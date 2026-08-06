@@ -1,0 +1,8 @@
+# One decoded VM sample from the NXS sensor-driver runtime.
+# Published on the subject named by the uavcan.pub.sample.id register.
+
+uint64 timestamp_us   # Acquisition time, microseconds since boot.
+uint16 seq            # Monotonic sample sequence number (wraps at 2^16).
+uint8[<=128] data     # Raw decoded sample bytes; layout is driver-defined.
+
+@sealed

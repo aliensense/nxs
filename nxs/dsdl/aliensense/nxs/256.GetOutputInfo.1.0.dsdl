@@ -1,0 +1,23 @@
+# Per-output-field descriptor, the Cyphal projection of the I2C descriptor
+# window. The host queries index 0..num_outputs-1 — index 0's response also
+# carries num_outputs — and decodes RawSample.data with the results. An
+# out-of-range index returns num_outputs with an empty name.
+
+uint8 index
+
+@sealed
+
+---
+
+uint8 num_outputs       # total output fields the loaded driver declares
+uint8 field_type        # 0=int8 1=uint8 2=int16 3=uint16 4=int32 5=uint32 6=float32 7=float64 8=string
+uint8 byte_order        # 0=big, 1=little
+uint8 semantic          # semantic category (0=generic); table in the host-interface spec
+uint8 byte_off          # byte position of the field within the sample (gaps are legal)
+uint16 count            # string fields: payload width; 0 for numeric
+float64 scale           # raw -> physical, multiplicative (full precision: geodetic scales quantize at float32)
+float64 offset          # raw -> physical, additive
+uint8[<=8] unit         # physical unit (ASCII)
+uint8[<=16] name        # field name (ASCII)
+
+@sealed

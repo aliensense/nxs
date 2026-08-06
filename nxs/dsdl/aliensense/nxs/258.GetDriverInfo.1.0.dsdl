@@ -1,0 +1,27 @@
+# Full driver-info snapshot — the Cyphal projection of the I2C info window,
+# the source the host's read_* getters poll.
+# slot 0xFF returns the active driver's full snapshot (name + runtime fields);
+# a numeric slot peeks the store (name + counts only, runtime fields zeroed).
+
+uint8 slot
+
+@sealed
+
+---
+
+uint8[<=16] name        # loaded driver name (ASCII)
+uint8 sample_size       # bytes per produced sample
+uint8 active_slot       # 0xFF = transient / RAM-only
+uint8 num_outputs       # declared output fields
+uint8 num_params        # declared parameters
+uint8 time_source       # 0=local monotonic, 1=PPS-synced
+uint8 vm_state          # 0=idle, 1=running, 2=error
+uint8 runner_state      # 0=no_driver 1=loading 2=probing 3=measuring 5=probe_failed
+uint8 error_code        # most-recent error (sticky until RESET)
+uint8 status_byte       # bit0=sample_ready bit1=error bit7=running
+uint8 store_count       # populated store slots
+uint8 probe_retries     # consecutive probe failures in the current cycle
+uint8 i2c_addr          # latched mikroBUS I2C address (0 if none)
+uint16 sample_count     # VM sample counter at snapshot
+
+@sealed

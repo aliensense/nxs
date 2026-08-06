@@ -1,0 +1,6 @@
+NXS SDK
+Copyright 2026 Aliensense
+
+This product includes DSDL definitions from the OpenCyphal
+public_regulated_data_types repository (MIT license), vendored
+under nxs/dsdl/.

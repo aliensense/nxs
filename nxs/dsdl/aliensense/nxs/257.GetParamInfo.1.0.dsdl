@@ -1,0 +1,23 @@
+# Per-parameter descriptor, the Cyphal projection of the I2C parameter
+# window. The host queries index
+# 0..num_params-1 — index 0's response also carries num_params — to learn each
+# declared parameter's name, unit, allowed values, default, and current value.
+# `register.Access` carries the value alone; this service carries the full
+# descriptor a value can't. An out-of-range index returns num_params with an
+# empty name.
+
+uint8 index
+
+@sealed
+
+---
+
+uint8 num_params        # total parameters the loaded driver declares
+uint8 param_type        # 0=enum, 1=range (ranges are future work)
+uint32 default_value    # value the driver shipped with
+uint32 current_value    # value currently applied on-device
+uint32[<=16] values     # allowed values (enum list); array length is the count
+uint8[<=8] unit         # physical unit (ASCII)
+uint8[<=16] name        # parameter name (ASCII)
+
+@sealed

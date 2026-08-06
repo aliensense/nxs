@@ -1,0 +1,16 @@
+# Compact telemetry push — the Cyphal projection of the I2C status registers. The node publishes this on the 1 Hz
+# tick (and, with the lower-latency hook, on VM state transitions); the
+# periodic push doubles as a liveness signal, so absence for >2 s means the
+# firmware is wedged. Error-counter slots: 0=probe_failed, 1=vm_decode_err,
+# 2=vm_io_err, 3=param_rejected, 4=upload_crc_err, 5=save_err, 6,7=reserved.
+
+uint8 vm_state              # 0=idle, 1=running, 2=error
+uint8 runner_state          # 0=no_driver 1=loading 2=probing 3=measuring 5=probe_failed
+uint8 active_slot           # 0xFF = transient / no driver
+uint8 last_error_code       # most-recent error (sticky until RESET)
+uint16[8] error_counters    # per-category cumulative counts since boot
+uint32 uptime_ms            # since boot
+uint32 sample_count         # VM sample counter at emit time
+uint8 free_slots            # store capacity - populated count
+
+@sealed

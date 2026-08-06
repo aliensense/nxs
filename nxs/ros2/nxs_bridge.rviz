@@ -1,0 +1,29 @@
+# RViz2 base config for the NXS bridge: Grid + TF (core plugins only).
+# The launch file's viz:=true path appends one `rviz_imu_plugin/Imu`
+# display per IMU-publishing manifest unit, wired to its
+# `/<base>/<unit>/imu` topic. When launching rviz2 by hand, add Imu
+# displays for the unit topics the same way (needs imu_tools).
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+Visualization Manager:
+  Global Options:
+    Fixed Frame: nxs
+    Frame Rate: 30
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: true
+      Show Names: true
+      Show Axes: true
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/FocusCamera
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 3
+      Name: Current View
