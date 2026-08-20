@@ -183,6 +183,8 @@ Extract:
   count/enable/reset registers
 - **For UART sensors**: default baud rate, command protocol
 
+**Timing declarations from the datasheet.** If the part is a stream receiver whose message carries a solution computed earlier (GNSS), call `self.stamp_frame()` at the measure loop's frame-sync point — it stamps the raw first-byte arrival. If the datasheet documents how far the measurement predates the stamp, declare `ACQUISITION_LATENCY_US`: a ΔΣ conversion counts as its window midpoint (start-to-read interval − conversion_time/2), a filtered IMU as its group delay, a receiver as its solution latency; compute it in `configure()` when it depends on the chosen ODR/OSR. Leave it 0 when a downstream fusion filter models the delay. Event-sampled parts need nothing — the delivered DRDY edge stamps them automatically.
+
 ## Step 5: Create the Driver File
 
 The driver is one module in the `nxs.drivers` package — `nxs upload <name>`
@@ -196,6 +198,29 @@ python -c "import nxs.drivers, os; print(os.path.dirname(nxs.drivers.__file__))"
 
 Write `<sensor_name_lowercase>.py` into that directory. The file name is the
 snake_case sensor name, also the YAML `driver:` value.
+
+**Check for a family base first.** An underscore-prefixed module in the
+same directory (`_ubx_nav_pvt.py`) is a driver-family base: the shared
+epoch message, measure loop, output table, and framing helpers for every
+part that speaks that protocol. List them before writing anything:
+
+```bash
+python -c "import nxs.drivers, os; d=os.path.dirname(nxs.drivers.__file__); print([f for f in os.listdir(d) if f.startswith('_') and not f.startswith('__')])"
+```
+
+Read the base's docstring: it names the family and states what a
+subclass still owns. When the part belongs to that family, subclass it
+and implement only the part-specific surface — probe expectations,
+configuration keys, rate tables, protocol variants — instead of
+re-emitting the shared machinery. A standalone driver for a part the
+base already covers silently detaches from every later fix to the base,
+which is the failure this check exists to prevent.
+
+When a part is the **second** member of a family whose first member is
+still standalone, extract the shared machinery into a new `_family.py`
+base and make both drivers subclass it, rather than copying the first
+driver. Two concrete implementations are the threshold for extracting a
+base — one is not.
 
 **Name the driver after the part, never the carrier board.** The file
 and class carry the part number of the silicon or module whose

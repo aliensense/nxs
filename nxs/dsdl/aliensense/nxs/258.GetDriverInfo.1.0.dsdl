@@ -5,7 +5,7 @@
 
 uint8 slot
 
-@sealed
+@extent 48 * 8
 
 ---
 
@@ -24,4 +24,4 @@ uint8 probe_retries     # consecutive probe failures in the current cycle
 uint8 i2c_addr          # latched mikroBUS I2C address (0 if none)
 uint16 sample_count     # VM sample counter at snapshot
 
-@sealed
+@extent 128 * 8

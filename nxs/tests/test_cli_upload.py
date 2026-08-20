@@ -35,9 +35,15 @@ class _FakeTransport:
         return self._ran
 
     def read_driver_name(self):
-        # The device reports a driver name once it has come up after RUN;
-        # `_upload_and_run` polls this to confirm the driver loaded.
         return "iam20680" if self._ran else ""
+
+    def read_runner_state(self):
+        # `_upload_and_run` waits on the runner state, not the driver name:
+        # the name is set at load, so it reports success on a driver that is
+        # about to fail its probe.
+        from nxs._generated_constants import RunnerStates
+        state = RunnerStates.RunnerState
+        return state.MEASURING if self._ran else state.NO_DRIVER
 
 
 def _args(driver, config=None, output=None):
@@ -53,7 +59,53 @@ def test_name_compiles_uploads_and_runs():
     assert t.ran() is True
 
 
-# ── (a) existing file → upload verbatim ────────────────────────
+# ── (a) local .py → compile like the name branch ───────────────
+
+def test_local_py_compiles_like_the_name_branch(tmp_path):
+    # The Driver Development Guide's authoring flow: `nxs upload ./x.py`.
+    # A copy of a known driver source must produce the identical image.
+    import shutil
+    import nxs.drivers.iam20680 as drv_mod
+    src = tmp_path / "my_sensor.py"
+    shutil.copy(drv_mod.__file__, src)
+    t = _FakeTransport()
+    assert cmd_upload(t, _args(str(src))) == 0
+    assert t.uploaded() == serialize(Iam20680().compile({}))
+    assert t.ran() is True
+
+
+def test_local_py_honors_offline_output(tmp_path):
+    import shutil
+    import nxs.drivers.iam20680 as drv_mod
+    src = tmp_path / "my_sensor.py"
+    shutil.copy(drv_mod.__file__, src)
+    out = tmp_path / "my_sensor.nxs"
+    assert cmd_upload(None, _args(str(src), output=str(out))) == 0
+    assert out.read_bytes() == serialize(Iam20680().compile({}))
+
+
+def test_local_py_import_error_names_the_line(tmp_path, capsys):
+    # "name 'np' is not defined" is true and useless on its own; a driver
+    # author needs the line in their own file.
+    src = tmp_path / "typo.py"
+    src.write_text("from nxs.compiler import SensorDriver\n"
+                   "\n"
+                   "\n"
+                   "VALUE = undefined_name_here\n")
+    assert cmd_upload(_FakeTransport(), _args(str(src))) == 1
+    err = capsys.readouterr().err
+    assert "undefined_name_here" in err
+    assert "line 4" in err
+
+
+def test_local_py_without_a_driver_errors(tmp_path, capsys):
+    src = tmp_path / "not_a_driver.py"
+    src.write_text("x = 1\n")
+    assert cmd_upload(_FakeTransport(), _args(str(src))) == 1
+    assert "No SensorDriver found" in capsys.readouterr().out
+
+
+# ── (b) existing file → upload verbatim ────────────────────────
 
 def test_file_uploads_bytes_verbatim(tmp_path):
     img = serialize(Iam20680().compile({}))

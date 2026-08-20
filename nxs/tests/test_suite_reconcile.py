@@ -16,7 +16,7 @@ import pytest
 
 from nxs.suite.firmware import IMAGE_MAGIC
 from nxs.suite.reconcile import switch_suite, load_unit_driver
-from nxs.client import SupportsCommissioning
+from nxs.client import SupportsCommissioning, SUPPORTED_PROTO_VERSION
 from nxs.suite.schema import parse_suite_config
 from nxs.suite.state import SuiteState
 
@@ -104,6 +104,11 @@ class FakeUnit(SupportsCommissioning):
 
     def read_active_slot(self):
         return 0 if self._slots else 0xFF
+
+    def read_runner_state(self):
+        from nxs._generated_constants import RunnerStates
+        state = RunnerStates.RunnerState
+        return state.MEASURING if self._slots else state.NO_DRIVER
 
     def read_driver_name(self):
         return self._driver_name
@@ -248,6 +253,101 @@ def test_firmware_unknown_version_flashes_once():
                               SuiteState.load(state.path),
                               opener=lambda k, **kw: second, firmware_dir=store)
         assert second.pushed() == [] and reports[0].ok
+
+
+def test_proven_identity_outranks_a_stale_state_record():
+    """An out-of-band flash to the pinned version must not earn a reboot:
+    the wire proves the exact triple, and the stale record loses."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = os.path.join(tmp, 'fw')
+        os.makedirs(store)
+        _mcuboot_image(os.path.join(store, 'nxs.bin'), (1, 2, 3))
+
+        state = _state(tmp)
+        state.record('u1', fw_version='1.2.2')   # stale: flashed out-of-band
+        fake = FakeUnit(fw='v1.2.3-4-gabc1234')  # the wire proves the pin
+        reports = switch_suite(_cfg(firmware='1.2.3'), state,
+                               opener=lambda k, **kw: fake, firmware_dir=store)
+        assert fake.pushed() == []
+        assert reports[0].ok
+
+
+def test_firmware_sha_identity_flashes_once_like_no_version():
+    """A bare untagged SHA proves no version at all: with no state record
+    it takes the same flash-once path as a transport that serves nothing,
+    not silent convergence."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = os.path.join(tmp, 'fw')
+        os.makedirs(store)
+        _mcuboot_image(os.path.join(store, 'nxs.bin'), (1, 1, 0))
+
+        class ShaUnit(FakeUnit):
+            def push_image(self, path, chunk_size=32, progress_cb=None):
+                self._pushed.append(path)
+                return os.path.getsize(path)   # still serves the bare SHA
+
+        state = _state(tmp)
+        first = ShaUnit(fw='87fdf5b')
+        switch_suite(_cfg(firmware='1.1.0'), state,
+                    opener=lambda k, **kw: first, firmware_dir=store)
+        assert len(first.pushed()) == 1
+
+        second = ShaUnit(fw='87fdf5b')
+        reports = switch_suite(_cfg(firmware='1.1.0'),
+                              SuiteState.load(state.path),
+                              opener=lambda k, **kw: second, firmware_dir=store)
+        assert second.pushed() == [] and reports[0].ok
+
+
+def test_firmware_pin_reflashes_a_proven_patch_mismatch():
+    """A full build identity proves the patch: v1.2.2 under a 1.2.3 pin
+    reflashes even with no state record — the wire contradicts the pin."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = os.path.join(tmp, 'fw')
+        os.makedirs(store)
+        _mcuboot_image(os.path.join(store, 'nxs.bin'), (1, 2, 3))
+
+        fake = FakeUnit(fw='v1.2.2-4-gabc1234')
+        reports = switch_suite(_cfg(firmware='1.2.3'), _state(tmp),
+                               opener=lambda k, **kw: fake, firmware_dir=store)
+        assert len(fake.pushed()) == 1
+        assert reports[0].ok
+
+
+def test_firmware_pin_tolerates_a_legacy_pair_with_matching_minor():
+    """A legacy "1.2" identity proves nothing below the minor: a 1.2.3
+    pin with a matching pair and no record converges without a flash."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = os.path.join(tmp, 'fw')
+        os.makedirs(store)
+        _mcuboot_image(os.path.join(store, 'nxs.bin'), (1, 2, 3))
+
+        fake = FakeUnit(fw='1.2')
+        reports = switch_suite(_cfg(firmware='1.2.3'), _state(tmp),
+                               opener=lambda k, **kw: fake, firmware_dir=store)
+        assert fake.pushed() == []
+        assert reports[0].ok
+
+
+def test_dfu_verify_catches_a_wrong_patch_boot():
+    """A device that boots the wrong patch after the push is a failed
+    update: the full identity proves it, and recording the pin instead
+    would mask it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        store = os.path.join(tmp, 'fw')
+        os.makedirs(store)
+        _mcuboot_image(os.path.join(store, 'nxs.bin'), (1, 2, 3))
+
+        class WrongImageUnit(FakeUnit):
+            def push_image(self, path, chunk_size=32, progress_cb=None):
+                # The push lands but the old image boots again.
+                return os.path.getsize(path)
+
+        fake = WrongImageUnit(fw='v1.2.2-4-gabc1234')
+        reports = switch_suite(_cfg(firmware='1.2.3'), _state(tmp),
+                               opener=lambda k, **kw: fake, firmware_dir=store)
+        assert not reports[0].ok
+        assert 'DFU verify failed' in (reports[0].error or '')
 
 
 def test_missing_firmware_image_fails_before_touching_the_device():
@@ -466,8 +566,11 @@ def test_apply_fails_over_to_the_second_link(tmp_path):
     reports = switch_suite(cfg, _state(tmp_path), opener=opener)
     assert reports[0].ok
     assert reports[0].link == 'can can1 node 10'
-    assert any('edge i2c /dev/i2c-9@0x30: down' in a
-               for a in reports[0].actions)
+    assert any('edge i2c /dev/i2c-9@0x30: down' in n
+               for n in reports[0].notes)
+    # A link verdict is not something done to the device, so it must not
+    # keep an otherwise-idempotent switch from reading converged.
+    assert not any('edge ' in a for a in reports[0].actions)
 
 
 def test_a_link_reaching_different_silicon_fails_before_provisioning(tmp_path):
@@ -570,8 +673,219 @@ def test_switch_seeds_time_sync_on_capable_transports():
         reports = switch_suite(_cfg(), _state(tmp),
                               opener=lambda k, **kw: fake)
         assert reports[0].ok
-        assert any("time sync seeded" in a for a in reports[0].actions)
+        assert any("time sync seeded" in n for n in reports[0].notes)
         assert fake._pushed is not None
         assert fake._pushed[3] == 10_000_000
         _off, _bound, _rate, _window, source, valid = fake.read_time_sync()
         assert valid and source == 1
+
+
+# ── Register-map contract gate ─────────────────────────────────
+
+def test_mismatched_unit_without_pin_is_refused():
+    class OffContract(FakeUnit):
+        def interface_version(self):
+            return SUPPORTED_PROTO_VERSION + 1
+
+    fake = OffContract()
+    with tempfile.TemporaryDirectory() as tmp:
+        reports = switch_suite(_cfg(), _state(tmp),
+                               opener=lambda k, **kw: fake)
+        assert not reports[0].ok
+        assert f"register-map v{SUPPORTED_PROTO_VERSION + 1}" in reports[0].error
+        assert "pin firmware" in reports[0].error
+        assert fake.slots() == []            # nothing touched the device
+
+
+def test_contract_mismatch_flashes_even_at_the_same_fw_version():
+    # The product version and the contract move independently: two images on
+    # different contracts can both report fw 1.0, so version-drift alone would
+    # skip the flash and leave the device on its old contract.
+    class SameVersionOffContract(FakeUnit):
+        def interface_version(self):
+            # off-contract until the pinned image lands — a real reboot.
+            return (SUPPORTED_PROTO_VERSION if self.pushed()
+                    else SUPPORTED_PROTO_VERSION + 1)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        store = os.path.join(tmp, 'fw')
+        os.makedirs(store)
+        _mcuboot_image(os.path.join(store, 'nxs.bin'), (1, 0, 0))
+
+        fake = SameVersionOffContract(fw='1.0')      # same version as the pin
+        reports = switch_suite(_cfg(firmware='1.0.0'), _state(tmp),
+                               opener=lambda k, **kw: fake,
+                               firmware_dir=store)
+        assert len(fake.pushed()) == 1, \
+            "a contract mismatch must force the pinned flash"
+        assert reports[0].ok
+
+
+def test_matching_contract_passes_the_gate():
+    class Current(FakeUnit):
+        def interface_version(self):
+            return SUPPORTED_PROTO_VERSION
+
+    fake = Current()
+    with tempfile.TemporaryDirectory() as tmp:
+        reports = switch_suite(_cfg(), _state(tmp),
+                               opener=lambda k, **kw: fake)
+        assert reports[0].ok
+        assert fake.slots() == ['Iam20680']
+
+
+def test_converged_survives_the_time_sync_seed(monkeypatch):
+    """The seed runs on every switch by design. Counting it as a converge
+    action left `converged` unreachable on any transport with a time surface,
+    so an idempotent re-switch was indistinguishable from a real change."""
+    from nxs.client import SupportsTimeSync
+    import nxs.suite.reconcile as reconcile
+
+    # Only the two abstract methods, since the seed itself is stubbed below.
+    # A test that needs real estimation wants the fuller SyncFakeUnit in
+    # test_switch_seeds_time_sync_on_capable_transports.
+    class SyncingUnit(FakeUnit, SupportsTimeSync):
+        def push_time_sync(self, offset_us, bound_us, rate_ppb=0,
+                           valid_for_us=0):
+            pass
+
+        def read_time_sync(self):
+            return None
+
+    monkeypatch.setattr(reconcile, 'estimate_and_push', lambda t: 219)
+    fake = SyncingUnit()
+    with tempfile.TemporaryDirectory() as tmp:
+        state = _state(tmp)
+        switch_suite(_cfg(), state, opener=lambda k, **kw: fake)
+        r2 = switch_suite(_cfg(), SuiteState.load(state.path),
+                          opener=lambda k, **kw: fake)
+        # The seed is a note, not a device change — that split is what keeps
+        # `converged` reachable on a transport that carries a time surface.
+        assert r2[0].actions == ['converged']
+        assert r2[0].notes == ['time sync seeded (±219 µs)']
+
+
+def test_converged_survives_a_verified_second_link(tmp_path):
+    """Proving a secondary link answers the same silicon writes nothing to
+    the device. Counting the `edge …: up` verdict as a converge action left
+    `converged` unreachable for every multi-link unit — the common case,
+    since a unit on both I2C and CAN is what the suite is for."""
+    cfg = parse_suite_config({'units': [
+        {'name': 'imu', 'links': [
+            {'transport': 'i2c', 'bus': '/dev/i2c-9', 'address': 0x30},
+            {'transport': 'cyphal-can', 'iface': 'can1', 'node_id': 125}],
+         'sensors': []}]})
+    device = FakeUnit(node_addr=125)
+    state = _state(tmp_path)
+    switch_suite(cfg, state, opener=lambda k, **kw: device)
+    again = switch_suite(cfg, SuiteState.load(state.path),
+                         opener=lambda k, **kw: device)
+    assert again[0].actions == ['converged']
+    assert any('edge can can1 node 125: up' in n for n in again[0].notes)
+
+
+def test_deploy_waits_for_the_probe_before_reading_the_slot():
+    """`vm_run()` returns when the device accepts the command, not when the
+    driver has probed. Reading the slot on the next line reported a working
+    deploy as `no driver probed a sensor yet`."""
+    class SlowProbe(FakeUnit):
+        def __init__(self):
+            super().__init__()
+            self._reads = 0
+
+        def read_runner_state(self):
+            from nxs._generated_constants import RunnerStates
+            self._reads += 1
+            if self._reads < 3:
+                # Still resetting and settling; no samples yet.
+                return RunnerStates.RunnerState.PROBING
+            return super().read_runner_state()
+
+    fake = SlowProbe()
+    with tempfile.TemporaryDirectory() as tmp:
+        reports = switch_suite(_cfg(), _state(tmp),
+                               opener=lambda k, **kw: fake)
+        assert reports[0].ok
+        assert 'active: Iam20680 (slot 0)' in reports[0].actions
+        assert not any('no driver probed' in a for a in reports[0].actions)
+
+
+def test_a_seed_that_cannot_confirm_does_not_fail_a_converged_unit(monkeypatch):
+    """The seed runs after the device already matches the manifest, and
+    `nxs timesync` re-seeds on its own cadence. Letting its exception escape
+    reported a converged board as ✗ — which is what a panel deploy did, since
+    the comm thread is still draining flash writes when the seed lands."""
+    from nxs.client import SupportsTimeSync
+    import nxs.suite.reconcile as reconcile
+
+    class SyncingUnit(FakeUnit, SupportsTimeSync):
+        def push_time_sync(self, offset_us, bound_us, rate_ppb=0,
+                           valid_for_us=0):
+            pass
+
+        def read_time_sync(self):
+            return None
+
+    def _boom(_t):
+        raise RuntimeError("push not applied (mirror mismatch)")
+
+    monkeypatch.setattr(reconcile, 'estimate_and_push', _boom)
+    fake = SyncingUnit()
+    with tempfile.TemporaryDirectory() as tmp:
+        state = _state(tmp)
+        switch_suite(_cfg(), state, opener=lambda k, **kw: fake)
+        r2 = switch_suite(_cfg(), SuiteState.load(state.path),
+                          opener=lambda k, **kw: fake)
+    assert r2[0].ok, "a failed seed must not fail an otherwise converged unit"
+    assert r2[0].actions == ['converged']
+    assert any('time sync not seeded' in n for n in r2[0].notes)
+
+
+def test_a_deploy_whose_driver_never_probed_fails_the_unit(tmp_path):
+    """The runner parks in PROBE_FAILED until a host command intervenes, so
+    it is a verdict, not a stage. Reporting it as an action left the unit
+    ticked ✓ while telling the operator no sensor had answered."""
+    from nxs._generated_constants import RunnerStates
+
+    class NeverProbes(FakeUnit):
+        def read_runner_state(self):
+            return RunnerStates.RunnerState.PROBE_FAILED
+
+    reports = switch_suite(_cfg(), _state(tmp_path),
+                           opener=lambda k, **kw: NeverProbes())
+    assert not reports[0].ok
+    assert 'no sensor answered' in reports[0].error
+
+
+def test_a_parked_runner_is_drift_so_the_next_switch_redeploys(tmp_path):
+    """`converged` compares the loaded driver's *name*, which keeps matching
+    while the runner sits parked in PROBE_FAILED. Without this the switch
+    after a failed deploy ticked the unit green over a dead sensor."""
+    from nxs._generated_constants import RunnerStates
+
+    class Parkable(FakeUnit):
+        """One device across both switches — a fresh fake would show shape
+        drift from its empty store and redeploy for the wrong reason."""
+        parked = False
+
+        def read_runner_state(self):
+            if self.parked:
+                return RunnerStates.RunnerState.PROBE_FAILED
+
+            return super().read_runner_state()
+
+    fake = Parkable()
+    with tempfile.TemporaryDirectory() as tmp:
+        state = _state(tmp)
+        first = switch_suite(_cfg(), state, opener=lambda k, **kw: fake)
+        assert first[0].ok and first[0].actions != ['converged']
+        # The sensor stops answering after the panel is already deployed and
+        # recorded: the driver name still matches, the store still matches.
+        fake.parked = True
+        again = switch_suite(_cfg(), SuiteState.load(state.path),
+                             opener=lambda k, **kw: fake)
+    # Drift, so the switch redeploys — and the redeploy's own probe verdict
+    # fails the unit, rather than a green `converged` over a dead sensor.
+    assert not again[0].ok, "a parked runner must not read as converged"
+    assert 'no sensor answered' in again[0].error
+    assert any('deploy panel' in a for a in again[0].actions)

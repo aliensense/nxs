@@ -168,3 +168,38 @@ def test_rate_survives_thinning_with_offset_freshness():
                  rtt_ns=rtt)
     assert ts.bound_us() == 80 / 2
     assert -420_000 <= ts.rate_ppb() <= -380_000
+
+
+def test_push_polls_the_mirror_instead_of_reading_it_once():
+    """The device applies the record on its comm thread, not in the
+    transaction that carries it. A single readback lost that race whenever
+    the thread was busy — right after a panel deploy it still has the store
+    writes and the driver probe ahead of it — and `suite switch` failed a
+    unit that had converged."""
+    from nxs.client import estimate_and_push
+
+    class LaggingMirror(MockTransport):
+        def __init__(self, lag: int):
+            super().__init__()
+            self.lag = lag
+            self.reads = 0
+            self.pushed = None
+
+        def read_device_time_us(self):
+            return 42_000_000
+
+        def push_time_sync(self, offset_us, bound_us, rate_ppb=0,
+                           valid_for_us=0):
+            self.pushed = (offset_us, bound_us, rate_ppb, valid_for_us)
+
+        def read_time_sync(self):
+            self.reads += 1
+            if self.reads <= self.lag:
+                # The previous record, still valid and in-contract.
+                return (0, 999999, 0, 0, 0, 1)
+            o, b, r, w = self.pushed
+            return (o, b, r, w, 0, 1)
+
+    t = LaggingMirror(lag=3)
+    assert estimate_and_push(t) is not None
+    assert t.reads == 4, "should have polled past the stale echoes"

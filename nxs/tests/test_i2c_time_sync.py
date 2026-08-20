@@ -7,7 +7,8 @@ import pytest
 
 from nxs.client import TimeSyncEstimator, estimate_and_push
 from nxs.transports.i2c import (REG_PROGRAM_DATA, REG_SAMPLE_DATA,
-                                REG_XFER_TYPE, NxsI2cTransport)
+                                REG_XFER_TYPE, XFER_TYPE_TIME_SYNC, XFER_TYPE_VM_BYTECODE,
+                                NxsI2cTransport)
 
 
 class _Bus:
@@ -19,6 +20,11 @@ class _Bus:
         self.writes = {}
         self.record = b""
         self.mirror_paints = True
+
+    def read_byte_data(self, addr, reg):
+        # The transports read the mode back after writing it (a silent
+        # session refusal is detected this way); this stub never refuses.
+        return self.writes.get(reg, 0)
 
     def read_i2c_block_data(self, addr, reg, n):
         if reg == REG_PROGRAM_DATA:
@@ -86,6 +92,10 @@ class _MirrorBus:
     def write_byte_data(self, addr, reg, value):
         pass
 
+    def read_byte_data(self, addr, reg):
+        # Ignores writes, so the mode readback simply reports it took.
+        return XFER_TYPE_TIME_SYNC if reg == REG_XFER_TYPE else 0
+
     def read_i2c_block_data(self, addr, reg, n):
         assert reg == REG_PROGRAM_DATA
         if self.unpainted > 0:
@@ -102,3 +112,28 @@ def test_read_time_sync_polls_past_an_unpainted_mirror():
 def test_read_time_sync_reports_invalid_when_never_painted():
     t = _transport(_MirrorBus(unpainted_reads=10 ** 9))
     assert t.read_time_sync() == (0, 0, 0, 0, 0, False)
+
+
+class _LaggingModeBus(_MirrorBus):
+    """The XFER_TYPE write commits deferred: the mode readback returns the
+    old value for the first `lag` polls, then TIME_SYNC — exactly the race
+    a single-shot readback misdiagnosed as a live session."""
+
+    def __init__(self, lag):
+        super().__init__(unpainted_reads=0)
+        self.lag = lag
+
+    def read_byte_data(self, addr, reg):
+        if reg == REG_XFER_TYPE:
+            if self.lag > 0:
+                self.lag -= 1
+                return XFER_TYPE_VM_BYTECODE     # drain hasn't run yet
+            return XFER_TYPE_TIME_SYNC
+        return 0
+
+
+def test_read_time_sync_polls_past_a_lagging_mode_commit():
+    # A lagging drain must not read as "session live"; the echo-budget claim
+    # waits for the mode to land and then serves the record.
+    t = _transport(_LaggingModeBus(lag=3))
+    assert t.read_time_sync() == (-123456, 220, -400000, 50_000_000, 1, True)

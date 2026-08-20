@@ -19,6 +19,7 @@ import sys as _sys
 import math
 import re
 import struct
+import time
 import sys
 import types
 
@@ -48,7 +49,7 @@ IMU_FIELDS = [
 ]
 
 GNSS_FIELDS = [
-    _f('fix_type', ftype='uint8'), _f('num_sv', ftype='uint8'),
+    _f('fix_type', Sem.FIX_TYPE, 'uint8'), _f('num_sv', ftype='uint8'),
     _f('longitude', Sem.LONGITUDE, 'int32'),
     _f('latitude', Sem.LATITUDE, 'int32'),
     _f('alt_ellipsoid', ftype='int32'),
@@ -1233,3 +1234,104 @@ def test_real_rclpy_smoke():
         assert n == 2
     finally:
         bridge.shutdown()
+
+
+def test_utc_from_itow_resolves_week_and_leap():
+    # Mid-week: host sits 1000 s after the epoch described by itow.
+    now = rb.GpsTime.GPS_EPOCH_UNIX_S - rb.GpsTime.GPS_UTC_LEAP_S \
+        + 2400 * rb.GpsTime.GPS_WEEK_S + 300_000 + 1000
+    utc = rb.utc_from_itow(300_000.0, now)
+    assert utc == now - 1000
+
+    # Week rollover: itow restarted near zero while the host clock still
+    # sits at the tail of the previous week — the next week wins.
+    now = rb.GpsTime.GPS_EPOCH_UNIX_S - rb.GpsTime.GPS_UTC_LEAP_S \
+        + 2400 * rb.GpsTime.GPS_WEEK_S + rb.GpsTime.GPS_WEEK_S - 30
+    utc = rb.utc_from_itow(5.0, now)
+    assert utc == now + 35
+
+
+def test_utc_from_itow_refuses_implausible_host_clock():
+    # A cold host (clock near the Unix epoch) cannot resolve the GPS
+    # week — refuse rather than confidently emit a wrong one.
+    assert rb.utc_from_itow(300_000.0, 1_000_000.0) is None
+    assert rb.utc_from_itow(300_000.0,
+                            rb.HOST_CLOCK_FLOOR_UNIX_S - 1) is None
+
+
+def test_epoch_binding_requires_both_semantics():
+    tow = _f('itow', Sem.TIME_OF_WEEK, 'uint32')
+    fix = _f('fix_type', Sem.FIX_TYPE, 'uint8')
+    other = _f('pressure', Sem.PRESSURE, 'uint32')
+    assert rb.epoch_binding([tow, fix, other]) == ('itow', 'fix_type')
+    assert rb.epoch_binding([tow, other]) is None
+    assert rb.epoch_binding([other]) is None
+
+
+# ── itow stamp mode, composed ─────────────────────────────
+
+# The stamp path is per unit, not per message, so these ride an IMU unit
+# (header-bearing and stubbed) carrying the two epoch fields.
+EPOCH_FIELDS = IMU_FIELDS + [_f('itow', Sem.TIME_OF_WEEK, 'uint32'),
+                             _f('fix_type', Sem.FIX_TYPE, 'uint8')]
+
+
+def _epoch_bridge(runtime, **kw):
+    plan = rb.UnitPlan(name='gnss', frame_id='gnss',
+                       publications=rb.plan_publications(EPOCH_FIELDS),
+                       epoch=rb.epoch_binding(EPOCH_FIELDS))
+    return rb.Ros2Bridge([plan], runtime=runtime, resolver=_stub_resolver,
+                         **kw)
+
+
+def _epoch_sample(itow_s, fix_type, count=1):
+    values = dict(IMU_VALUES, itow=itow_s, fix_type=fix_type)
+    return Sample(count=count, raw=b'', values=values,
+                  timestamp_us=2_500_000)
+
+
+def test_itow_mode_stamps_from_the_receiver_epoch():
+    # A time-solved fix stamps with the resolver's UTC — not the sync
+    # projection, not arrival.
+    runtime = _FakeRuntime(now=(9, 9))
+    sync = _FakeTimeSync(stamp=(777, 888))
+    bridge = _epoch_bridge(runtime, stamp_mode=rb.STAMP_ITOW,
+                           time_syncs=[sync])
+    itow_s = 300_000.0
+    bridge.publish(0, _epoch_sample(itow_s, 3))
+    imu = runtime.pubs['nxs/gnss/imu'].published[0]
+    expected = rb.utc_from_itow(itow_s, time.time())
+    assert imu.header.stamp.sec == int(expected)
+    assert (imu.header.stamp.sec, imu.header.stamp.nanosec) != (777, 888)
+    assert (imu.header.stamp.sec, imu.header.stamp.nanosec) != (9, 9)
+
+
+def test_itow_mode_falls_back_to_synced_once_without_a_time_fix(caplog):
+    # fix_type 1 is dead-reckoning only: no time solution, so the mode
+    # degrades to the synced projection and says so exactly once.
+    runtime = _FakeRuntime(now=(9, 9))
+    sync = _FakeTimeSync(stamp=(777, 888))
+    bridge = _epoch_bridge(runtime, stamp_mode=rb.STAMP_ITOW,
+                           time_syncs=[sync])
+    with caplog.at_level(logging.WARNING, logger='nxs.ros2_bridge'):
+        bridge.publish(0, _epoch_sample(300_000.0, 1, count=1))
+        bridge.publish(0, _epoch_sample(300_001.0, 1, count=2))
+    published = runtime.pubs['nxs/gnss/imu'].published
+    assert len(published) == 2
+    for msg in published:
+        assert (msg.header.stamp.sec, msg.header.stamp.nanosec) == (777, 888)
+    warnings = [r for r in caplog.records
+                if 'no valid GNSS epoch' in r.message]
+    assert len(warnings) == 1
+
+
+def test_format_plan_marks_epoch_capable_units():
+    epoch_plan = rb.UnitPlan('gnss', 'gnss',
+                             rb.plan_publications(EPOCH_FIELDS),
+                             epoch=rb.epoch_binding(EPOCH_FIELDS))
+    imu_plan = rb.UnitPlan('imu', 'imu', rb.plan_publications(IMU_FIELDS),
+                           epoch=rb.epoch_binding(IMU_FIELDS))
+    out = rb.format_plan([epoch_plan, imu_plan], 'nxs')
+    assert 'gnss:  [epoch-capable]' in out
+    assert 'imu:' in out
+    assert 'imu:  [epoch-capable]' not in out

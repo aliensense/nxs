@@ -150,3 +150,45 @@ def test_reopened_transport_inherits_the_estimator():
     pusher.round()
     assert len(opened) == 2
     assert estimators[0] is estimators[1]
+
+
+def test_held_mux_skips_the_interval_and_keeps_the_unit():
+    # A live upload/DFU on the unit refuses the record (EBUSY): the pusher
+    # skips the interval without dropping the link — the estimator's state
+    # is fine, the device just can't take a record right now — and pushes
+    # normally once the session ends.
+    from nxs.client import DeviceRefused
+
+    calls = {'n': 0}
+
+    def pusher(transport):
+        calls['n'] += 1
+        if calls['n'] == 1:
+            raise DeviceRefused(16, "another transfer session is live")
+        return 250
+
+    p = SuitePusher(_cfg(['u1']), opener=lambda kind, **kw: MockTransport(),
+                    pusher=pusher)
+    first = p.round()
+    assert first[0].bound_us is None
+    assert first[0].note == "mux held — sync skipped"
+    assert 'u1' in p._open_units          # not dropped
+
+    second = p.round()
+    assert second[0].bound_us == 250      # same link, next interval
+    assert 'u1' not in p._mux_held        # warn-once flag re-armed
+
+
+def test_a_push_failure_with_no_message_still_names_the_fault():
+    """`str(exc)` is empty for a bare `OSError()`, so the note read as
+    `push failed ()` — a report that names nothing."""
+    def opener(kind, **kw):
+        return MockTransport()
+
+    def mute_pusher(transport):
+        raise OSError()
+
+    report = SuitePusher(_cfg(['u1']), opener=opener,
+                         pusher=mute_pusher).round()[0]
+    assert report.bound_us is None
+    assert "push failed (OSError)" in report.note

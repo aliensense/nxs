@@ -16,6 +16,8 @@ one command.
     ros2 launch "$(nxs ros2 --launch-file)" viz:=true stamp:=arrival
 """
 
+from nxs.stamp_modes import STAMP_MODES, STAMP_SYNCED
+
 from launch import LaunchDescription
 from launch.actions import (DeclareLaunchArgument, ExecuteProcess,
                             OpaqueFunction)
@@ -87,8 +89,9 @@ def generate_launch_description():
             output="screen")]
 
     return LaunchDescription([
-        DeclareLaunchArgument("stamp", default_value="synced",
-                              description="header.stamp source: synced|device|arrival"),
+        DeclareLaunchArgument("stamp", default_value=STAMP_SYNCED,
+                              description="header.stamp source: "
+                                          + "|".join(STAMP_MODES)),
         DeclareLaunchArgument("topic_base", default_value="nxs",
                               description="leading topic namespace"),
         DeclareLaunchArgument("viz", default_value="false",

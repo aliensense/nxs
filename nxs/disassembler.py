@@ -104,6 +104,8 @@ _FORMATTERS = {
     Op.UART_AVAIL: lambda a, i: f"r{i[1]} = uart_avail",
     Op.SLEEP_MS: lambda a, i: f"{struct.unpack_from('<H', i, 1)[0]} ms",
     Op.SLEEP_US: lambda a, i: f"{struct.unpack_from('<H', i, 1)[0]} us",
+    Op.ACQ_FRAME: lambda a, i: "acq = rx_backlog_start",
+    Op.ACQ_BIAS: lambda a, i: f"acq_bias = {struct.unpack_from('<L', i, 1)[0]} us",
     Op.SET_SAMPLE_SIZE: lambda a, i: f"size={i[1]}",
     Op.REG_WRITE_BURST: lambda a, i: f"[0x{i[1] | (i[2] << 8):02X}] = buf[{i[3]}..+{i[4]}]",
     Op.CVT64: lambda a, i: f"work[{i[2]}] = (i64) r{i[1]}",

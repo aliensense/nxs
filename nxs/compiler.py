@@ -47,6 +47,7 @@ _SEMANTIC_ALIASES = {
     'weight': 'mass',
     'range': 'distance',
     'flow_rate': 'flow',
+    'itow': 'time_of_week',
 }
 
 
@@ -1750,6 +1751,15 @@ class SensorDriver:
     # parts (e.g. FXOS8700).
     RESET_ACTIVE = 'low'
 
+    # Declared acquisition latency, µs: the physical measurement predates
+    # the stamped bound (DRDY edge, frame arrival, or commit instant) by
+    # this much. Declare only from a documented figure — a ΔΣ conversion
+    # counts as its window MIDPOINT (sleep − conversion_time/2), a filter
+    # as its group delay; leave 0 when a downstream fusion filter models
+    # the delay itself. Overridable from configure() when the value
+    # depends on the chosen ODR/OSR/filter config.
+    ACQUISITION_LATENCY_US = 0
+
     def __init__(self):
         self._emitter = _Emitter()
         self._regs = _RegAlloc()
@@ -2341,6 +2351,16 @@ class SensorDriver:
             self._trace_phase = "configure"
             self.configure(config)
         self._trace_phase = None
+
+        # The declared acquisition latency (class attr, or instance
+        # override from configure() for config-dependent figures) rides
+        # one config-section op; commit applies it to every stamp.
+        if bias_us := int(self.ACQUISITION_LATENCY_US):
+            if not (0 < bias_us <= 0xFFFFFFFF):
+                raise CompileError(
+                    f"ACQUISITION_LATENCY_US {bias_us!r} does not fit a "
+                    f"u32 microsecond operand")
+            self._emitter.emit(Op.ACQ_BIAS, *struct.pack("<L", bias_us))
 
         # Phase 3: AST-compile measure()
         if measure_fn is not None:
@@ -3724,6 +3744,17 @@ class StreamDriver(SensorDriver):
                 em.label(L_TIMEOUT)
                 em.emit(Op.ERROR, ERR_CODE_TIMEOUT)
             em.label(L_FOUND)
+
+    def stamp_frame(self) -> None:
+        """Compile: set the pass's acquisition bound to the RX backlog's
+        first-byte arrival (a declared `ACQUISITION_LATENCY_US`, e.g. a
+        receiver's documented solution latency, applies at commit).
+        Place at the measure loop's frame-sync point; the following
+        commit freezes the bound with the sample. The latch names the
+        RX backlog's first byte, so it equals the frame's own first
+        byte only while the loop drains the backlog every pass.
+        """
+        self._emitter.emit(Op.ACQ_FRAME)
 
     def read_n(self, count: int,
                timeout_ms: Optional[int] = None) -> TracedSlice:

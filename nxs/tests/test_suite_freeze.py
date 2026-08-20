@@ -141,6 +141,139 @@ def test_freeze_pin_firmware_captures_the_running_version():
             or 'firmware: 1.0' in open(path).read()
 
 
+def test_freeze_refuses_an_unknown_orientation_code():
+    """A device orientation code outside this SDK's vocabulary must not
+    reach the manifest — the parser would reject the whole file."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path, cfg, _ = _tuned_setup(tmp)
+
+        from nxs.client import CalibrationRecord, SupportsCalibration
+
+        class NewerOrientationUnit(FakeUnit, SupportsCalibration):
+            def read_calibration(self):
+                rec = CalibrationRecord()
+                rec.orientation = 99
+                return rec
+
+            def write_calibration(self, record, persist=True):
+                pass
+
+            def set_orientation(self, rotation, persist=True):
+                pass
+
+            def cal_gyro(self):
+                pass
+
+            def cal_mag_start(self):
+                pass
+
+            def cal_mag_stop(self):
+                pass
+
+            def cal_abort(self):
+                pass
+
+            def save_calibration(self):
+                pass
+
+            def read_cal_epoch(self):
+                return 1
+
+            def read_cal_progress(self):
+                return (0, 0, 0)
+
+        oriented = NewerOrientationUnit()
+        switch_suite(cfg, SuiteState.load(os.path.join(tmp, 's2.yaml')),
+                    opener=lambda k, **kw: oriented)
+        before = open(path).read()
+        reports = freeze_suite(cfg, path, only_unit='u1',
+                               opener=lambda k, **kw: oriented)
+        assert not reports[0].ok
+        assert 'orientation code 99' in (reports[0].error or '')
+        assert open(path).read() == before
+
+
+def test_freeze_survives_a_missing_calibration_surface():
+    """Concrete transports always type as SupportsCalibration; connected
+    firmware may predate the registers. The optional adoption must not
+    fail the rest of the freeze."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path, cfg, _ = _tuned_setup(tmp)
+
+        from nxs.client import SupportsCalibration
+
+        class LegacyUnit(FakeUnit, SupportsCalibration):
+            def read_calibration(self):
+                raise RuntimeError("register does not exist")
+
+            def write_calibration(self, record, persist=True):
+                pass
+
+            def set_orientation(self, rotation, persist=True):
+                pass
+
+            def cal_gyro(self):
+                pass
+
+            def cal_mag_start(self):
+                pass
+
+            def cal_mag_stop(self):
+                pass
+
+            def cal_abort(self):
+                pass
+
+            def save_calibration(self):
+                pass
+
+            def read_cal_epoch(self):
+                return 1
+
+            def read_cal_progress(self):
+                return (0, 0, 0)
+
+        legacy = LegacyUnit()
+        switch_suite(cfg, SuiteState.load(os.path.join(tmp, 's2.yaml')),
+                    opener=lambda k, **kw: legacy)
+        legacy.set_param('sample_rate', 500)
+        reports = freeze_suite(cfg, path, only_unit='u1',
+                               opener=lambda k, **kw: legacy)
+        assert reports[0].ok
+        assert any('calibration surface unavailable' in a
+                   for a in reports[0].actions)
+        assert any('sample_rate' in a for a in reports[0].actions)
+
+
+def test_freeze_pin_normalizes_a_full_build_identity():
+    """A device serving `git describe` pins its proven triple, never the
+    raw string the manifest parser would reject."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path, cfg, _ = _tuned_setup(tmp)
+        fake = FakeUnit(fw='v1.2.3-4-g87fdf5b')
+        switch_suite(cfg, SuiteState.load(os.path.join(tmp, 's2.yaml')),
+                    opener=lambda k, **kw: fake)
+        reports = freeze_suite(cfg, path, only_unit='u1', pin_firmware=True,
+                               opener=lambda k, **kw: fake)
+        assert reports[0].ok and reports[0].firmware == '1.2.3'
+        # The rewritten manifest is still a valid manifest.
+        assert load_suite_config(path).units[0].firmware == '1.2.3'
+
+
+def test_freeze_pin_leaves_the_pin_on_a_bare_sha():
+    """An untagged build proves no version; the pin must not adopt it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path, cfg, _ = _tuned_setup(tmp)
+        fake = FakeUnit(fw='87fdf5b')
+        switch_suite(cfg, SuiteState.load(os.path.join(tmp, 's2.yaml')),
+                    opener=lambda k, **kw: fake)
+        reports = freeze_suite(cfg, path, only_unit='u1', pin_firmware=True,
+                               opener=lambda k, **kw: fake)
+        assert reports[0].ok
+        assert reports[0].firmware is None
+        assert any('proves no version' in a for a in reports[0].actions)
+
+
 def test_freeze_all_isolates_a_dead_unit():
     with tempfile.TemporaryDirectory() as tmp:
         path = os.path.join(tmp, 'suite.yaml')

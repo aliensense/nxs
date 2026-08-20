@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# PYTHON_ARGCOMPLETE_OK
 """
 nxs — command-line tool for NXS sensor VM.
 
@@ -9,7 +10,7 @@ Usage:
     nxs get <param>
     nxs set <param> <value>
     nxs stream [--count N] [--raw]
-    nxs ros2 [--plan] [--stamp synced|device|arrival] [--launch-file]
+    nxs ros2 [--plan] [--stamp synced|device|arrival|itow] [--launch-file]
     nxs status
 
 Options:
@@ -25,19 +26,22 @@ Options:
 import argparse
 import collections
 import importlib
+import importlib.util
 import os
 import struct
 import sys
 import time
 
-from nxs._generated_constants import CyphalDefaults, NxsDevices
+from nxs._generated_constants import CyphalDefaults, NxsDevices, RunnerStates
 from nxs.client import (
     ACTIVE_SLOT, ERRNO_EEXIST, PUSH_INTERVAL_S, DeviceRefused,
-    SupportsBitTiming, SupportsCanTermination, SupportsCommissioning,
-    SupportsEgressDecimation, SupportsFaultCounters, SupportsIdentify,
-    SupportsRecovery, SupportsSlotPeek, SupportsTimeSync)
+    SupportsBitTiming, SupportsCalibration, SupportsCanTermination,
+    SupportsCommissioning, SupportsEgressDecimation, SupportsFaultCounters,
+    SupportsIdentify, SupportsRecovery, SupportsSlotPeek, SupportsTimeSync,
+    ROTATION_NAMES, rotation_code, rotation_name)
 from nxs.transports import open_client
 from nxs.compiler import CompileError, SEMANTIC_NAMES
+from nxs.stamp_modes import STAMP_ITOW, STAMP_MODES, STAMP_SYNCED
 from nxs.image import NXS_MAJOR, NXS_MINOR, peek_format, serialize
 from nxs.descriptor import (
     effective_scale_fields, is_decodable, parse_sample, sample_width)
@@ -272,6 +276,17 @@ def _is_mutating(args) -> bool:
     return False
 
 
+def _require_supported_version(t):
+    """Exit loudly if the device's register-map contract differs from the one
+    this tool speaks. I2C serves PROTO_VERSION; the Cyphal transports return
+    None (no such register) and are skipped. A read failure is left to the
+    command itself to diagnose."""
+    from nxs.client import contract_mismatch
+    mm = contract_mismatch(t)
+    if mm is not None:
+        sys.exit(f"nxs: {mm} — use a matching nxs (`nxs probe` for details).")
+
+
 def _warn_if_suite_managed(args):
     """One stderr note when a flag-addressed mutating verb targets a
     declared unit. Best-effort: a missing or broken manifest never
@@ -310,15 +325,29 @@ def _warn_if_suite_managed(args):
             return
 
 
+# The verbs that must reach an off-contract device: `probe` reports the
+# version, `push-fw` and `recover` carry the firmware that ends the mismatch.
+VERSION_GATE_EXEMPT = ('probe', 'push-fw', 'recover')
+
+
+def _probe_detail(t) -> str:
+    """Trailing " — reason" when the transport knows why the probe found
+    nothing; empty when it does not."""
+    getter = getattr(t, "probe_failure_detail", None)
+    detail = getter() if getter is not None else None
+    return f" — {detail}" if detail else ""
+
+
 def cmd_probe(t, args):
     ok = t.probe()
-    print(f"NXS @ {_describe_target(args)}: {'found' if ok else 'NOT FOUND'}")
+    print(f"NXS @ {_describe_target(args)}: "
+          f"{'found' if ok else 'NOT FOUND' + _probe_detail(t)}")
     if ok:
         ver = t.interface_version()
     else:
         ver = None  # don't touch the bus after a failed probe
     if ver is not None:
-        from nxs.transports.i2c import SUPPORTED_PROTO_VERSION
+        from nxs.client import SUPPORTED_PROTO_VERSION
         if ver == 0:
             print("register map: unversioned (firmware predates "
                   "PROTO_VERSION)")
@@ -331,16 +360,25 @@ def cmd_probe(t, args):
 
 
 def _upload_and_run(t, img):
+    from nxs.client import await_driver_up
+
     t.upload_image(img)
     t.vm_run()
-    # Store + sensor probe finish asynchronously after RUN; poll until the
-    # driver is up so we don't report success while it's still loading.
-    for _ in range(15):
-        if t.read_driver_name():
-            print("Uploaded and running.")
-            return 0
-        time.sleep(0.2)
-    print("Uploaded, but the driver did not come up — check the device log.",
+    # Store + sensor probe finish asynchronously after RUN. Waiting on the
+    # runner state rather than on a driver name distinguishes "up" from
+    # "loaded but the sensor never answered" — the name is set at load, so it
+    # reports success on a driver that is about to fail its probe.
+    state = RunnerStates.RunnerState
+    settled = await_driver_up(t)
+    if settled == state.MEASURING:
+        print("Uploaded and running.")
+        return 0
+    if settled == state.PROBE_FAILED:
+        print("Uploaded, but no sensor answered the driver — check the wiring "
+              "and the driver's bus/address params.", file=sys.stderr)
+        return 1
+    print(f"Uploaded, but the driver did not come up (runner is "
+          f"{state._NAMES.get(settled, settled)}) — check the device log.",
           file=sys.stderr)
     return 1
 
@@ -348,7 +386,23 @@ def _upload_and_run(t, img):
 def cmd_upload(t, args):
     src = args.driver
 
-    # (a) An existing file is already a compiled .nxs image — upload it as
+    # (a) A local .py is a driver source: compile it exactly like the
+    #     driver-name branch, honoring --param / -o (the Driver
+    #     Development Guide's authoring flow).
+    if os.path.isfile(src) and src.endswith('.py'):
+        label = os.path.splitext(os.path.basename(src))[0]
+        spec = importlib.util.spec_from_file_location(label, src)
+        mod = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(mod)
+        except Exception as e:
+            from nxs.client import import_failure_detail
+            print(f"error: {src} failed to import: "
+                  f"{import_failure_detail(e, src)}", file=sys.stderr)
+            return 1
+        return _compile_from_module(t, mod, label, args)
+
+    # (b) Any other existing file is a compiled .nxs image — upload it as
     #     is. Its params are baked in, so --param / -o don't apply.
     if os.path.isfile(src):
         if args.config:
@@ -379,7 +433,7 @@ def cmd_upload(t, args):
         print(f"Uploading {src}: {len(img)}B image")
         return _upload_and_run(t, img)
 
-    # (b/c) Otherwise treat src as a driver name and compile drivers/<name>.py.
+    # (c) Otherwise treat src as a driver name and compile drivers/<name>.py.
     driver_name = src.lower()
     try:
         mod = importlib.import_module(f"nxs.drivers.{driver_name}")
@@ -388,7 +442,13 @@ def cmd_upload(t, args):
               f"driver skill (writes drivers/{driver_name}.py), or pass a "
               f"path to a compiled .nxs.", file=sys.stderr)
         return 1
+    return _compile_from_module(t, mod, driver_name, args)
 
+
+def _compile_from_module(t, mod, label, args):
+    """Compile the SensorDriver found in `mod` and upload (or, with -o,
+    write) the image — the shared tail of the driver-name and local-.py
+    upload branches."""
     # Find SensorDriver subclass
     from nxs.compiler import SensorDriver
     drv_cls = None
@@ -400,7 +460,7 @@ def cmd_upload(t, args):
             drv_cls = obj
             break
     if drv_cls is None:
-        print(f"No SensorDriver found in {driver_name}")
+        print(f"No SensorDriver found in {label}")
         return 1
 
     # Build config from --config args
@@ -564,6 +624,12 @@ def cmd_stream(t, args):
             break
         if attempt < 2:
             time.sleep(0.2)
+    cal_record = None
+    if isinstance(t, SupportsCalibration):
+        try:
+            cal_record = t.read_calibration()
+        except (RuntimeError, OSError, TimeoutError):
+            pass
     driver_name = name or args.driver
     if not driver_name:
         print("No driver loaded.")
@@ -606,6 +672,10 @@ def cmd_stream(t, args):
                   f"decoded values may be wrong ({cause})", file=sys.stderr)
 
     human = args.units != 'si'
+    # Width of the per-row `[ rate Hz] n=... ts=...` prefix, shared with the
+    # header pad so the columns stay aligned: fits `[9999.0 Hz] n=65535` plus
+    # a 12-digit microsecond timestamp.
+    prefix_w = 36
     show_cols = bool(fields) and not args.raw and not args.quiet
     if show_cols:
         header = "  ".join(f"{f['name']:>10s}" for f in fields)
@@ -614,8 +684,8 @@ def cmd_stream(t, args):
             for f in fields)
         print(f"Streaming {driver_name} — {len(fields)} fields, "
               f"{sample_size}B/sample, every_nth={every_nth} (ctrl-C to stop)\n")
-        print(f"{'':>22s}  {header}")
-        print(f"{'':>22s}  {units}")
+        print(f"{'':>{prefix_w}s}  {header}")
+        print(f"{'':>{prefix_w}s}  {units}")
     else:
         print(f"Streaming {driver_name} (sample_size={sample_size}, "
               f"every_nth={every_nth}, ctrl-C to stop)\n")
@@ -681,9 +751,10 @@ def cmd_stream(t, args):
                         print(f"{prefix} len={len(s.raw)}  "
                               f"{' '.join(f'{b:02X}' for b in s.raw)}")
                 else:
-                    values = s.values or (parse_sample(s.raw, local_fields)
+                    values = s.values or (parse_sample(s.raw, local_fields,
+                                                       cal_record, name)
                                           if local_fields else {})
-                    print(f"{prefix}  "
+                    print(f"{prefix:<{prefix_w}s}  "
                           f"{_format_sample_columns(values, fields, human)}")
             if count is not None and samples >= count:
                 break
@@ -840,8 +911,8 @@ def cmd_ros2(args, opener=open_client, argv=None):
     """Bridge decoded samples onto ROS 2 topics: the whole suite by
     default, one unit with --unit, or an ad-hoc flag-addressed device."""
     from nxs.ros2_bridge import (
-        Ros2Bridge, UnitPlan, acquire_run_lock, format_plan, join_topic,
-        load_map, plan_publications, run_bridge)
+        Ros2Bridge, UnitPlan, acquire_run_lock, epoch_binding, format_plan,
+        join_topic, load_map, plan_publications, run_bridge)
 
     if getattr(args, 'launch_file', False):
         print(os.path.join(os.path.dirname(__file__), 'ros2',
@@ -900,7 +971,8 @@ def cmd_ros2(args, opener=open_client, argv=None):
             continue
         pubs = load_map(args.map) if args.map else plan_publications(fields)
         frame = args.frame_id or name or driver or 'nxs'
-        plans.append(UnitPlan(name=name, frame_id=frame, publications=pubs))
+        plans.append(UnitPlan(name=name, frame_id=frame, publications=pubs,
+                              epoch=epoch_binding(fields)))
         clients.append(client)
 
     if not plans:
@@ -928,8 +1000,9 @@ def cmd_ros2(args, opener=open_client, argv=None):
         for pub in plan.publications:
             print(f"publishing {join_topic(args.topic_base, plan.name, pub.topic)}"
                   f"  [{pub.msg_type}]")
-    if args.stamp == 'synced':
-        # Warm-start the estimators. The per-unit bound banner prints
+    if args.stamp in (STAMP_SYNCED, STAMP_ITOW):
+        # Warm-start the estimators — itow's documented fallback is the
+        # synced projection. The per-unit bound banner prints
         # from run_bridge once a unit's first samples flow — transports
         # without a time surface (I2C) observe on the sample polls, so
         # no transport has a bound to show before streaming starts.
@@ -1016,14 +1089,21 @@ def _get_output_fields(driver_name, t):
     if drv_cls is None:
         return []
 
-    # Read current param values from device to build matching config
+    # Read current param values from device to build matching config. A
+    # failure here is NOT harmless: fields whose scale tracks a param (an
+    # IMU's full-scale range, typically) would silently decode at the
+    # driver's compiled default instead of the device's live value, and the
+    # printed columns would look entirely ordinary while being wrong.
     config = {}
     try:
         caps = t.read_capabilities()
         for p in caps:
             config[p['name']] = p['current']
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"warning: could not read live parameters ({e}) — refusing to "
+              f"decode with compiled defaults, which would print plausible "
+              f"but wrong values", file=sys.stderr)
+        return []
 
     # Compile with current config to get output fields with correct scales
     try:
@@ -1085,7 +1165,7 @@ def cmd_status(t, args):
 
     ok = t.probe()
     if not ok:
-        print(f"NXS @ {_describe_target(args)}: NOT FOUND")
+        print(f"NXS @ {_describe_target(args)}: NOT FOUND{_probe_detail(t)}")
         return 1
 
     status = t.read_status()
@@ -1098,6 +1178,7 @@ def cmd_status(t, args):
     runner_state = t.read_runner_state()
     probe_retries = t.read_probe_retries()
     serial = t.read_serial()
+    fw = t.read_fw_version()
 
     vm_state_names = {0: 'IDLE', 1: 'RUNNING', 2: 'ERROR'}
     flags = []
@@ -1119,6 +1200,8 @@ def cmd_status(t, args):
     print(f"NXS @ {_describe_target(args)}")
     if serial and any(serial):
         print(f"  Serial:  {serial.hex()}")
+    if fw:
+        print(f"  FW:      {fw}")
     print(f"  Driver:  {name or '(none)'}")
     print(f"  VM:      {vm_state_names.get(state, '?')} "
           f"(0x{status:02X}: {', '.join(flags) or 'idle'})")
@@ -1149,16 +1232,28 @@ def cmd_status(t, args):
             else:
                 print("  Sync:    -")
     if isinstance(t, SupportsFaultCounters):
-        # Firmware without the fault-counter registers refuses the
-        # read; status stays useful without the line.
+        # Firmware without the fault-counter surface refuses the
+        # read; status stays useful without the lines.
+        overflow_read = getattr(t, "read_cmd_queue_overflow_count", None)
         try:
             io_err = t.read_io_err_count()
             probe_failed = t.read_probe_failed_count()
+            drdy = t.read_drdy_coalesced_count()
+            rejects = t.read_ingress_reject_count()
+            overflows = overflow_read() if overflow_read else None
         except (RuntimeError, OSError, TimeoutError):
             pass
         else:
-            print(f"  Faults:  {io_err} I/O errors absorbed, "
-                  f"{probe_failed} probe failures")
+            # A healthy device stays quiet: the block appears only when a
+            # counter is nonzero, so a Faults line always means something.
+            if any((io_err, probe_failed, drdy, rejects, overflows)):
+                print(f"  Faults:  {io_err} I/O errors absorbed, "
+                      f"{probe_failed} probe failures")
+                print(f"           {drdy} samples missed (VM busy at DRDY), "
+                      f"{rejects} commands rejected (bus contention)")
+                if overflows is not None:
+                    print(f"           {overflows} writes dropped "
+                          f"(device queue full)")
     if error:
         print(f"  Error:   {error}")
     return 0
@@ -1249,10 +1344,13 @@ def cmd_store_clear(t, args):
 
 
 def cmd_cycle(t, args):
+    from nxs.client import await_driver_up
     from nxs.transports.i2c import RUNNER_STATES
     old_slot = t.read_active_slot()
     t.cycle()
-    time.sleep(0.3)
+    # The cycled slot re-loads and re-probes asynchronously; a fixed sleep
+    # either reports a stale slot or waits longer than the probe needs.
+    await_driver_up(t)
     new_slot = t.read_active_slot()
     runner = RUNNER_STATES.get(t.read_runner_state(), "?")
     print(f"Cycled: slot {old_slot} → {new_slot}  state={runner}")
@@ -1296,6 +1394,29 @@ def cmd_identify(t, args):
     return 0
 
 
+def cmd_set_orientation(t, args):
+    if not isinstance(t, SupportsCalibration):
+        print(f"set-orientation: not supported on transport '{args.transport}'",
+              file=sys.stderr)
+        return 1
+    if args.rotation is None:
+        print(f"orientation = {rotation_name(t.read_calibration().orientation)}")
+        return 0
+    try:
+        code = rotation_code(args.rotation)
+    except ValueError as e:
+        print(f"set-orientation: {e}", file=sys.stderr)
+        return 1
+    try:
+        t.set_orientation(code, persist=not args.no_persist)
+    except (RuntimeError, ValueError) as e:
+        print(f"set-orientation: {e}", file=sys.stderr)
+        return 1
+    print(f"orientation = {args.rotation.upper()}"
+          f"{'' if args.no_persist else ' (persisted)'}")
+    return 0
+
+
 def cmd_env(args):
     import nxs
     root = os.path.join(os.path.dirname(os.path.abspath(nxs.__file__)), 'dsdl')
@@ -1305,7 +1426,31 @@ def cmd_env(args):
                          ('UAVCAN__NODE__ID', str(CyphalDefaults.HOST_NODE_ID))):
         if not os.environ.get(key):
             print(f'export {key}={default}')
+    _print_completion()
     return 0
+
+
+def _print_completion():
+    """Emit argcomplete's registration for the eval'd `nxs env` line.
+
+    argcomplete completes verbs, subcommands, flags, and argument
+    choices from the live parser, so the completion never drifts from
+    the CLI. The snippet is bash-flavored; the zsh guard loads
+    bashcompinit first. Other shells get the exports only.
+    """
+    try:
+        from argcomplete.shell_integration import shellcode
+    except ImportError:
+        return
+    body = shellcode(["nxs"], shell="bash").strip()
+    print("""
+if [ -n "${BASH_VERSION:-}${ZSH_VERSION:-}" ]; then
+if [ -n "${ZSH_VERSION:-}" ]; then
+    typeset -f compdef >/dev/null 2>&1 || { autoload -U compinit && compinit; }
+    autoload -U +X bashcompinit && bashcompinit
+fi
+%s
+fi""" % body)
 
 
 
@@ -1313,7 +1458,7 @@ def cmd_timesync(t, args):
     """Refresh the estimator and push the discipline on a fixed cadence.
     The pushed offset maps the device clock into host CLOCK_REALTIME —
     the star topology's mesh epoch is this host."""
-    from nxs.client import estimate_and_push
+    from nxs.client import DeviceRefused, XFER_EBUSY, estimate_and_push
 
     if not isinstance(t, SupportsTimeSync):
         print("timesync: this transport serves no time surface")
@@ -1321,6 +1466,28 @@ def cmd_timesync(t, args):
     while True:
         try:
             bound = estimate_and_push(t, interval_s=args.interval)
+        except DeviceRefused as e:
+            if e.code != XFER_EBUSY or args.once:
+                print(f"timesync: {e}")
+                return 1
+            # A transfer session holds the mux (a driver upload or a
+            # firmware push). The resident pusher skips the interval and
+            # lives — killing it here silently decays mesh time.
+            print("timesync: mux held (transfer in flight) — skipping")
+            time.sleep(args.interval)
+            continue
+        except OSError as e:
+            if args.once:
+                print(f"timesync: {e}")
+                return 1
+            # The device NACKs the bus outright while a firmware push
+            # erases its staging slot (~2.4 s of deafness) and again across
+            # the reboot that applies it. A resident pusher rides that out
+            # — dying on a transient bus error decays mesh time for the
+            # whole rig long after the push has finished.
+            print(f"timesync: link unavailable ({e}) — skipping")
+            time.sleep(args.interval)
+            continue
         except RuntimeError as e:
             print(f"timesync: {e}")
             return 1
@@ -1518,7 +1685,7 @@ def _tool_version() -> str:
 class _VersionAction(argparse.Action):
     """`--version`, computed lazily. Building the version string runs
     `git describe`; a plain `action='version'` string would execute it at
-    parser construction — on every invocation, not just `--version`."""
+    parser construction, which is every invocation of the tool."""
 
     def __call__(self, parser, namespace, values, option_string=None):
         print(f"nxs {_tool_version()}")
@@ -1655,13 +1822,16 @@ def build_parser():
                         help='header.frame_id for a single device '
                              '(default: the unit name, else the driver '
                              'name)')
-    p_ros2.add_argument('--stamp', choices=['synced', 'device', 'arrival'],
-                        default='synced',
+    p_ros2.add_argument('--stamp', choices=list(STAMP_MODES),
+                        default=STAMP_SYNCED,
                         help='header.stamp source: the device clock '
                              'projected onto host time via two-way sync '
                              '(synced, default), the raw device '
-                             'microsecond clock (device), or ROS time '
-                             'on arrival')
+                             'microsecond clock (device), ROS time '
+                             'on arrival, or the GNSS in-message epoch '
+                             'mapped to UTC (itow; epoch-capable drivers '
+                             'only, gated on fix validity, falls back to '
+                             'synced)')
     p_ros2.add_argument('--map', metavar='FILE', default=None,
                         help='Explicit mapping YAML replacing the '
                              'semantic auto-map (single device only)')
@@ -1698,7 +1868,7 @@ def build_parser():
     store_sub.add_parser(
         'cycle', help='Force advance to next populated slot')
 
-    sub.add_parser('env', help='Print CYPHAL_PATH exports for stock yakut: eval "$(nxs env)"')
+    sub.add_parser('env', help='Print CYPHAL_PATH exports and shell completion: eval "$(nxs env)"')
 
     p_ts = sub.add_parser('timesync',
                           help='Push the host time discipline to this one '
@@ -1735,6 +1905,20 @@ def build_parser():
     p_term.add_argument('value', nargs='?', default=None,
                         help='on | off | default (revert to off); omit to read')
 
+    from nxs.calibrate import add_calibrate_parser
+    add_calibrate_parser(sub)
+
+    p_orient = sub.add_parser(
+            'set-orientation',
+            help='Declare the mounting orientation (a ROTATION_* name)')
+    p_orient.add_argument('rotation', nargs='?', default=None,
+                          type=str.upper, choices=ROTATION_NAMES,
+                          metavar='ROTATION',
+                          help='one of: ' + ' '.join(ROTATION_NAMES)
+                               + '. Omit to print the current orientation')
+    p_orient.add_argument('--no-persist', action='store_true',
+                          help='Apply to the running state only (no Save)')
+
     p_comm = sub.add_parser('commission',
                             help='Read/set the persisted node-ID and subject-IDs')
     p_comm.add_argument('--node-id', type=int, default=None,
@@ -1758,7 +1942,13 @@ def build_parser():
 
 
 def main():
-    args = build_parser().parse_args()
+    parser = build_parser()
+    try:
+        import argcomplete
+        argcomplete.autocomplete(parser)
+    except ImportError:
+        pass
+    args = parser.parse_args()
 
     # `upload -o FILE` compiles to a file with no device attached; every
     # other command needs a transport.
@@ -1802,6 +1992,18 @@ def main():
 
     # Flag-addressed mutation of a declared unit gets a breadcrumb; with
     # --unit the operator already named the unit, so stay silent.
+    # This tool speaks a single register-map contract
+    # (SUPPORTED_PROTO_VERSION). A device on another contract
+    # would misbehave silently — a failed push leaves its VM halted, status
+    # prints fabricated counters, an upload reads as a fake "Uploaded" — so
+    # refuse loudly before any session-stateful traffic. Three verbs are
+    # exempt because they are how a mismatch gets diagnosed and repaired:
+    # `probe` reports the version, and `push-fw` / `recover` carry the new
+    # firmware that ends the mismatch. Gating those would strand a fielded
+    # device on its old contract with no upgrade path but a J-Link.
+    if args.command not in VERSION_GATE_EXEMPT:
+        _require_supported_version(t)
+
     if getattr(args, 'unit', None) is None and _is_mutating(args):
         _warn_if_suite_managed(args)
 
@@ -1830,8 +2032,13 @@ def main():
             'can-bitrate': cmd_can_bitrate,
             'can-term': cmd_can_term,
             'commission': cmd_commission,
+            'set-orientation': cmd_set_orientation,
         }
-        dispatch = commands[args.command]
+        if args.command == 'calibrate':
+            from nxs.calibrate import cmd_calibrate
+            dispatch = cmd_calibrate
+        else:
+            dispatch = commands[args.command]
 
     # A command that reads live device state misreports an unreachable node:
     # `caps` prints "No driver loaded", `get` an empty value — each interprets
@@ -1844,12 +2051,13 @@ def main():
     # re-`upload`, or `reset` — a hard refusal would leave the wedge no exit.
     NEEDS_DEVICE = {'caps', 'outputs', 'get', 'set', 'stream', 'run',
                     'decimation', 'can-bitrate', 'can-term', 'commission', 'store',
-                    'identify'}
+                    'identify', 'calibrate', 'set-orientation'}
     RECOVERY_VERBS = {'stop', 'upload', 'reset'}
     if args.command in NEEDS_DEVICE | RECOVERY_VERBS and not t.probe():
         if args.command in NEEDS_DEVICE:
-            print(f"nxs: NXS not found on {args.transport} "
-                  f"(check wiring / power / -t/-b/-p or the $NXS_* env vars)",
+            detail = _probe_detail(t) or (" (check wiring / power / -t/-b/-p "
+                                          "or the $NXS_* env vars)")
+            print(f"nxs: NXS not found on {args.transport}{detail}",
                   file=sys.stderr)
             return 1
         print(f"nxs: no probe answer on {args.transport}; "

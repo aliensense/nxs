@@ -138,9 +138,13 @@ def step_probe(t, args) -> str:
     if decision == "skip":
         return "skip"
     while True:
-        ok, _ = _call(args, _cli.cmd_probe, t)
+        ok, exc = _call(args, _cli.cmd_probe, t)
         if ok:
             return "go"
+        # A permission error, a missing smbus2, or a timeout already carrying
+        # the mux-holder state is a better answer than the wiring checklist.
+        if exc is not None:
+            err(f"probe failed: {exc}")
         print_probe_diagnostic(args)
         a = input(
             f"\n{YELLOW}[probe]{NC} Enter=retry, s=skip, q=quit: "

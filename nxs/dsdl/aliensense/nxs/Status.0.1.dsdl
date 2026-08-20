@@ -13,4 +13,4 @@ uint32 uptime_ms            # since boot
 uint32 sample_count         # VM sample counter at emit time
 uint8 free_slots            # store capacity - populated count
 
-@sealed
+@extent 128 * 8

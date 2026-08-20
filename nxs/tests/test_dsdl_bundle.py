@@ -35,7 +35,11 @@ def test_bundled_aliensense_covers_repo_source():
         pytest.skip("repo source dsdl/aliensense absent (installed, not a checkout)")
 
     bundled = os.path.join(os.path.dirname(here), "dsdl", "aliensense")
-    missing = _rel_dsdl(source) - _rel_dsdl(bundled)
+    # Internal channel payload types (nxs/internal/) never appear on a
+    # wire; vendor-dsdl.sh strips them from the customer bundle.
+    internal_prefix = os.path.join("nxs", "internal") + os.sep
+    missing = {f for f in _rel_dsdl(source) - _rel_dsdl(bundled)
+               if not f.startswith(internal_prefix)}
     assert not missing, (
         "bundled DSDL is stale — run scripts/vendor-dsdl.sh. Missing: "
         + ", ".join(sorted(missing)))

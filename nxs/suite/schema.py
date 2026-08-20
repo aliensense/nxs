@@ -23,7 +23,7 @@ _TOP_KEYS = {"suite", "defaults", "units"}
 _SUITE_KEYS = {"name"}
 _DEFAULTS_KEYS = {"firmware"}
 _UNIT_KEYS = {"name", "module", "links", "serial", "firmware", "sensors",
-              "egress"}
+              "egress", "orientation"}
 _EGRESS_KEYS = {"decimation", "subjects"}
 # The SI-subject tokens the per-subject factors address (SubjectBucket
 # names; the same tokens name the Cyphal decimation.<subject> registers).
@@ -120,6 +120,10 @@ class UnitSpec:
     egress: Optional[EgressSpec] = None
     serial: Optional[str] = None
     firmware: Optional[str] = None
+    # Declared mounting orientation (a ROTATION_* name) — installer intent,
+    # tied to the position: it transfers to a swapped board, unlike the
+    # solved per-silicon calibration, which never enters the manifest.
+    orientation: Optional[str] = None
 
 
 @dataclass
@@ -135,6 +139,44 @@ def parse_version(text: str) -> tuple:
         raise ValueError(f"bad version {text!r} (expected MAJOR.MINOR[.PATCH])")
     nums = [int(p) for p in parts] + [0]
     return tuple(nums[:3])
+
+
+_DEVICE_VERSION_RE = re.compile(
+    r"v?(\d+)\.(\d+)(?:\.(\d+))?"
+    r"(?:$|-dirty$|-\d+-g[0-9a-f]+(?:-dirty)?$)")
+
+
+def parse_device_version(text):
+    """Version triple proven by a device identity string, or None.
+
+    The wire serves either the legacy "MAJOR.MINOR" pair or the full
+    build identity: "v1.0.0-4-g87fdf5b" (`git describe` — tag, commits
+    above it, short SHA), "-dirty" suffixed on an unclean build, and a
+    bare "87fdf5b" when no release tag was reachable. Only those forms
+    prove anything: a prerelease tag ("v1.0.0-rc1", with or without a
+    describe suffix) is not the release it borrows numbers from, so it
+    proves None — the pin logic then falls back to state records
+    rather than reading an RC as converged with a final pin. Unlike
+    `parse_version` this never raises — the string crossed a wire, not
+    a manifest review.
+    """
+    m = _DEVICE_VERSION_RE.match(str(text))
+    if m is None:
+        return None
+
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0))
+
+
+def device_proves_patch(text):
+    """Whether a device identity string pins its patch component.
+
+    Legacy firmware serves the bare "MAJOR.MINOR" pair, which proves
+    nothing below the minor; a full build identity carries the tag's
+    triple and makes the patch comparable against a pin.
+    """
+    m = _DEVICE_VERSION_RE.match(str(text))
+
+    return m is not None and m.group(3) is not None
 
 
 def normalize_serial(text, where: str) -> str:
@@ -311,8 +353,18 @@ def _parse_unit(raw, where: str, defaults: dict) -> UnitSpec:
         except ValueError as e:
             raise ManifestError(f"{where}.firmware: {e}") from None
 
+    orientation = raw.get("orientation")
+    if orientation is not None:
+        from nxs.client import rotation_code
+        try:
+            rotation_code(str(orientation))
+        except ValueError as e:
+            raise ManifestError(f"{where}.orientation: {e}") from None
+        orientation = str(orientation).upper()
+
     return UnitSpec(name=name, module=module, links=links, sensors=sensors,
-                    egress=egress, serial=serial, firmware=firmware)
+                    egress=egress, serial=serial, firmware=firmware,
+                    orientation=orientation)
 
 
 def parse_suite_config(raw: dict, where: str = "suite.yaml") -> SuiteConfig:

@@ -12,7 +12,7 @@ touches devices the manifest does not claim.
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from nxs.client import SupportsCommissioning
+from nxs.client import SupportsCommissioning, contract_mismatch
 from nxs.suite.schema import SuiteConfig
 from nxs.suite.state import SuiteState
 from nxs.transports import open_client
@@ -56,6 +56,11 @@ def reset_suite(cfg: SuiteConfig, state: SuiteState, *,
                 reports.append(report)
                 continue
             report.link = mgmt_link.describe()
+            if mismatch := contract_mismatch(transport, unreadable_is_skew=True):
+                report.ok = False
+                report.error = mismatch
+                reports.append(report)
+                continue
             report.actions.extend(notes)
             _reset_unit(unit, state, transport, report, factory=factory)
         except Exception as e:

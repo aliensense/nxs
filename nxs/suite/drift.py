@@ -4,7 +4,9 @@ its manifest entry, at the granularity the wire can prove.
 `apply` consumes it to repair (manifest wins), `freeze` to adopt
 (device wins), `status` to display. Axes:
 
-- driver: the active driver is not one the manifest declares;
+- driver: the active driver is not one the manifest declares, or it
+  loaded and never probed a sensor (the runner parks in PROBE_FAILED,
+  so nothing clears that on its own);
 - shape: the stored panel differs (slot count, or the manifest's
   sensor list changed since the last deploy);
 - params: the active driver runs values other than the manifest's
@@ -18,7 +20,9 @@ its manifest entry, at the granularity the wire can prove.
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 
-from nxs.suite.schema import UnitSpec, parse_version
+from nxs._generated_constants import RunnerStates
+from nxs.suite.schema import (UnitSpec, device_proves_patch,
+                              parse_device_version, parse_version)
 from nxs.suite.state import SuiteState
 
 
@@ -29,10 +33,11 @@ class UnitDrift:
     params: Dict[str, Tuple[object, object]] = field(default_factory=dict)
     egress: Dict[str, Tuple[object, object]] = field(default_factory=dict)
     fw: bool = False
+    orientation: bool = False
 
     def any(self) -> bool:
         return (self.driver or self.shape or bool(self.params)
-                or bool(self.egress) or self.fw)
+                or bool(self.egress) or self.fw or self.orientation)
 
     def kinds(self) -> List[str]:
         """Render labels, most invasive first."""
@@ -47,7 +52,18 @@ class UnitDrift:
             kinds.append("egress")
         if self.fw:
             kinds.append("fw")
+        if self.orientation:
+            kinds.append("orientation")
         return kinds
+
+
+def orientation_drift(unit: UnitSpec, transport) -> bool:
+    """True when the declared mounting orientation differs from the device."""
+    from nxs.client import SupportsCalibration, rotation_code
+    if unit.orientation is None or not isinstance(transport, SupportsCalibration):
+        return False
+    return transport.read_calibration().orientation \
+        != rotation_code(unit.orientation)
 
 
 def firmware_drift(unit: UnitSpec, state: SuiteState, transport) -> bool:
@@ -58,9 +74,17 @@ def firmware_drift(unit: UnitSpec, state: SuiteState, transport) -> bool:
     want = parse_version(unit.firmware)
     device = transport.read_fw_version()
 
-    # A provable major.minor mismatch always flashes — the wire is
-    # authoritative for a contradiction, whatever the state record says.
-    if device is not None and parse_version(device)[:2] != want[:2]:
+    # The wire is authoritative for whatever it proves. A full build
+    # identity proves the whole triple and decides alone: a mismatch
+    # flashes whatever the record says, and an exact match converges
+    # even over a stale record — an out-of-band flash to the pinned
+    # version must not earn a reboot the wire disproves.
+    device_ver = parse_device_version(device) if device is not None else None
+    if device_ver is not None and device_proves_patch(device):
+        return device_ver != want
+    # A legacy identity proves major.minor only; a pair mismatch is a
+    # contradiction and flashes.
+    if device_ver is not None and device_ver[:2] != want[:2]:
         return True
     # major.minor agrees (or the wire serves nothing). The state record
     # refines to the exact pin — this tool knows the patch it flashed, so
@@ -75,10 +99,12 @@ def firmware_drift(unit: UnitSpec, state: SuiteState, transport) -> bool:
         except ValueError:
             return True
     # No record: accept a proven major.minor match as converged rather
-    # than a disruptive reflash (patch is below what the wire proves);
+    # than a disruptive reflash (a legacy pair proves nothing below the
+    # minor, and a full identity already had its patch compared above);
     # flash once only when the wire can't even prove major.minor
-    # (firmware predating the FW_VERSION registers).
-    return device is None
+    # (firmware predating the FW_VERSION registers, or an untagged build
+    # serving a bare SHA).
+    return device_ver is None
 
 
 def egress_drift(unit: UnitSpec, transport) -> Dict[str, Tuple[object, object]]:
@@ -108,7 +134,8 @@ def detect_unit_drift(unit: UnitSpec, panel: list, transport,
     caller so apply, freeze, and status share one compilation.
     """
     drift = UnitDrift(fw=firmware_drift(unit, state, transport),
-                      egress=egress_drift(unit, transport))
+                      egress=egress_drift(unit, transport),
+                      orientation=orientation_drift(unit, transport))
     if not panel:
         # Declared-empty (`sensors: []`): anything running or stored is
         # driver drift. An unmanaged panel (key absent) is never drift.
@@ -120,6 +147,13 @@ def detect_unit_drift(unit: UnitSpec, panel: list, transport,
     names = [compiled.name for _, compiled in panel]
     active = transport.read_driver_name()
     if active not in names:
+        drift.driver = True
+        return drift
+    # A driver that loaded but never probed is not the manifest realized. The
+    # runner parks in PROBE_FAILED until a host command intervenes, so nothing
+    # clears it on its own and every later switch would read the name, match
+    # it, and report `converged` over a sensor that never answered.
+    if transport.read_runner_state() == RunnerStates.RunnerState.PROBE_FAILED:
         drift.driver = True
         return drift
     if transport.read_store_count() != len(panel) \

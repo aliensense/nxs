@@ -4,7 +4,8 @@ and defaults must inherit exactly one way (unit overrides suite
 default)."""
 import pytest
 
-from nxs.suite.schema import ManifestError, parse_suite_config, parse_version
+from nxs.suite.schema import (ManifestError, parse_device_version,
+                              parse_suite_config, parse_version)
 
 
 def _minimal(unit_overrides=None, **top):
@@ -176,3 +177,37 @@ def test_identity_resolves_stable_device_aliases(tmp_path):
     port_alias.symlink_to(port_node)
     assert (LinkSpec(transport='cyphal-serial', port=str(port_alias)).identity()
             == LinkSpec(transport='cyphal-serial', port=str(port_node)).identity())
+
+
+def test_parse_device_version_legacy_pair():
+    assert parse_device_version('1.4') == (1, 4, 0)
+    assert parse_device_version('1.2.3') == (1, 2, 3)
+
+
+def test_parse_device_version_describe_forms():
+    assert parse_device_version('v1.0.0-4-g87fdf5b') == (1, 0, 0)
+    assert parse_device_version('v1.2.3') == (1, 2, 3)
+    assert parse_device_version('v1.2.3-4-gdeadbee-dirty') == (1, 2, 3)
+
+
+def test_parse_device_version_unprovable_is_none_never_raise():
+    assert parse_device_version('87fdf5b') is None
+    assert parse_device_version('unknown') is None
+    assert parse_device_version('') is None
+
+
+def test_device_version_only_describe_suffixes_prove():
+    """A prerelease tag borrows the release's numbers without being it:
+    reading "v1.0.0-rc1" as 1.0.0 would let an RC converge a final pin."""
+    from nxs.suite.schema import device_proves_patch, parse_device_version
+
+    assert parse_device_version("v1.0.0-4-g87fdf5b") == (1, 0, 0)
+    assert parse_device_version("v1.0.0-4-g87fdf5b-dirty") == (1, 0, 0)
+    assert parse_device_version("v1.0.0-dirty") == (1, 0, 0)
+    assert parse_device_version("1.4") == (1, 4, 0)
+    assert parse_device_version("v1.0.0-rc1") is None
+    assert parse_device_version("v1.0.0-rc1-151-ge0f9e99") is None
+    assert parse_device_version("87fdf5b") is None
+    assert device_proves_patch("v1.2.3-4-gabc1234")
+    assert not device_proves_patch("1.2")
+    assert not device_proves_patch("v1.0.0-rc1-151-ge0f9e99")

@@ -42,6 +42,8 @@ from nxs.serial_util import open_serial_once
 # REGISTER_NAMES).
 DECIMATION_REGISTER = "aliensense.nxs.decimation"
 TIME_US_REGISTER = "aliensense.nxs.time_us"
+CALIBRATION_REGISTER = "aliensense.nxs.calibration"
+FW_DESCRIBE_REGISTER = "aliensense.nxs.fw.describe"
 
 _log = logging.getLogger(__name__)
 

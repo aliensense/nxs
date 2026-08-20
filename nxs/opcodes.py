@@ -59,6 +59,8 @@ class Op(IntEnum):
     EVENT_DIV = 0x4F  # Configure the DRDY event backend to wake YIELD on every div-th hardware edge (0/1 = every edge). Backend-config like UART_CONFIGURE; emitted once before the measure loop for a fixed-sync part whose sample_rate divides the sync. load_program resets the divider to 1.
     SLEEP_MS = 0x50  # Sleep for ms milliseconds.
     SLEEP_US = 0x51  # Sleep for us microseconds.
+    ACQ_FRAME = 0x52  # Set the pass's acquisition bound to the RX backlog's first-byte arrival; now when the stream serves no stamp. Compiled from self.stamp_frame().
+    ACQ_BIAS = 0x53  # Declare the driver's acquisition latency: every committed stamp is biased this many microseconds earlier. Emitted once after configure() from ACQUISITION_LATENCY_US.
     STORE_SAMPLE = 0x60  # Commit sample_buf to the ring slot; bump the sample counter.
     SET_SAMPLE_SIZE = 0x61  # Set the published sample size in bytes.
     MEMCPY_IMM = 0x62  # Copy `len` inline program bytes into sample_buf[dst_off..]. The data follows the header; instruction_size() returns the 3-byte header and callers add len.
@@ -121,6 +123,8 @@ INSTRUCTION_SIZE: Dict[int, int] = {
     Op.EVENT_DIV: 3,
     Op.SLEEP_MS: 3,
     Op.SLEEP_US: 3,
+    Op.ACQ_FRAME: 1,
+    Op.ACQ_BIAS: 5,
     Op.STORE_SAMPLE: 1,
     Op.SET_SAMPLE_SIZE: 2,
     Op.MEMCPY_IMM: 3,  # header only; + len inline bytes
@@ -185,6 +189,8 @@ OPCODE_SINCE_MINOR: Dict[int, int] = {
     Op.EVENT_DIV: 0,
     Op.SLEEP_MS: 0,
     Op.SLEEP_US: 0,
+    Op.ACQ_FRAME: 0,
+    Op.ACQ_BIAS: 0,
     Op.STORE_SAMPLE: 0,
     Op.SET_SAMPLE_SIZE: 0,
     Op.MEMCPY_IMM: 0,

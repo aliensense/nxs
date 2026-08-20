@@ -20,16 +20,18 @@ import time
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from nxs._generated_constants import CyphalDefaults
-from nxs.client import SupportsTimeSync, estimate_and_push
+from nxs._generated_constants import CyphalDefaults, RunnerStates
+from nxs.client import SupportsTimeSync, await_driver_up, estimate_and_push
 from nxs.compiler import SensorDriver
 from nxs.descriptor import load_driver
 from nxs.suite import DRIVERS_DIR, FIRMWARE_DIR
 from nxs.suite.drift import UnitDrift, detect_unit_drift, firmware_drift
 from nxs.suite.firmware import find_image
-from nxs.suite.schema import SuiteConfig, UnitSpec, parse_version
+from nxs.suite.schema import (SuiteConfig, UnitSpec, device_proves_patch,
+                              parse_device_version, parse_version)
 from nxs.suite.state import SuiteState
 from nxs.image import serialize
+from nxs.client import contract_mismatch, exc_detail, import_failure_detail
 from nxs.transports import open_client
 
 log = logging.getLogger("nxs.suite")
@@ -44,10 +46,19 @@ class DriverNotFound(Exception):
 
 @dataclass
 class UnitReport:
+    """One unit's converge result.
+
+    `actions` are things done to the device; `notes` are observations that
+    recur on every switch regardless of drift — the time-sync seed, a link
+    fallback, a transport that cannot verify a serial pin. The split is what
+    makes `converged` meaningful: derived from `actions` alone, it says the
+    device already matched the manifest, which a list mixing both cannot.
+    """
     name: str
     link: str
     ok: bool = True
     actions: List[str] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
     error: str = ""
 
 
@@ -63,7 +74,9 @@ def load_unit_driver(name: str, drivers_dir: str = DRIVERS_DIR):
         try:
             spec.loader.exec_module(module)
         except Exception as e:
-            raise DriverNotFound(f"{path}: import failed: {e}") from None
+            raise DriverNotFound(
+                f"{path}: import failed: "
+                f"{import_failure_detail(e, str(path))}") from e
         classes = [obj for obj in vars(module).values()
                    if isinstance(obj, type) and issubclass(obj, SensorDriver)
                    and obj.__module__ == module.__name__]
@@ -156,7 +169,7 @@ def _apply_unit(unit: UnitSpec, state: SuiteState, *, dry_run: bool,
             report.error = error
             return report
         report.link = mgmt_link.describe()
-        report.actions.extend(notes)
+        report.notes.extend(notes)
 
         ok, observed = _check_serial(unit, state, transport, report,
                                      dry_run=dry_run,
@@ -184,11 +197,38 @@ def _apply_unit(unit: UnitSpec, state: SuiteState, *, dry_run: bool,
         # not a freshly-commissioned one. Commissioning only stages the
         # next-boot node-ID, so deferring it past the flash is safe; the panel
         # reads come last so a DFU reboot never leaves them stale.
+        # A device on another register-map contract must not be commissioned
+        # or panel-converged — the tool would misread it. A pinned firmware
+        # is the repair: converge it first, then re-check; without a pin the
+        # unit is refused untouched.
+        mismatch = contract_mismatch(transport, unreadable_is_skew=True)
+        if mismatch and not unit.firmware:
+            report.ok = False
+            report.error = (mismatch + " — pin firmware for this unit to "
+                            "upgrade it, or use a matching nxs")
+            return report
+        if mismatch:
+            report.actions.append(mismatch + " — converging firmware first")
+        # A contract mismatch is itself drift, whatever the versions say: the
+        # product version and the register-map contract move independently, so
+        # a v1 and a v2 image can both report the same `fw`. Without this the
+        # pinned flash would be skipped as "converged" and the device would
+        # stay on its old contract.
         if unit.firmware and not _converge_firmware(
                 unit, state, transport, report, image_path, would, dry_run,
-                needs_flash=firmware_drift(unit, state, transport)):
+                needs_flash=(firmware_drift(unit, state, transport)
+                             or bool(mismatch))):
             return report
+        if mismatch and not dry_run:
+            mismatch = contract_mismatch(transport, unreadable_is_skew=True)
+            if mismatch:
+                report.ok = False
+                report.error = (mismatch + " after flashing the pinned "
+                                "firmware — that image does not speak this "
+                                "contract either")
+                return report
         _commission(unit, mgmt_link, transport, report, would, opener)
+        _push_orientation(unit, transport, report, would)
         if panel:
             digest = panel_hash(unit)
             drift = detect_unit_drift(unit, panel, transport, state, digest)
@@ -201,11 +241,24 @@ def _apply_unit(unit: UnitSpec, state: SuiteState, *, dry_run: bool,
             _converge_empty_panel(unit, state, transport, report, would,
                                   dry_run)
         _converge_egress(unit, transport, report, would, dry_run)
+        # Counted before the seed: the time sync runs on every switch by
+        # design, so folding it in would leave `converged` unreachable and
+        # an idempotent re-switch indistinguishable from one that changed
+        # the device.
         if not dry_run and isinstance(transport, SupportsTimeSync):
             # Seed the time discipline so the unit is synced from the
             # first converge; `nxs timesync` keeps it fresh thereafter.
-            if (bound := estimate_and_push(transport)) is not None:
-                report.actions.append(f"time sync seeded (±{bound} µs)")
+            # A seed that fails is a note, not a unit failure: the device
+            # already matches the manifest by this point, and `nxs timesync`
+            # re-seeds on its own cadence. Failing the unit here reported a
+            # converged board as ✗ and sent the operator looking for drift
+            # that was not there.
+            try:
+                if (bound := estimate_and_push(transport)) is not None:
+                    report.notes.append(f"time sync seeded (±{bound} µs)")
+            except Exception as e:
+                report.notes.append(f"time sync not seeded ({exc_detail(e)}) "
+                                    f"— `nxs timesync` will retry")
         if not report.actions:
             report.actions.append("converged")
     except Exception as e:
@@ -267,32 +320,46 @@ def _verify_edges(unit: UnitSpec, mgmt_link, reference, report,
     anything is written. A down link is reported, not fatal — the board
     is still converged over the management link. An *answering* link
     with a missing or different serial fails the unit: it may reach a
-    different board (miswiring) or a merged-bus ghost."""
+    different board (miswiring) or a merged-bus ghost.
+
+    Both verdicts are notes, not actions: proving a link answers changes
+    nothing on the device, and a unit whose links are all up and all
+    verified is exactly the one that should report `converged`."""
     for link in unit.links:
         if link is mgmt_link:
             continue
         transport, _ = _open_edge(link, opener)
         if transport is None:
-            report.actions.append(f"edge {link.describe()}: down")
+            report.notes.append(f"edge {link.describe()}: down")
             continue
+        unreadable = None
         try:
             try:
                 raw = transport.read_serial()
-            except Exception:
-                raw = None
+            except Exception as e:
+                # A NACKed transaction is not evidence of miswiring — keep
+                # the two apart, or a good harness gets re-pinned over one
+                # transient read.
+                raw, unreadable = None, e
             seen = raw.hex() if raw else None
         finally:
             try:
                 transport.close()
             except Exception:
                 pass
+        if unreadable is not None:
+            report.ok = False
+            report.error = (f"edge {link.describe()}: serial unreadable "
+                            f"({unreadable}) — retry; this is not a "
+                            f"miswiring verdict")
+            return False
         if reference is None or seen != reference:
             report.ok = False
             report.error = (f"cannot verify {link.describe()} reaches this "
                             f"board: it reports {seen or 'no serial'}, the "
                             f"management link saw {reference or 'no serial'}")
             return False
-        report.actions.append(f"edge {link.describe()}: up")
+        report.notes.append(f"edge {link.describe()}: up")
     return True
 
 
@@ -324,7 +391,7 @@ def _check_serial(unit: UnitSpec, state: SuiteState, transport, report,
     raw = transport.read_serial()
     if raw is None:
         if unit.serial:
-            report.actions.append("serial pin not verifiable on this transport")
+            report.notes.append("serial pin not verifiable on this transport")
         return True, None
     seen = raw.hex()
 
@@ -395,6 +462,24 @@ def _commission_edge(link, transport, report, would: str):
                           f"(now {current}; adopts on next power-cycle)")
 
 
+def _push_orientation(unit: UnitSpec, transport, report, would: str):
+    """Persist the declared mounting orientation when the device differs.
+
+    Only the orientation byte moves — the solved per-silicon affines on the
+    device are never touched by apply."""
+    from nxs.client import SupportsCalibration, rotation_code, rotation_name
+    if unit.orientation is None or not isinstance(transport, SupportsCalibration):
+        return
+    declared = rotation_code(unit.orientation)
+    current = transport.read_calibration().orientation
+    if current == declared:
+        return
+    if not would:
+        transport.set_orientation(declared)
+    report.actions.append(f"{would}set orientation {unit.orientation} "
+                          f"(was {rotation_name(current)})")
+
+
 def _converge_firmware(unit: UnitSpec, state: SuiteState, transport, report,
                        image_path: str, would: str, dry_run: bool, *,
                        needs_flash: bool) -> bool:
@@ -424,7 +509,13 @@ def _converge_firmware(unit: UnitSpec, state: SuiteState, transport, report,
         report.error = f"device did not return within {PROBE_AFTER_DFU_S:.0f}s after DFU"
         return False
     after = transport.read_fw_version()
-    if after and parse_version(after)[:2] != want[:2]:
+    after_ver = parse_device_version(after) if after else None
+    # A legacy pair proves major.minor; a full build identity proves the
+    # patch too — recording the pin over a wrong-patch boot would mask
+    # the failed update.
+    if after_ver is not None and (after_ver[:2] != want[:2]
+                                  or (device_proves_patch(after)
+                                      and after_ver != want)):
         report.ok = False
         report.error = f"DFU verify failed: device reports {after}, pinned {unit.firmware}"
         return False
@@ -455,12 +546,22 @@ def _converge_panel(unit: UnitSpec, state: SuiteState, transport, report,
         transport.upload_image(serialize(compiled))
         transport.save_slot(slot)
     transport.vm_run()
+    runner = await_driver_up(transport)
     active = transport.read_active_slot()
-    if 0 <= active < len(panel):
+    if runner == RunnerStates.RunnerState.MEASURING and 0 <= active < len(panel):
         report.actions.append(f"active: {names[active]} (slot {active})")
+    elif runner == RunnerStates.RunnerState.PROBE_FAILED:
+        # The runner parks here until a host command intervenes, so this is a
+        # verdict and not a stage the next poll moves past. The deploy did not
+        # achieve what the manifest asks for, and saying so is the difference
+        # between an operator checking the wiring and one trusting a tick.
+        report.ok = False
+        report.error = ("no sensor answered the deployed driver "
+                        "(check wiring, then `nxs suite status`)")
     else:
-        report.actions.append("no driver probed a sensor yet "
-                              "(check wiring, then `nxs suite status`)")
+        report.ok = False
+        report.error = (f"driver did not come up — runner is "
+                        f"{RunnerStates.RunnerState._NAMES.get(runner, runner)}")
     state.record(unit.name, panel_hash=digest)
 
 

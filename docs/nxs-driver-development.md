@@ -4,10 +4,12 @@ Applies to: NXS v1.0 · image format 1.0 · `nxs` tool 1.0.x
 
 | Document set | |
 |---|---|
-| [Datasheet](nxs-datasheet.md) | electrical, pinout, performance, supported sensors |
+| [Device Reference](nxs-device-reference.md) | interfaces, performance and limits, supported sensors, versioning |
 | [Interface Description](nxs-host-interface.md) | transports, register map, commands, procedures |
 | [Integration & Operation Manual](nxs-integration-manual.md) | design-in, host setup, workflows |
 | **Driver Development Guide** (this document) | authoring drivers for unsupported sensors |
+| [FAQ](nxs-faq.md) | frequently asked questions |
+| [Technical Specifications](nxs-specifications.md) | capability summary tables |
 
 ## 1. The authoring model
 
@@ -127,6 +129,8 @@ Each field: `{'name', 'scale', 'offset'?, 'unit'?, 'type'?, 'byte_order'?, 'scal
 
 Omit `unit` for these fields — the compiler inherits the canonical unit and rejects a conflicting declaration. Matching is by exact name, case-insensitive, after alias folding: the full semantic names (`temperature`, `frequency`, `mass`, `distance`, `flow`) and the aliases `temp`, `freq`, `weight`, `range`, and `flow_rate` all infer the same semantics as their table entries. Names outside that set are *generic*: they stream with full self-description (name, type, scale/offset, declared unit) but claim no standard subject. `scale_param` names a declared parameter whose live value multiplies the base `scale` on-device — the idiom for runtime-tunable full-scale ranges.
 
+The same semantics select per-unit calibration: fields carrying the `accel_*`, `gyro_*`, and `mag_*` semantics form the three calibration vector buckets, and the `angle` semantic carries the encoder zero-offset ([Interface Description §6.9](nxs-host-interface.md)). Declaring the semantic is the entire opt-in — the correction applies in the SI tier, so the driver's sample layout, scales, and raw stream are untouched.
+
 Fields pack sequentially by default; `'at': N` places a field at an explicit byte position within the sample — the binary-record idiom, where fields map onto scattered offsets inside a captured frame and the gaps (headers, reserved bytes, checksums) carry no fields. Explicit placement is all-or-none per driver; overlapping fields, a field past the sample buffer, or more fields than the descriptor table holds are compile errors. Every descriptor carries its resolved byte position on the wire, so hosts decode each field at its declared offset rather than accumulating widths.
 
 ### 4.4 `@measure_loop(trigger=...)`
@@ -136,6 +140,8 @@ Fields pack sequentially by default; `'at': N` places a field at an explicit byt
 The body executes on-device; `configure()`, by contrast, is traced at compile time against mock reads, so a value read in `configure()` is a placeholder — a runtime conditional on it is rejected and belongs here in `measure()`, and a register read-modify-write is `write_modify` (§4.7), whose read happens on-device at load. The body compiles to VM bytecode and resolves integer **literals** (write registers/masks as hex with a naming comment) and **UPPER_CASE class-level integer constants** (`self.CMD_X` — the home for computed wire words); any other `self.*` value is rejected, except `configure()`-bound coefficients. Reads come in two shapes: `read_burst(reg, count[, into=off])` *places* bytes in the sample buffer at `into` (default 0; a second bank takes a distinct `into=`, and an overlap is a compile error), while `read(reg, width[, signed=, endian=])` returns a *value* into a register — unsigned big-endian by default, `signed=True` for signed fields and `endian="little"` for little-endian parts. Value-reads stage off the sample buffer, so they never corrupt placed data. `sleep_ms(n)` and `sleep_us(n)` pace conversions and inter-word gaps. Control flow supports `if`/`elif`/`else` and the integer comparisons `== != < > <= >=`; loops and function calls other than the `self.*` verbs are rejected at compile time.
 
 A driver whose protocols need *different framing bytecode* — which a runtime parameter cannot patch — declares one measure loop per protocol, each tagged `when=("<config key>", <value>)`, with exactly one marked `default=True`; `compile(config)` picks the variant the config names (an unknown value, mixed tagged/untagged loops, or a missing default are compile errors). `configure()` branches on the same key in plain Python. The key is a compile-time configuration, not a runtime parameter: switching protocols means uploading the other configuration (or storing both in driver-store slots and cycling).
+
+**Acquisition timestamps.** Samples are stamped with their acquisition instant automatically: a drdy loop stamps the delivered data-ready edge; a pass nothing armed stamps its commit instant. One verb arms the bound for data that predates its delivery: `stamp_frame()` — placed at a stream loop's frame-sync point — stamps the RX backlog's first-byte arrival (equal to the frame's own first byte only while the loop drains and stamps every pass). Separately, a driver whose measurement predates every stamped bound by a knowable amount declares `ACQUISITION_LATENCY_US` (default 0), applied at commit to whichever base the pass armed: a ΔΣ conversion declares its window midpoint (start-to-read interval minus half the conversion time), a filtered part its documented group delay, a GNSS receiver its documented solution latency. Declare only documented figures — leave 0 when a downstream fusion filter models the delay itself — and override from `configure()` when the value depends on the chosen ODR/OSR/filter configuration.
 
 ### 4.5 Data path: direct reads vs the on-chip FIFO
 
@@ -369,4 +375,4 @@ A compiled `.nxs` artifact is bound to the image format it was built for; after 
 
 ## 6. Stability
 
-The DSL surface in §4 is a public API from product version 1.0. Additions (new verbs, new canonical semantics) arrive in MINOR or PATCH releases and never invalidate an existing driver source; a change that would break compiled images is a product-MINOR (image format) event, and one that would break driver *sources* is a product-MAJOR event. Versioning model: [Datasheet §9](nxs-datasheet.md).
+The DSL surface in §4 is a public API from product version 1.0. Additions (new verbs, new canonical semantics) arrive in MINOR or PATCH releases and never invalidate an existing driver source; a change that would break compiled images is a product-MINOR (image format) event, and one that would break driver *sources* is a product-MAJOR event. Versioning model: [Device Reference §5](nxs-device-reference.md).

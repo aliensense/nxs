@@ -3,10 +3,52 @@ Sensor descriptor utilities — driver loading, sample parsing, config loading.
 """
 
 import importlib
+import logging
+import math
 import struct
-from typing import Any, Dict, List, Type
+from typing import Any, Dict, List, Optional, Type
 
+from nxs._generated_constants import Calibration as CalConstants
+from nxs._generated_constants import FieldSemantics
 from nxs.compiler import SensorDriver
+
+# Identity 3x3, row-major — the no-op affine for one vector bucket.
+IDENTITY_M = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+
+log = logging.getLogger("nxs.descriptor")
+
+# Unknown-rotation codes already warned about (once per code, not per sample).
+_WARNED_ROTATIONS: set = set()
+
+
+FNV_PRIME = 0x01000193
+
+
+def fnv1a32(name: str) -> int:
+    """FNV-1a 32-bit hash of a driver name. Must match the firmware's
+    `cal::fnv1a32` so both appliers derive one verdict."""
+    h = 0x811C9DC5
+    for byte in name.encode():
+        h ^= byte
+        h = (h * FNV_PRIME) & 0xFFFFFFFF
+    return h
+
+
+def driver_tag(name: Optional[str], bus: int = 0, address: int = 0) -> int:
+    """The calibration record's sensor-identity tag: driver name plus the
+    attachment point it is bound to.
+
+    The name alone cannot separate two identical parts on one panel — both
+    would hash the same and the guard could not refuse a swap between them.
+    Mirrors the firmware's `cal::driver_tag`, continuing the same FNV-1a walk
+    over the bus kind and the latched address. `None` is the unguarded 0.
+    """
+    if name is None or name in ("", "-"):
+        return 0
+    h = fnv1a32(name)
+    h = ((h ^ (bus & 0xFF)) * FNV_PRIME) & 0xFFFFFFFF
+    h = ((h ^ (address & 0xFF)) * FNV_PRIME) & 0xFFFFFFFF
+    return h
 
 
 # ── Type sizes for sample parsing ───────────────────────────
@@ -114,14 +156,92 @@ def effective_scale_fields(output_fields: List[dict], params: list) -> List[dict
     return out
 
 
-def parse_sample(raw: bytes, output_fields: List[dict]) -> Dict[str, Any]:
+def apply_calibration(values: Dict[str, Any], output_fields: List[dict],
+                      calibration, active_tag: int = 0) -> Dict[str, Any]:
+    """Apply the device's per-vector affine calibration to decoded values.
+
+    The host twin of the firmware's SI-tier stage: groups the decoded
+    fields by semantic bucket and applies ``R·(M·v + b)`` per vector plus
+    the encoder zero-offset on the angle scalar, so an I2C/RawSample
+    consumer gets the same physical values the Cyphal SI subjects carry.
+    ``calibration`` is a ``CalibrationRecord``-shaped object;
+    ``driver_name`` drives the tag guard exactly like the firmware (a
+    tagged bucket solved for another driver contributes only the mounting
+    rotation). Fields with no vector semantic pass through untouched.
+
+    A record whose orientation code postdates this tool (the rotation
+    vocabulary is append-only) disables the whole post-pass: the mount
+    composes into every bucket, so no part of the record can be applied
+    correctly, and raw values are honest where wrong-rotation values are
+    not. Warned once per unknown code.
+    """
+    rot = CalConstants.Rotation.MATRIX.get(calibration.orientation)
+    if rot is None:
+        if calibration.orientation not in _WARNED_ROTATIONS:
+            _WARNED_ROTATIONS.add(calibration.orientation)
+            log.warning(
+                "calibration record carries unknown rotation code %d "
+                "(newer device?) — decoding uncalibrated; update nxs",
+                calibration.orientation)
+        return dict(values)
+    active_hash = active_tag
+    out = dict(values)
+
+    groups: Dict[int, Dict[int, str]] = {}
+    angle_names = []
+    for f in output_fields:
+        name = f.get('name')
+        if name not in values or not isinstance(values[name], (int, float)):
+            continue
+        sem = f.get('semantic', 0)
+        bucket = FieldSemantics.FIELD_SEMANTIC_BUCKET.get(sem, 0)
+        if FieldSemantics.SubjectBucket.ACCELERATION <= bucket \
+                <= FieldSemantics.SubjectBucket.MAGNETIC_FIELD:
+            slot = FieldSemantics.FIELD_SEMANTIC_SLOT.get(sem, 0)
+            groups.setdefault(bucket - 1, {})[slot] = name
+        elif sem == FieldSemantics.FieldSemantic.ANGLE:
+            angle_names.append(name)
+
+    for vec, slots in groups.items():
+        if set(slots) != {0, 1, 2}:
+            # A rotation or bias applied to a partial vector would mix the
+            # present components with fabricated zeros — an incomplete
+            # vector passes through raw, mirroring the firmware applier.
+            continue
+        active = (calibration.bucket_guard(vec, active_hash)
+                  != CalConstants.BucketGuard.STALE)
+        m = calibration.m[vec] if active else IDENTITY_M
+        b = calibration.b[vec] if active else (0.0, 0.0, 0.0)
+        v = [values[slots[i]] for i in range(3)]
+        affine = [m[i * 3] * v[0] + m[i * 3 + 1] * v[1] + m[i * 3 + 2] * v[2]
+                  + b[i] for i in range(3)]
+        rotated = [rot[i * 3] * affine[0] + rot[i * 3 + 1] * affine[1]
+                   + rot[i * 3 + 2] * affine[2] for i in range(3)]
+        for i, name in slots.items():
+            out[name] = rotated[i]
+
+    encoder_active = (calibration.bucket_guard(
+            len(calibration.driver_tags), active_hash)
+            != CalConstants.BucketGuard.STALE)
+    if encoder_active and calibration.encoder_zero:
+        for name in angle_names:
+            out[name] = (values[name] + calibration.encoder_zero) % math.tau
+
+    return out
+
+
+def parse_sample(raw: bytes, output_fields: List[dict],
+                 calibration=None,
+                 active_tag: int = 0) -> Dict[str, Any]:
     """Parse a raw sample using the output field descriptors.
 
     Returns a dict of {field_name: value}. Numeric fields are scaled
     floats. String fields are decoded ASCII strings (0xFF trimmed). The
     field `scale` is taken as-is: device-served descriptors already carry
     the effective (param-folded) scale; for raw NXS descriptors, fold
-    first with `effective_scale_fields`.
+    first with `effective_scale_fields`. A ``calibration`` record applies
+    the per-vector affine post-pass (`apply_calibration`); None keeps
+    the descriptor-tier decode unchanged.
     """
     result = {}
     offset = 0
@@ -161,6 +281,9 @@ def parse_sample(raw: bytes, output_fields: List[dict]) -> Dict[str, Any]:
             field_offset = field.get('offset', 0.0)
             result[field['name']] = raw_val * scale + field_offset
             offset += size
+
+    if calibration is not None:
+        result = apply_calibration(result, output_fields, calibration, active_tag)
 
     return result
 

@@ -14,7 +14,9 @@ an 8-bit register address across two bytes ([R/W|A6:0][A7|xxxxxxx]) with
 R/W=0 for read, mode 0, 1 MHz max.
 
 Bus / trigger:
-    bus       i2c (default) | spi          (nxs set bus / --config bus=spi)
+    bus       i2c (default) | spi          (--param bus=spi at upload;
+                                            runtime `nxs set bus 1` takes
+                                            the numeric code — see #160)
     trigger   drdy (default) | poll        (INT1 data-ready on mikroBUS INT)
 
 Config keys:

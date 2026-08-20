@@ -9,15 +9,25 @@ from nxs.transports.i2c import NxsI2cTransport, _TOPIC_DEFAULTS
 
 
 class _FakeConfigBus:
-    """Serves a fixed 20-byte CONFIG record for read_identity."""
+    """Serves a fixed 20-byte CONFIG record for read_identity. Models the
+    mode register (`XFER_TYPE` echoes writes) so the claim-check readback
+    the config paths perform sees its echo; `held_mode` pins it like a
+    live transfer session would."""
 
-    def __init__(self, record):
+    def __init__(self, record, held_mode=None):
         self._record = bytes(record)
+        self.held_mode = held_mode
+        self.xfer_type = held_mode if held_mode is not None else 0
 
     def write_byte_data(self, addr, reg, val):
-        pass
+        from nxs.transports.i2c import REG_XFER_TYPE
+        if reg == REG_XFER_TYPE and self.held_mode is None:
+            self.xfer_type = val
 
     def read_byte_data(self, addr, reg):
+        from nxs.transports.i2c import REG_XFER_TYPE
+        if reg == REG_XFER_TYPE:
+            return self.xfer_type
         return 0
 
     def read_i2c_block_data(self, addr, reg, length):
@@ -33,6 +43,7 @@ class _RecordingBus(_FakeConfigBus):
 
     def write_byte_data(self, addr, reg, val):
         self.byte_writes.append((reg, val))
+        super().write_byte_data(addr, reg, val)
 
     def write_i2c_block_data(self, addr, reg, data):
         pass
@@ -57,6 +68,24 @@ def test_read_identity_reports_commissioned_values():
     assert ident["node_addr"] == 10
     assert ident["topics"]["sample"] == 6200
     assert ident["topics"]["status"] == _TOPIC_DEFAULTS["status"]   # unset → default
+
+
+def test_commission_against_a_held_mux_streams_nothing():
+    # A live transfer session refuses the CONFIG mode write silently; the
+    # claim readback detects it before a record byte can land in the
+    # holder's sink (the cross-flow corruption the session lock exists
+    # to stop).
+    from nxs.client import DeviceRefused
+    from nxs.transports.i2c import (REG_PROGRAM_DATA, REG_XFER_TYPE,
+                                    XFER_TYPE_DFU_IMAGE)
+    bus = _RecordingBus(b"\xff" * 20)
+    bus.held_mode = XFER_TYPE_DFU_IMAGE
+    bus.xfer_type = XFER_TYPE_DFU_IMAGE
+    t = NxsI2cTransport(0, _bus_obj=bus)
+    with pytest.raises(DeviceRefused) as ei:
+        t.commission(10, {})
+    assert ei.value.code == 16
+    assert not any(reg == REG_PROGRAM_DATA for reg, _ in bus.byte_writes)
 
 
 def test_validate_commission_rejects_out_of_range():

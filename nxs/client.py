@@ -25,6 +25,7 @@ arrive asynchronously (a push transport's background thread), but they
 are consumed through the synchronous `iter_samples()` / `on_sample()`
 surface — the threading lives in the transport, not in this contract.
 """
+import struct
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -32,8 +33,10 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
+from nxs._generated_constants import Calibration as CalConstants
 from nxs._generated_constants import FieldSemantics
-from nxs.descriptor import is_decodable, parse_sample
+from nxs._generated_constants import RunnerStates
+from nxs.descriptor import IDENTITY_M, fnv1a32, is_decodable, parse_sample
 
 # Mirrors RegisterMapFrontend.h::SELECTOR_INACTIVE; documented here so
 # the SDK and its transports share one name for the wire sentinel.
@@ -78,6 +81,110 @@ COMMISSION_ERR_REASON = {
     5:  "flash (NVS) write error",                                        # EIO
 }
 
+# Highest register-map contract version this SDK understands. A host-side
+# capability, deliberately NOT sourced from the firmware's generated
+# PROTO_VERSION_VALUE: bump it only when this code actually learns to speak
+# a new contract version.
+SUPPORTED_PROTO_VERSION = 1
+
+
+def contract_mismatch(transport, *, unreadable_is_skew: bool = False) -> Optional[str]:
+    """None when the device speaks this SDK's register-map contract, or when
+    the transport serves no version at all (Cyphal has no such register).
+    Otherwise a one-line description of the skew, for refusing mutation
+    before it can misread the device.
+
+    A transport that serves no version at all (Cyphal, or a duck-typed
+    double) is always None. A read that FAILS is the caller's judgment:
+    a single verb can let its own operation produce the better error, but
+    anything about to mutate a device should pass `unreadable_is_skew=True`
+    and refuse rather than converge blind against an unknown contract."""
+    reader = getattr(transport, "interface_version", None)
+    if reader is None:
+        return None                 # serves no version, like Cyphal
+    try:
+        ver = reader()
+    except NotImplementedError:
+        return None
+    except (OSError, RuntimeError) as e:
+        if unreadable_is_skew:
+            return f"could not read the device's register-map version ({e})"
+        return None
+    if ver is None or ver == SUPPORTED_PROTO_VERSION:
+        return None
+    return (f"device speaks register-map v{ver}; this nxs speaks "
+            f"v{SUPPORTED_PROTO_VERSION} only")
+
+
+# DFU `begin` bulk-erases the staging slot before it answers, freezing the
+# MCU: measured 2.44 s for slot 1 on the STM32G491. 2x margin.
+DFU_ERASE_TIMEOUT_S = 5.0
+
+# Store commands (save, delete, clear, identity commit) program flash on the
+# same frozen-MCU terms, less of it.
+STORE_CMD_TIMEOUT_S = 2.0
+
+# The silent-refusal detection code: a mode readback that does not echo the
+# write means EBUSY — named here because it is raised at claim sites that
+# never see a CMD_ERROR value (the device numbers, not the host's errno).
+XFER_EBUSY = 16
+
+# Retry budget for the epoch-bracketed calibration record read (both
+# transports): each attempt is a full multi-page / multi-register pass, so
+# a handful covers any realistic repaint storm.
+CAL_READ_ATTEMPTS = 5
+
+CAL_REFRESH_S = 2.0
+"""Streaming-side probe cadence of the calibration epoch: a running
+stream reloads its decode record when the bank moves underneath it (a
+boot-auto solve, an on-device procedure, the other transport)."""
+
+# Transfer-session refusals (RegisterMapFrontend's session rules). Keys are
+# the DEVICE's errno numbers — Zephyr's newlib values, which match Linux for
+# every entry here (EPROTO is 71 on both; macOS differs, which only matters
+# to mock-bus unit tests — inject these numbers, not the host errno module's).
+XFER_ERR_REASON = {
+    16: "another transfer session is live (a concurrent upload or firmware "
+        "push) — retry when it ends, or release it with XFER_ABORT",  # EBUSY
+    71: "out-of-sequence transfer op: wrong XFER_TYPE for this operation, "
+        "or a config stage trampled by an interleaved write",         # EPROTO
+    27: "image exceeds the device staging buffer",                    # EFBIG
+    2:  "no transfer session to release",                             # ENOENT
+    11: "the device dropped the command before dispatch (queue full) — "
+        "retry",                                                      # EAGAIN
+}
+
+# CMD_LOAD's verdict — the device confirms the parse before "Uploaded" means
+# anything (issue #152: a stale wheel's image used to vanish silently).
+LOAD_ERR_REASON = {
+    61: "the staged image arrived short of the announced size — bytes were "
+        "lost in transit; re-run the upload",                         # ENODATA
+    8:  "the device rejected the image: not a valid driver (stale SDK "
+        "wheel or corrupt content — detail in the device log)",       # ENOEXEC
+    11: "the device dropped the command before dispatch (queue full) — "
+        "retry",                                                      # EAGAIN
+    5:  "the file pull failed on the device (server silent past the "
+        "retry budget, or a refused write) — retry the upload",       # EIO
+}
+
+# Calibration apply/persist/procedure errnos. The numbers are the device's,
+# not this host's: the firmware's libc diverges from glibc above 71, so
+# EBADMSG, ETIMEDOUT and ECANCELED are 77/116/140 here where a Linux host
+# would say 74/110/125. Taking them from the host's own `errno` module would
+# silently unmap exactly those three.
+CALIB_ERR_REASON = {
+    22: "calibration record rejected (bad version, orientation, or non-finite values)",  # EINVAL
+    19: "device has no calibration engine",                                              # ENODEV
+    5:  "flash (NVS) write error",                                                       # EIO
+    16: "another calibration procedure is running",                                      # EBUSY
+    11: "insufficient rotation coverage or samples",                                     # EAGAIN
+    34: "degenerate fit (cloud is not an ellipsoid)",                                    # ERANGE
+    77: "fit failed the sphere self-check",                                              # EBADMSG
+    116: "timed out waiting for stillness",                                              # ETIMEDOUT
+    95: "the loaded driver has no source for this calibration",                 # EOPNOTSUPP
+    140: "procedure cancelled (host abort or driver change)",                           # ECANCELED
+}
+
 # DFU begin/write/finish errnos.
 DFU_ERR_REASON = {
     16: "a firmware update is already in progress",   # EBUSY
@@ -96,6 +203,39 @@ PULL_ERR_REASON = {
 }
 
 ERRNO_EEXIST = 17
+# Device libc numbering, not the host's: a mag solve answers EAGAIN when
+# the cloud is not yet enough, and leaves the collection open to retry.
+ERRNO_EAGAIN = 11
+ERRNO_ENOENT = 2
+ERRNO_ECANCELED = 140
+
+
+def exc_detail(exc: BaseException) -> str:
+    """`str(exc)`, falling back to the type name when it is empty.
+
+    A bare `ImportError()` or `KeyError` stringifies to "", which reports
+    as no reason at all."""
+    return str(exc) or type(exc).__name__
+
+
+def import_failure_detail(exc: BaseException, path: str) -> str:
+    """`str(exc)` plus the file:line it happened at.
+
+    A driver author's typo raises `NameError: name 'np' is not defined` —
+    true and useless without a location. Walk the traceback to the last
+    frame inside the driver file so the message points at their line."""
+    import traceback
+    detail = f"{type(exc).__name__}: {exc}"
+    # A SyntaxError from a module the driver imports carries that module's
+    # position, not the driver's — only trust it when the files match.
+    line = (exc.lineno if isinstance(exc, SyntaxError) and exc.filename == path
+            else None)
+    if line is None:
+        for frame in reversed(traceback.extract_tb(exc.__traceback__)):
+            if frame.filename == path:
+                line = frame.lineno
+                break
+    return f"{detail} (line {line})" if line else detail
 
 
 def err_reason(code: int, reasons=None) -> str:
@@ -300,8 +440,10 @@ class SupportsSlotPeek(ABC):
 
 
 class SupportsFaultCounters(ABC):
-    """Transports that can read the runner's cumulative fault telemetry
-    (Cyphal `aliensense.nxs.io_err_count` / `probe_failed_count`)."""
+    """Transports that can read the runner's cumulative fault telemetry —
+    the Cyphal `aliensense.nxs.*_count` registers, or the I2C diag view
+    (`DRIVER_SELECT = DRIVER_VIEW_DIAG`, paged via `SEL_VALUE_INDEX`).
+    All counters saturate at 65535; read deltas across a window."""
 
     @abstractmethod
     def read_io_err_count(self) -> int:
@@ -310,6 +452,16 @@ class SupportsFaultCounters(ABC):
     @abstractmethod
     def read_probe_failed_count(self) -> int:
         """Probe give-up count since boot."""
+
+    @abstractmethod
+    def read_drdy_coalesced_count(self) -> int:
+        """Sample intervals missed because the VM was still busy when the
+        sensor signalled data-ready."""
+
+    @abstractmethod
+    def read_ingress_reject_count(self) -> int:
+        """Host commands dropped because another transport held a live
+        session."""
 
 
 class SupportsEgressDecimation(ABC):
@@ -431,6 +583,177 @@ class SupportsBitTiming(ABC):
         with the record)."""
 
 
+# Calibration record geometry (constants/calibration.yaml): three vector
+# buckets in SubjectBucket-1 order, each a row-major 3x3 M and a bias b,
+# plus the encoder zero-offset and the per-solve driver-identity tags.
+CAL_VECTORS = ("acceleration", "angular_velocity", "magnetic_field")
+
+_CAL_STRUCT = struct.Struct("<BB2x27f9ff4I")
+assert _CAL_STRUCT.size == CalConstants.RECORD_SIZE
+
+
+# Every valid `orientation` code name, sorted — the vocabulary for CLI
+# choices and shell completion.
+ROTATION_NAMES = tuple(sorted(CalConstants.Rotation._NAMES.values()))
+
+
+def rotation_name(code: int) -> str:
+    """ROTATION_* name for a code, or the bare number if unknown."""
+    return CalConstants.Rotation._NAMES.get(code, str(code))
+
+
+def rotation_code(name: str) -> int:
+    """ROTATION_* code for a name (case-insensitive). Raises ValueError."""
+    code = getattr(CalConstants.Rotation, name.upper(), None)
+    if not isinstance(code, int):
+        raise ValueError(f"unknown rotation '{name}' "
+                         f"(one of {', '.join(sorted(CalConstants.Rotation._NAMES.values()))})")
+    return code
+
+
+@dataclass
+class CalibrationRecord:
+    """The device's per-unit calibration record, host view.
+
+    ``m``/``b`` are sensor-frame per-bucket affines indexed like
+    ``CAL_VECTORS``; ``orientation`` is a ROTATION_* code composed on top by
+    the appliers; a nonzero driver tag gates its bucket to the driver the
+    solve ran against."""
+    orientation: int = 0
+    m: Tuple[Tuple[float, ...], ...] = (IDENTITY_M,) * 3
+    b: Tuple[Tuple[float, ...], ...] = ((0.0, 0.0, 0.0),) * 3
+    encoder_zero: float = 0.0
+    driver_tags: Tuple[int, ...] = (0, 0, 0)
+    encoder_tag: int = 0
+
+    def bucket_guard(self, vec: int, active_tag: int) -> int:
+        """How one bucket's stored solve relates to the running sensor, as a
+        `Calibration.BucketGuard` code.
+
+        `BOUND` — solved against this sensor. `UNGUARDED` — applied, but
+        carrying no identity, so nothing verifies it belongs here; the
+        deliberate escape hatch for a hand-written record. `STALE` — solved
+        against a different sensor, so the affine must not be applied.
+
+        The safety property of the whole feature, so it lives on the record
+        and every applier asks it. Mirrors the firmware's
+        `CalibrationRecord::bucket_guard`; `vec == len(driver_tags)` asks
+        about the encoder.
+        """
+        guard = CalConstants.BucketGuard
+        tag = (self.driver_tags[vec] if vec < len(self.driver_tags)
+               else self.encoder_tag)
+        if tag == 0:
+            return guard.UNGUARDED
+
+        return guard.BOUND if tag == active_tag else guard.STALE
+
+    def pack(self) -> bytes:
+        """Wire/flash layout, little-endian (`Calibration.RECORD_SIZE` bytes)."""
+        flat_m = [v for row in self.m for v in row]
+        flat_b = [v for row in self.b for v in row]
+        return _CAL_STRUCT.pack(CalConstants.RECORD_VERSION, self.orientation,
+                                *flat_m, *flat_b, self.encoder_zero,
+                                *self.driver_tags, self.encoder_tag)
+
+    @classmethod
+    def unpack(cls, data: bytes) -> "CalibrationRecord":
+        """Decode a wire record; raises ValueError on a bad size or version."""
+        if len(data) < _CAL_STRUCT.size:
+            raise ValueError(f"calibration record too short: {len(data)} B")
+        fields = _CAL_STRUCT.unpack_from(data)
+        version = fields[0]
+        if version != CalConstants.RECORD_VERSION:
+            raise ValueError(f"calibration record version {version} "
+                             f"(expected {CalConstants.RECORD_VERSION})")
+        flat_m = fields[2:29]
+        flat_b = fields[29:38]
+        return cls(orientation=fields[1],
+                   m=tuple(tuple(flat_m[v * 9:v * 9 + 9]) for v in range(3)),
+                   b=tuple(tuple(flat_b[v * 3:v * 3 + 3]) for v in range(3)),
+                   encoder_zero=fields[38],
+                   driver_tags=tuple(fields[39:42]),
+                   encoder_tag=fields[42])
+
+    def replace_vector(self, vec: int, m: Tuple[float, ...],
+                       b: Tuple[float, ...], tag: int) -> "CalibrationRecord":
+        """Copy with one bucket's affine + tag swapped."""
+        ms = list(self.m)
+        bs = list(self.b)
+        tags = list(self.driver_tags)
+        ms[vec] = tuple(m)
+        bs[vec] = tuple(b)
+        tags[vec] = tag
+        return CalibrationRecord(orientation=self.orientation, m=tuple(ms),
+                                 b=tuple(bs), encoder_zero=self.encoder_zero,
+                                 driver_tags=tuple(tags),
+                                 encoder_tag=self.encoder_tag)
+
+
+class SupportsCalibration(ABC):
+    """The device stores and applies a per-unit calibration record — one
+    affine per vector bucket, the mounting orientation, and the encoder
+    zero-offset — served over the wire and persisted by the unified Save."""
+
+    @abstractmethod
+    def read_calibration(self) -> CalibrationRecord:
+        """The record the device currently applies (running state)."""
+
+    @abstractmethod
+    def read_cal_epoch(self) -> int:
+        """The bank's change counter (wraps past 255): a one-read probe
+        for "did the record move" without the record transfer."""
+
+    @abstractmethod
+    def write_calibration(self, record: CalibrationRecord,
+                          persist: bool = True) -> None:
+        """Apply ``record`` to the running state; ``persist`` commits it to
+        the device's store so it survives a reboot."""
+
+    @abstractmethod
+    def set_orientation(self, rotation: int, persist: bool = True) -> None:
+        """Set the mounting-orientation code, leaving the solved affines
+        untouched."""
+
+    @abstractmethod
+    def cal_gyro(self) -> None:
+        """Start the on-device gyro still-average (hold the unit still);
+        completion and its verdict land in `read_cal_progress`."""
+
+    @abstractmethod
+    def cal_mag_start(self) -> None:
+        """Start the on-device mag collection (rotate the vehicle)."""
+
+    @abstractmethod
+    def cal_mag_stop(self) -> None:
+        """Close the mag collection: the device gates, solves, self-checks,
+        and applies. Raises `DeviceRefused` on a refused fit (the previous
+        calibration stays)."""
+
+    @abstractmethod
+    def cal_abort(self) -> None:
+        """Drop the procedure in progress without solving, leaving the
+        previous calibration in place.
+
+        `cal_mag_stop` is the other way out of a collection, but it also
+        solves and applies, so it cannot express an operator's Ctrl-C —
+        and a gyro pass has no stop verb at all. Until the procedure ends
+        it holds the device's transfer session, which refuses every later
+        command, including the firmware push that would recover the unit.
+        """
+
+    @abstractmethod
+    def read_cal_progress(self) -> Tuple[int, int, int]:
+        """(state, detail, result): a `Calibration.CalState` code, the gyro
+        percent / mag rotation coverage, and the last completed verdict
+        (`CAL_RESULT_NONE` until one completes)."""
+
+    @abstractmethod
+    def save_calibration(self) -> None:
+        """Persist the running record via the unified Save (an on-device
+        procedure applies to the running state only)."""
+
+
 class SupportsCommissioning(ABC):
     """The device persists a Cyphal node-ID and per-topic subject-IDs,
     commissioned over the wire and applied on the next reboot."""
@@ -463,6 +786,8 @@ class NxsClient(ABC):
         self._poll_fields: Optional[List[dict]] = None
         self._poll_token: int = 0
         self._time_sync = TimeSyncEstimator()
+        self._poll_cal: Optional[CalibrationRecord] = None
+        self._poll_name: Optional[str] = None
 
     # ── Context management ────────────────────────────────
     def __enter__(self):
@@ -480,6 +805,12 @@ class NxsClient(ABC):
         (a USB unplug or a wedged serial device). Default False; the Cyphal
         client overrides."""
         return False
+
+    def probe_failure_detail(self) -> Optional[str]:
+        """Why the last `probe()` found nothing, when the transport knows.
+
+        None when it has nothing to add beyond the device being silent."""
+        return None
 
     # ── Time sync ─────────────────────────────────────────
     def get_time_sync(self) -> TimeSyncEstimator:
@@ -682,8 +1013,21 @@ class NxsClient(ABC):
         self._streaming = False
         self._disarm_stream()
 
-    def iter_samples(self, timeout: float = 1.0) -> Iterator[Sample]:
+    def iter_samples(self, timeout: float = 1.0,
+                     calibrated: bool = True,
+                     max_silence_s: Optional[float] = None) -> Iterator[Sample]:
         """Yield decoded `Sample`s until streaming is stopped.
+
+        ``max_silence_s`` ends the stream (a plain return) after that
+        long without a sample, so an acquisition loop over a muted or
+        failed sensor fails through its own no-data path instead of
+        hanging; None (the default) waits forever.
+
+        ``calibrated`` composes the served calibration record into the
+        decoded values — the host twin of the device's SI tier — and
+        re-fetches it with the descriptors on a driver swap so the tag
+        guard tracks the live driver. The calibration procedures opt out
+        to acquire at the raw descriptor tier.
 
         Fetches the descriptor set once, decodes each sample with it,
         and re-fetches when `_descriptor_token()` changes mid-stream
@@ -700,20 +1044,50 @@ class NxsClient(ABC):
             self.start_stream()
         try:
             token, fields = self._load_fields()
+            calibration, active_tag = (self._load_calibration()
+                                       if calibrated else (None, 0))
             prev_seq = None
+            cal_epoch = None
+            next_cal_check = time.monotonic() + CAL_REFRESH_S
+            last_sample = time.monotonic()
             while self._streaming:
                 item = self._next_raw(timeout)
                 if item is None:
+                    if (max_silence_s is not None
+                            and time.monotonic() - last_sample >= max_silence_s):
+                        return
                     continue
+                last_sample = time.monotonic()
+                # The bank can move with no descriptor change — a boot-auto
+                # solve, an on-device procedure, a write from the other
+                # transport — so the epoch is probed on a slow clock. A
+                # probe the device refuses (a live transfer session) just
+                # waits for the next tick.
+                if calibrated and time.monotonic() >= next_cal_check:
+                    next_cal_check = time.monotonic() + CAL_REFRESH_S
+                    try:
+                        epoch = self.read_cal_epoch()
+                    except Exception:
+                        epoch = cal_epoch
+                    if epoch is not None and epoch != cal_epoch:
+                        # The first observation reloads too: the bank may
+                        # have moved between the startup record read and
+                        # this probe, and adopting the epoch without the
+                        # record would pin that stale affine forever.
+                        cal_epoch = epoch
+                        calibration, active_tag = self._load_calibration()
                 # Descriptors change only on a VM restart (which resets seq);
                 # re-check the RPC-backed token on that backward jump, not per
                 # sample — per-sample it collapsed the stream to the GetDriverInfo
                 # round-trip rate (~1 Hz, since the response is TX-dropped under load).
                 count = item[0]
                 if token == -1 or (prev_seq is not None and count < prev_seq):
+                    prev_token = token
                     token, fields = self._refreshed_fields(token, fields)
+                    if calibrated and token != prev_token:
+                        calibration, active_tag = self._load_calibration()
                 prev_seq = count
-                yield self._decode(item, fields)
+                yield self._decode(item, fields, calibration, active_tag)
         finally:
             # Best-effort like spin()/host teardown: a disarm that raises
             # on a dead link must not supersede the loop's own exception.
@@ -732,12 +1106,28 @@ class NxsClient(ABC):
             self.start_stream()
         if self._poll_fields is None:
             self._poll_token, self._poll_fields = self._load_fields()
+            self._poll_cal, self._poll_name = self._load_calibration()
+            self._poll_cal_epoch = None
+            self._poll_cal_check = time.monotonic() + CAL_REFRESH_S
         item = self._next_raw(timeout)
         if item is None:
             return None
+        if time.monotonic() >= self._poll_cal_check:
+            self._poll_cal_check = time.monotonic() + CAL_REFRESH_S
+            try:
+                epoch = self.read_cal_epoch()
+            except Exception:
+                epoch = self._poll_cal_epoch
+            if epoch is not None and epoch != self._poll_cal_epoch:
+                self._poll_cal_epoch = epoch
+                self._poll_cal, self._poll_name = self._load_calibration()
+        prev_token = self._poll_token
         self._poll_token, self._poll_fields = self._refreshed_fields(
                 self._poll_token, self._poll_fields)
-        return self._decode(item, self._poll_fields)
+        if self._poll_token != prev_token:
+            self._poll_cal, self._poll_name = self._load_calibration()
+        return self._decode(item, self._poll_fields, self._poll_cal,
+                            self._poll_name)
 
     def on_sample(self, handler: Callable[[Sample], None]):
         """Register a handler invoked per sample by `spin()`."""
@@ -805,17 +1195,107 @@ class NxsClient(ABC):
         return fields if is_decodable(fields) else []
 
     def _decode(self, item: Tuple[int, bytes, Optional[int]],
-                fields: List[dict]) -> Sample:
+                fields: List[dict], calibration=None,
+                active_tag: int = 0) -> Sample:
         count, raw, timestamp_us = item
-        values = parse_sample(raw, fields) if fields else {}
+        values = (parse_sample(raw, fields, calibration, active_tag)
+                  if fields else {})
         return Sample(count=count, raw=raw, values=values,
                       timestamp_us=timestamp_us)
+
+    def _load_calibration(self):
+        """The served record + the running sensor's tag for the decode
+        post-pass, or (None, 0) when the transport serves no calibration
+        surface or the read fails (the decode stays descriptor-tier raw)."""
+        reader = getattr(self, "read_calibration", None)
+        if reader is None:
+            return None, 0
+        try:
+            record = reader()
+            return record, active_driver_tag(self, record)
+        except (RuntimeError, OSError, TimeoutError, ValueError,
+                struct.error, DeviceRefused):
+            return None, 0
+
+
+def active_driver_tag(transport, record=None) -> int:
+    """The running sensor's identity tag: driver name, bus, latched address.
+
+    The single host-side producer — `calibrate show`, the suite's CAL column
+    and the decode post-pass all ask here, because a tag derived two ways is
+    a guard that fails open. Mirrors the firmware's `cal::driver_tag`.
+
+    The bus is read, never inferred: a driver with no latched I²C address may
+    be on SPI *or* on a UART stream, and guessing SPI from a zero address
+    yields a tag the device never wrote. `record`, when given, short-circuits
+    the reads for a record that carries no tags at all — nothing to compare,
+    so nothing to fetch.
+    """
+    if record is not None and not any(record.driver_tags) and not record.encoder_tag:
+        return 0
+    from nxs.descriptor import driver_tag
+    try:
+        name = transport.read_driver_name() or ""
+    except Exception:
+        return 0
+    if not name:
+        return 0
+    address = 0
+    if isinstance(transport, SupportsSlotPeek):
+        address = getattr(transport.read_slot_info(ACTIVE_SLOT), "i2c_addr", 0) or 0
+    bus = 0
+    for param in (transport.read_capabilities() or []):
+        if param.get("name") == "bus":
+            bus = int(param.get("current", 0) or 0)
+            break
+
+    return driver_tag(name, bus, address)
+
 
 PUSH_INTERVAL_S = 1.0
 """Default refresh cadence of the resident pushers, seconds."""
 
 SYNC_LOST_PUSHES = 10
 """Pushes that may be lost before the pushed discipline expires."""
+
+
+DRIVER_UP_TIMEOUT_S = 5.0
+"""Budget for a driver to load, reset its sensor, and probe after a RUN."""
+
+DRIVER_UP_POLL_S = 0.2
+"""Register-poll spacing while waiting. One transaction per tick against a
+probe measured in hundreds of milliseconds."""
+
+
+def await_driver_up(client, timeout_s: float = DRIVER_UP_TIMEOUT_S,
+                    poll_s: float = DRIVER_UP_POLL_S) -> int:
+    """Block until the runner settles after `vm_run()`, and return its state.
+
+    `vm_run()` returns when the device accepts the command, not when the
+    driver has probed — an IAM-20680's reset-and-settle alone is ~200 ms — so
+    reading any result on the next line reports a working deploy as a failed
+    one. Settling means `MEASURING` (the driver is up) or `PROBE_FAILED` (it
+    gave up); either ends the wait, so a dead sensor answers immediately
+    instead of consuming the whole budget. A timeout returns the last state
+    read, which distinguishes a driver still `PROBING` from one that never
+    loaded.
+    """
+    state = RunnerStates.RunnerState
+    deadline = time.monotonic() + timeout_s
+    while True:
+        current = client.read_runner_state()
+        if current in (state.MEASURING, state.PROBE_FAILED):
+            return current
+        if time.monotonic() >= deadline:
+            return current
+        time.sleep(poll_s)
+
+
+#: Budget for the time-sync mirror to catch up with a push. Sized for the
+#: worst observed drain — a seed issued straight after a panel deploy, while
+#: the comm thread still has the store writes and the driver probe ahead of it.
+PUSH_ECHO_TIMEOUT_S = 2.0
+PUSH_ECHO_POLL_S = 0.01
 
 
 def estimate_and_push(client, pings: int = 8,
@@ -841,12 +1321,21 @@ def estimate_and_push(client, pings: int = 8,
     rate_ppb = estimator.rate_ppb()
     valid_for_us = int(SYNC_LOST_PUSHES * interval_s * 1_000_000)
     client.push_time_sync(offset_us, bound_us, rate_ppb, valid_for_us)
-    echoed = client.read_time_sync()
-    if echoed is not None:
-        # The mirror echoes bound, rate, and window verbatim; offset
-        # legitimately differs (servo re-anchor), so it stays unchecked.
+    # The record applies on the comm thread, not in the transaction that
+    # carries it, so poll the echo instead of reading it once: right after a
+    # panel deploy that thread is still draining flash writes and a single
+    # read returns the previous record. The mirror echoes bound, rate, and
+    # window verbatim; offset legitimately differs (servo re-anchor), so it
+    # stays unchecked.
+    deadline = time.monotonic() + PUSH_ECHO_TIMEOUT_S
+    while True:
+        echoed = client.read_time_sync()
+        if echoed is None:
+            return bound_us
         _, echoed_bound, echoed_rate, echoed_window, _, echoed_valid = echoed
-        if (not echoed_valid or echoed_bound != bound_us
-                or echoed_rate != rate_ppb or echoed_window != valid_for_us):
+        if (echoed_valid and echoed_bound == bound_us
+                and echoed_rate == rate_ppb and echoed_window == valid_for_us):
+            return bound_us
+        if time.monotonic() >= deadline:
             raise RuntimeError("push not applied (mirror mismatch)")
-    return bound_us
+        time.sleep(PUSH_ECHO_POLL_S)

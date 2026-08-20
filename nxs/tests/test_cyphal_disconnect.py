@@ -30,19 +30,31 @@ def test_quiet_background_logging_caps_pycyphal(restore_pycyphal_logging):
     cc._BG_QUIETED = False
     logging.getLogger("pycyphal").setLevel(logging.NOTSET)
     cc._quiet_background_logging()
-    assert logging.getLogger("pycyphal").level == logging.CRITICAL
-    # The reader-thread / publisher errors come from child loggers, which
-    # inherit the cap: their ERROR records are dropped, CRITICAL still passes.
+    # The reader-thread / publisher cascade comes from the serial subtree,
+    # which is capped: its ERROR records are dropped, CRITICAL still passes.
     child = logging.getLogger("pycyphal.transport.serial._serial")
     assert not child.isEnabledFor(logging.ERROR)
     assert child.isEnabledFor(logging.CRITICAL)
 
 
+def test_quiet_background_logging_does_not_hide_the_diagnosis(
+        restore_pycyphal_logging):
+    # The cap is safe precisely because the media-configuration diagnosis
+    # travels as an exception, not a log record: an unusable link raises
+    # InvalidMediaConfigurationError and the caller prints it. What the cap
+    # removes is the per-second publisher traceback that buries it.
+    cc._BG_QUIETED = False
+    cc._quiet_background_logging()
+    import pycyphal.transport
+    assert issubclass(pycyphal.transport.InvalidMediaConfigurationError,
+                      Exception)
+
+
 def test_quiet_background_logging_is_idempotent(restore_pycyphal_logging):
     cc._BG_QUIETED = False
     cc._quiet_background_logging()
-    logging.getLogger("pycyphal").setLevel(logging.DEBUG)  # someone lowers it later
-    cc._quiet_background_logging()                          # guarded — must not re-cap
+    logging.getLogger("pycyphal").setLevel(logging.DEBUG)  # lowered later
+    cc._quiet_background_logging()                         # guarded, no re-cap
     assert logging.getLogger("pycyphal").level == logging.DEBUG
 
 

@@ -14,6 +14,7 @@ requires-python = ">=3.10"
 # round-trip YAML editor `suite freeze` uses to update the manifest
 # without destroying the operator's comments.
 dependencies = [
+    "argcomplete",
     "pyserial",
     "pyyaml",
     "ruamel.yaml",
@@ -47,4 +48,4 @@ exclude = ["nxs.tests*"]
 # The ros2/ data (launch file + RViz config) ships too, located at runtime
 # via `nxs ros2 --launch-file`.
 [tool.setuptools.package-data]
-nxs = ["dsdl/**/*.dsdl", "dsdl/*.md", "ros2/*.launch.py", "ros2/*.rviz"]
+nxs = ["dsdl/**/*.dsdl", "dsdl/*.md", "dsdl/LICENSE-*", "ros2/*.launch.py", "ros2/*.rviz"]

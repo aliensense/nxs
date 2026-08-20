@@ -15,12 +15,16 @@ sensor's `config:` (and `firmware:` under --pin-firmware) changes;
 comments and layout survive via a round-trip YAML edit.
 """
 import os
+import sys
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+from nxs.client import exc_detail
 from nxs.suite import DRIVERS_DIR
 from nxs.suite.reconcile import load_unit_driver
-from nxs.suite.schema import ManifestError, SuiteConfig, UnitSpec
+from nxs.suite.schema import (ManifestError, SuiteConfig, UnitSpec,
+                              device_proves_patch, parse_device_version,
+                              parse_version)
 from nxs.transports import open_client
 
 
@@ -34,6 +38,7 @@ class FreezeReport:
     egress_decimation: Optional[int] = None
     egress_subjects: dict = field(default_factory=dict)
     firmware: Optional[str] = None
+    orientation: Optional[str] = None
     actions: List[str] = field(default_factory=list)
     error: str = ""
 
@@ -77,8 +82,14 @@ def _freeze_unit(unit: UnitSpec, *, pin_firmware: bool, opener,
                 if candidate.probe():
                     transport = candidate
                     break
-            except Exception:
-                pass
+                # probe() answers False for a refused bus as well as for
+                # absent hardware; the transport kept which it was.
+                if reason := candidate.probe_failure_detail():
+                    print(f"freeze: {link.describe()}: {reason}",
+                          file=sys.stderr)
+            except Exception as e:
+                print(f"freeze: {link.describe()}: {exc_detail(e)}",
+                      file=sys.stderr)
             if candidate is not None:
                 try:
                     candidate.close()
@@ -151,13 +162,65 @@ def _freeze_unit(unit: UnitSpec, *, pin_firmware: bool, opener,
 
         if pin_firmware:
             version = transport.read_fw_version()
+            proven = parse_device_version(version) if version is not None else None
             if version is None:
                 report.actions.append("firmware not readable on this "
                                       "transport; pin unchanged")
-            elif version != unit.firmware:
-                report.firmware = version
+            elif proven is None:
+                # A bare SHA (untagged build) proves no release version —
+                # nothing the manifest's numeric pin can hold.
+                report.actions.append(f"firmware identity {version!r} proves "
+                                      "no version; pin unchanged")
+            else:
+                # Pin exactly what the wire proves: the full triple for a
+                # build identity, the pair for legacy firmware — and treat
+                # an equivalent existing pin as unchanged so a freeze
+                # never rewrites "1.0" into "1.0.0".
+                try:
+                    want = (parse_version(unit.firmware)
+                            if unit.firmware is not None else None)
+                except ValueError:
+                    want = None
+                if device_proves_patch(version):
+                    pin = ".".join(str(n) for n in proven)
+                    same = want is not None and want == proven
+                else:
+                    pin = f"{proven[0]}.{proven[1]}"
+                    same = want is not None and want[:2] == proven[:2]
+                if not same:
+                    report.firmware = pin
+                    report.changed = True
+                    report.actions.append(f"firmware: {unit.firmware}→{pin}")
+
+        # Adopt a hand-set mounting orientation into the manifest — declared
+        # intent, like the firmware pin. The solved affines stay on-device.
+        from nxs.client import SupportsCalibration, rotation_name
+        if isinstance(transport, SupportsCalibration):
+            try:
+                code = transport.read_calibration().orientation
+            except Exception:
+                # The class implements the surface; the connected firmware
+                # may predate it. An optional adoption must not fail the
+                # freeze of everything else.
+                code = None
+                report.actions.append("calibration surface unavailable; "
+                                      "orientation not adopted")
+            live = rotation_name(code) if code is not None else None
+            if live is not None and live.isdigit():
+                # rotation_name preserves an unknown code as its number.
+                # The manifest vocabulary cannot hold it, and writing it
+                # would corrupt the file for every later command.
+                report.ok = False
+                report.error = (f"device reports orientation code {live}, "
+                                "which this tool's vocabulary does not name "
+                                "— update the nxs tool, then freeze again")
+                return report
+            if live is not None and unit.orientation != live \
+                    and (unit.orientation or live != "NONE"):
+                report.orientation = live
                 report.changed = True
-                report.actions.append(f"firmware: {unit.firmware}→{version}")
+                report.actions.append(f"orientation: "
+                                      f"{unit.orientation or 'NONE'}→{live}")
 
         if not report.changed:
             report.actions.append("no tuning to adopt")
@@ -223,6 +286,8 @@ def _apply_frozen(entry, report: FreezeReport):
                 subjects[subject] = live
     if report.firmware is not None:
         entry["firmware"] = report.firmware
+    if report.orientation is not None:
+        entry["orientation"] = report.orientation
 
 
 def _write_manifest(config_path: str, reports: List[FreezeReport]):

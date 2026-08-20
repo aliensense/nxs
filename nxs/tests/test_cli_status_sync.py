@@ -26,3 +26,9 @@ def test_status_sync_dash_when_never_synced(capsys):
     assert cmd_status(MockTransport(), _args()) == 0
     out = capsys.readouterr().out
     assert "Sync:    -" in out
+
+
+def test_status_prints_the_build_identity(capsys):
+    assert cmd_status(MockTransport(), _args()) == 0
+    out = capsys.readouterr().out
+    assert f"FW:      {MockTransport.FW_VERSION}" in out

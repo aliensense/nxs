@@ -12,10 +12,11 @@ plus any declared port, CAN probes the declared node-ids plus the
 factory default. Full bus enumeration arrives with the suite runtime.
 """
 import glob
+import sys
 import os
 import re
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from nxs._generated_constants import CyphalDefaults, NxsDevices
 from nxs.suite import FIRMWARE_DIR
@@ -124,8 +125,12 @@ def _scan_i2c(opener, declared: List[LinkSpec]) -> List[Found]:
             link = LinkSpec(transport="i2c", bus=bus, address=address)
             try:
                 transport = opener("i2c", bus=bus, address=address)
-            except Exception:
-                break  # bus unusable; the next address won't fare better
+            except Exception as e:
+                # bus unusable; the next address won't fare better. Name it:
+                # a missing i2c group or an absent smbus2 reads exactly like
+                # "no board here" otherwise.
+                print(f"scan: {bus}: {e}", file=sys.stderr)
+                break
             hit = _inspect(transport, link)
             if hit:
                 found.append(hit)
@@ -145,6 +150,8 @@ def _scan_serial(opener, declared: List[LinkSpec]) -> List[Found]:
     try:
         from serial.tools import list_ports
     except ImportError:
+        print("scan: pyserial not installed — serial sweep skipped "
+              "(pip install 'nxs[cyphal]')", file=sys.stderr)
         return []
     # USB bridges are probed blind at the default baud; other ports
     # (SoC UARTs) only when declared — a GetInfo probe writes to the
@@ -164,7 +171,11 @@ def _scan_serial(opener, declared: List[LinkSpec]) -> List[Found]:
             kwargs["baud"] = baud
         try:
             transport = opener("cyphal-serial", **kwargs)
-        except Exception:
+        except Exception as e:
+            # A port held by another nxs process, a missing dialout
+            # membership, or absent DSDL all land here — and all read as
+            # "nothing answered" unless the reason is printed.
+            print(f"scan: {port}: {e}", file=sys.stderr)
             continue
         hit = _inspect(transport, link)
         if hit:
@@ -172,21 +183,44 @@ def _scan_serial(opener, declared: List[LinkSpec]) -> List[Found]:
     return found
 
 
-def _can_interfaces() -> List[str]:
+def _can_interfaces() -> List[Tuple[str, bool]]:
+    """Every SocketCAN netdev as `(name, is_up)`. A CAN adapter with no
+    kernel driver bound produces no netdev at all, and a netdev that was
+    never `ip link set up` binds fine but carries nothing — both look
+    identical to "swept CAN, found nothing" unless the caller reports them."""
     ifaces = []
     for path in sorted(glob.glob("/sys/class/net/*/type")):
         try:
             with open(path) as f:
-                if f.read().strip() == "280":  # ARPHRD_CAN
-                    ifaces.append(path.split("/")[-2])
+                if f.read().strip() != "280":  # ARPHRD_CAN
+                    continue
+        except OSError:
+            continue
+        name = path.split("/")[-2]
+        up = False
+        try:
+            with open(path.replace("/type", "/operstate")) as f:
+                up = f.read().strip() not in ("down", "unknown")
         except OSError:
             pass
+        ifaces.append((name, up))
     return ifaces
 
 
 def _scan_can(opener, declared: List[LinkSpec]) -> List[Found]:
     found = []
-    for iface in _can_interfaces():
+    ifaces = _can_interfaces()
+    if not ifaces:
+        if any(link.transport == "cyphal-can" for link in declared):
+            print("scan: no SocketCAN interface on this host — a CAN adapter "
+                  "needs its kernel driver (gs_usb for Geschwister/candleLight "
+                  "devices) and `ip link set up`", file=sys.stderr)
+        return found
+    for iface, up in ifaces:
+        if not up:
+            print(f"scan: {iface} is down — bring it up at the device's bit "
+                  f"timing before it can answer", file=sys.stderr)
+            continue
         node_ids = sorted({link.node_id for link in declared
                            if link.transport == "cyphal-can" and link.iface == iface}
                           | {CyphalDefaults.DEFAULT_NODE_ID})
@@ -195,7 +229,11 @@ def _scan_can(opener, declared: List[LinkSpec]) -> List[Found]:
             try:
                 transport = opener("cyphal-can", can_iface=iface,
                                    remote_node_id=node_id)
-            except Exception:
+            except Exception as e:
+                # The reason is diagnosable and the user cannot otherwise tell
+                # "nothing there" from "your link can't carry CAN FD" or "nxs
+                # has no pycyphal". Name it, then stop probing this iface.
+                print(f"scan: {iface}: {e}", file=sys.stderr)
                 break
             hit = _inspect(transport, link)
             if hit:

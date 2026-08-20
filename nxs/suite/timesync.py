@@ -4,14 +4,19 @@ Pushes every declared unit's time discipline on one cadence.
 Transports stay open across rounds. A unit that fails a round is
 reopened on the next one with its estimator intact.
 """
+import logging
 import os
 import shutil
+import sys
 from dataclasses import dataclass
 from typing import List, Optional
 
-from nxs.client import PUSH_INTERVAL_S, SupportsTimeSync, estimate_and_push
+from nxs.client import (DeviceRefused, PUSH_INTERVAL_S, SupportsTimeSync,
+                        XFER_EBUSY, estimate_and_push, exc_detail)
 from nxs.suite.schema import SuiteConfig
 from nxs.transports import open_client
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -52,6 +57,8 @@ def render_systemd_unit(nxs_path: str, user: str, only_units=None,
 class SuitePusher:
     def __init__(self, cfg: SuiteConfig, only_units=None, opener=open_client,
                  pusher=estimate_and_push):
+        self._mux_held = set()
+        self._open_warned = set()
         declared = {unit.name for unit in cfg.units}
         for name in only_units or []:
             if name not in declared:
@@ -76,11 +83,20 @@ class SuitePusher:
                 pass
         self._open_units.clear()
 
+    def warn_once(self, name: str, message: str):
+        """One warning per unit per episode. This pusher is resident and
+        runs every interval, so an unrecoverable link would otherwise
+        repeat its reason forever."""
+        if name not in self._open_warned:
+            self._open_warned.add(name)
+            log.warning("%s: %s", name, message)
+
     def _push_unit(self, unit) -> PushReport:
         if unit.name not in self._open_units:
             transport = self._open_unit(unit)
             if transport is None:
                 return PushReport(unit.name, note="no link answered")
+            self._open_warned.discard(unit.name)
             if hasattr(transport, "get_time_sync"):
                 held = self._estimators.get(unit.name)
                 if held is not None:
@@ -94,12 +110,29 @@ class SuitePusher:
         note = "no observation (link silent?)"
         try:
             bound = self._pusher(transport)
+        except DeviceRefused as e:
+            if e.code == XFER_EBUSY:    # a transfer session is live
+                # An upload or firmware push holds the mux. Skip the interval
+                # and keep the unit open — the estimator's state is fine, the
+                # device just can't take a record right now. One warning per
+                # episode; the next successful push re-arms it.
+                if unit.name not in self._mux_held:
+                    self._mux_held.add(unit.name)
+                    log.warning("%s: transfer session live — skipping sync "
+                                "until it ends", unit.name)
+                return PushReport(unit.name, note="mux held — sync skipped")
+            # Any other refusal is this unit's own failure, not the round's:
+            # report it and let the other units continue (round() isolates
+            # per unit — a re-raise here would abort the whole fleet's sync).
+            bound = None
+            note = f"push refused ({exc_detail(e)})"
         except Exception as e:
             bound = None
-            note = f"push failed ({e})"
+            note = f"push failed ({exc_detail(e)})"
         if bound is None:
             self._drop(unit.name)
             return PushReport(unit.name, note=note)
+        self._mux_held.discard(unit.name)
         return PushReport(unit.name, bound_us=bound)
 
     def _open_unit(self, unit):
@@ -110,8 +143,12 @@ class SuitePusher:
                 candidate = self._opener(link.transport, **link.client_kwargs())
                 if candidate.probe():
                     return candidate
-            except Exception:
-                pass
+                # probe() answers False for a refused bus as well as for
+                # absent hardware; the transport kept which it was.
+                if reason := candidate.probe_failure_detail():
+                    self.warn_once(unit.name, f"{link.describe()}: {reason}")
+            except Exception as e:
+                self.warn_once(unit.name, f"{link.describe()}: {exc_detail(e)}")
             if candidate is not None:
                 try:
                     candidate.close()

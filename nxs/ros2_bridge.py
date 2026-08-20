@@ -32,7 +32,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import yaml
 
-from nxs._generated_constants import FieldSemantics
+from nxs._generated_constants import FieldSemantics, GpsTime
 
 log = logging.getLogger(__name__)
 
@@ -57,12 +57,10 @@ MAG_AXES = (Sem.MAG_X, Sem.MAG_Y, Sem.MAG_Z)
 GEO_POSITION = (Sem.LATITUDE, Sem.LONGITUDE, Sem.ALTITUDE)
 GEO_VELOCITY = (Sem.VEL_NORTH, Sem.VEL_EAST, Sem.VEL_DOWN)
 
-# GNSS drivers carry fix quality as a GENERIC field under this name.
-FIX_TYPE_FIELD = "fix_type"
-
-STAMP_SYNCED = "synced"
-STAMP_DEVICE = "device"
-STAMP_ARRIVAL = "arrival"
+# Re-exported so bridge consumers keep one import site; the names live in
+# a leaf module the CLI and launch surfaces can read without the bridge.
+from nxs.stamp_modes import (STAMP_ARRIVAL, STAMP_DEVICE, STAMP_ITOW,
+                             STAMP_MODES, STAMP_SYNCED)
 
 
 def resolve_msg_type(type_string: str):
@@ -103,10 +101,38 @@ class Publication:
 @dataclass
 class UnitPlan:
     """One bridged unit: its manifest name (None for an ad-hoc device),
-    the frame_id its messages carry, and its planned publications."""
+    the frame_id its messages carry, its planned publications, and the
+    epoch-capable binding (`--stamp itow`'s field pair) when present."""
     name: Optional[str]
     frame_id: str
     publications: List[Publication]
+    epoch: Optional[Tuple[str, str]] = None
+
+
+def fields_by_semantic(fields: List[dict]) -> Dict[int, dict]:
+    """First field claiming each non-generic semantic (strings excluded) —
+    the one resolver behind publication planning and epoch binding."""
+    by_sem: Dict[int, dict] = {}
+    for f in fields:
+        sem = int(f.get('semantic', Sem.GENERIC))
+        if sem != Sem.GENERIC and sem not in by_sem \
+                and f.get('type') != 'string':
+            by_sem[sem] = f
+
+    return by_sem
+
+
+def epoch_binding(fields: List[dict]) -> Optional[Tuple[str, str]]:
+    """(time-of-week, fix-type) field names when the descriptors carry
+    both registry semantics — the epoch-capable contract `--stamp itow`
+    keys on. Resolved once at plan time so stamping never guesses names."""
+    by_sem = fields_by_semantic(fields)
+    tow = by_sem.get(Sem.TIME_OF_WEEK)
+    fix = by_sem.get(Sem.FIX_TYPE)
+    if tow is None or fix is None:
+        return None
+
+    return tow['name'], fix['name']
 
 
 def plan_publications(fields: List[dict]) -> List[Publication]:
@@ -119,12 +145,7 @@ def plan_publications(fields: List[dict]) -> List[Publication]:
     its own per-field topic. Every field lands in at least one
     publication; nothing is dropped.
     """
-    by_sem: Dict[int, dict] = {}
-    for f in fields:
-        sem = int(f.get('semantic', Sem.GENERIC))
-        if sem != Sem.GENERIC and sem not in by_sem \
-                and f.get('type') != 'string':
-            by_sem[sem] = f
+    by_sem = fields_by_semantic(fields)
 
     consumed = set()
     pubs = []
@@ -165,10 +186,8 @@ def plan_publications(fields: List[dict]) -> List[Publication]:
                                 'sensor_msgs/msg/FluidPressure',
                                 'pressure', {'value': name}))
 
-    fix_field = next(
-        (f['name'] for f in fields
-         if f.get('name') == FIX_TYPE_FIELD
-         and int(f.get('semantic', Sem.GENERIC)) == Sem.GENERIC), None)
+    fix = by_sem.get(Sem.FIX_TYPE)
+    fix_field = fix['name'] if fix is not None else None
 
     if all(s in by_sem for s in GEO_POSITION):
         bindings = dict(zip(('lat', 'lon', 'alt'), claim(GEO_POSITION)))
@@ -219,6 +238,11 @@ def plan_publications(fields: List[dict]) -> List[Publication]:
 # drift), 5 time-only.
 FIX_TYPES_WITH_FIX = (2, 3, 4)
 
+# Fix types whose GPS time is solved: the positions above plus 5
+# time-only. Time validity is a weaker bar than position validity — a
+# time-only fix stamps from iTOW while NavSatFix reports NO_FIX.
+FIX_TYPES_WITH_TIME = (2, 3, 4, 5)
+
 
 def navsat_status_from_fix_type(fix_type: int) -> int:
     """Map the driver's `fix_type` quality field onto a
@@ -232,6 +256,28 @@ def navsat_status_from_fix_type(fix_type: int) -> int:
     """
     return NAVSAT_STATUS_FIX if fix_type in FIX_TYPES_WITH_FIX \
         else NAVSAT_STATUS_NO_FIX
+
+
+# Below this the host clock is implausible (cold boot, no NTP) and the
+# nearest-week resolver would confidently pick a wrong week — refuse
+# instead, as RTKLIB clamps and gpsd warns. 2020-01-01 UTC.
+HOST_CLOCK_FLOOR_UNIX_S = 1_577_836_800
+
+
+def utc_from_itow(itow_s: float, now_unix_s: float) -> Optional[float]:
+    """UTC seconds for a GPS time-of-week, or None when the host clock
+    is too implausible to resolve the week. The week number is resolved
+    against the host clock (nearest of the adjacent weeks, so a rollover
+    boundary can't misplace the epoch; the host only has to be within
+    ±3.5 days), GPS→UTC via the maintained leap constant. A distinct
+    timescale from the host-projected device stamps — mixing the two in
+    one consumer needs care."""
+    if now_unix_s < HOST_CLOCK_FLOOR_UNIX_S:
+        return None
+    now_gps = now_unix_s - GpsTime.GPS_EPOCH_UNIX_S + GpsTime.GPS_UTC_LEAP_S
+    gps = float(itow_s) + GpsTime.GPS_WEEK_S * round((now_gps - float(itow_s))
+                                                     / GpsTime.GPS_WEEK_S)
+    return gps + GpsTime.GPS_EPOCH_UNIX_S - GpsTime.GPS_UTC_LEAP_S
 
 
 def stamp_from_us(us: int) -> Tuple[int, int]:
@@ -525,7 +571,8 @@ def format_plan(plans: List[UnitPlan], topic_base: str) -> str:
         if row is None:
             # The sanitized name is what the runtime uses for the node,
             # namespace, and frame_id — preview the real ROS surface.
-            lines.append(f"{sanitize_ros_name(plan.frame_id)}:")
+            epoch = "  [epoch-capable]" if plan.epoch else ""
+            lines.append(f"{sanitize_ros_name(plan.frame_id)}:{epoch}")
         else:
             topic, msg_type, fields = row
             lines.append(f"  {topic:<{width_t}}  {msg_type:<{width_m}}"
@@ -604,11 +651,23 @@ class Ros2Bridge:
                  resolver: Callable = resolve_msg_type):
         self._units = units
         self._stamp_mode = stamp_mode
+        # itow's documented fallback is the synced projection, so both
+        # modes take the sync path on samples without a usable epoch.
+        self._sync_stamps = stamp_mode in (STAMP_SYNCED, STAMP_ITOW)
         self._time_syncs = time_syncs
         self._runtime = runtime if runtime is not None else _RclpyRuntime()
         self._channels: List[List[_Channel]] = []
         self._frames = [sanitize_ros_name(u.frame_id) for u in units]
-        self._stamp_warned = [False] * len(units)
+        self._epochs = [u.epoch for u in units]
+        if stamp_mode == STAMP_ITOW:
+            # Epoch-less units warn once here and never take the itow path.
+            for unit, epoch in zip(units, self._epochs):
+                if epoch is None:
+                    log.warning("%s: no epoch binding (TIME_OF_WEEK + "
+                                "FIX_TYPE semantics); stamping on the "
+                                "synced projection", unit.frame_id)
+        # One warned flag per unit per fallback kind.
+        self._stamp_warned: Dict[str, List[bool]] = {}
         total = 0
         for unit in units:
             resolved = []
@@ -684,8 +743,15 @@ class Ros2Bridge:
         return self._units[unit_idx].frame_id
 
     def _stamp(self, unit_idx: int, sample) -> Tuple[int, int]:
-        if self._stamp_mode == STAMP_SYNCED \
-                and sample.timestamp_us is not None:
+        if self._stamp_mode == STAMP_ITOW \
+                and (epoch := self._epochs[unit_idx]) is not None:
+            stamp = self._stamp_from_itow(epoch, sample)
+            if stamp is not None:
+                return stamp
+            self._warn_stamp_fallback(unit_idx, "no valid GNSS epoch in "
+                                                "the stream",
+                                      "the synced projection")
+        if self._sync_stamps and sample.timestamp_us is not None:
             sync = self._time_syncs[unit_idx] if self._time_syncs else None
             if sync is not None:
                 stamp = sync.project_to_realtime(sample.timestamp_us)
@@ -700,11 +766,38 @@ class Ros2Bridge:
                                          "timestamp")
         return self._runtime.now_stamp()
 
+    def _stamp_from_itow(self, epoch: Tuple[str, str],
+                         sample) -> Optional[Tuple[int, int]]:
+        """UTC (sec, nanosec) from the message's own GNSS epoch, or None
+        when the fix isn't time-solved (FIX_TYPES_WITH_TIME) or the host
+        clock can't resolve the GPS week."""
+        tow_name, fix_name = epoch
+        values = sample.values or {}
+        itow_s = values.get(tow_name)
+        fix = values.get(fix_name)
+        if itow_s is None or fix is None \
+                or int(fix) not in FIX_TYPES_WITH_TIME:
+            return None
+        utc = utc_from_itow(float(itow_s), time.time())
+        if utc is None:
+            return None
+
+        return stamp_from_us(round(utc * 1_000_000))
+
     def _warn_arrival(self, unit_idx: int, reason: str):
-        if not self._stamp_warned[unit_idx]:
-            self._stamp_warned[unit_idx] = True
-            log.warning("%s: %s; stamping on arrival",
-                        self._units[unit_idx].frame_id, reason)
+        self._warn_stamp_fallback(unit_idx, reason, "arrival")
+
+    def _warn_stamp_fallback(self, unit_idx: int, reason: str, to: str):
+        """One warning per unit per fallback kind — a mode that degrades
+        two ways reports both."""
+        warned = self._stamp_warned.get(to)
+        if warned is None:
+            warned = [False] * len(self._units)
+            self._stamp_warned[to] = warned
+        if not warned[unit_idx]:
+            warned[unit_idx] = True
+            log.warning("%s: %s; stamping on %s",
+                        self._units[unit_idx].frame_id, reason, to)
 
 
 SILENT_UNIT_WARN_S = 5.0
@@ -814,27 +907,51 @@ def run_bridge(clients: list, bridge: Ros2Bridge,
     bound_shown = [False] * len(clients)
     last_ping = time.monotonic()
     last_push = time.monotonic()
+    # A degrading time discipline is invisible in the samples themselves —
+    # they keep flowing, stamped from an estimator that is quietly
+    # extrapolating past its last fit. Warn once per unit per fault so a
+    # recording that will be wrong says so while it is still running.
+    ping_warned = [False] * len(clients)
+    push_warned = [False] * len(clients)
     try:
         while count is None or samples < count:
             now = time.monotonic()
             if now - last_ping >= SYNC_PING_INTERVAL_S:
                 last_ping = now
-                for client in clients:
+                for i, client in enumerate(clients):
                     try:
                         client.time_sync_ping()
-                    except Exception:
-                        pass  # a dead link surfaces via its silent-unit warning
+                        ping_warned[i] = False
+                    except Exception as e:
+                        # The silent-unit warning only fires when SAMPLES
+                        # stop; an RPC path that dies while the sample
+                        # subject keeps flowing would never trip it, and the
+                        # stamps drift at the device's uncorrected rate.
+                        if not ping_warned[i]:
+                            ping_warned[i] = True
+                            log.warning("%s: time-sync ping failed (%s) — "
+                                        "timestamps will drift until it "
+                                        "recovers", bridge.unit_frame(i), e)
             # Star-topology discipline: push each unit's offset down on
             # the shared cadence so devices stay synced while it runs.
             if now - last_push >= PUSH_INTERVAL_S:
                 last_push = now
-                for client in clients:
+                for i, client in enumerate(clients):
                     if not isinstance(client, SupportsTimeSync):
                         continue
                     try:
                         estimate_and_push(client, pings=0)
-                    except Exception:
-                        pass  # next cadence retries; staleness is bounded
+                        push_warned[i] = False
+                    except Exception as e:
+                        # "Staleness is bounded" only holds if a later push
+                        # lands. Against a standing refusal the device's
+                        # validity window lapses and discipline is simply
+                        # gone, so say it once rather than never.
+                        if not push_warned[i]:
+                            push_warned[i] = True
+                            log.warning("%s: time-sync push failed (%s) — "
+                                        "device discipline lapses if this "
+                                        "persists", bridge.unit_frame(i), e)
             try:
                 idx, sample = q.get(timeout=0.5)
             except queue.Empty:

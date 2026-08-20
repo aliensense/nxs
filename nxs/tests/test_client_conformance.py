@@ -418,3 +418,11 @@ def test_refreshed_fields_goes_raw_only_while_swap_unresolved():
     token, fields = NxsClient._refreshed_fields(duck, token, fields)
     assert token == 2
     assert fields == new_fields
+
+
+def test_xfer_reason_map_names_the_retryable_drop():
+    # A queue-dropped announce/begin resolves to EAGAIN(11); the reason map
+    # must give retry guidance, not a bare "device error code 11".
+    from nxs.client import XFER_ERR_REASON, err_reason
+    assert "retry" in err_reason(11, XFER_ERR_REASON).lower()
+    assert "code 11" not in err_reason(11, XFER_ERR_REASON)

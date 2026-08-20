@@ -16,24 +16,35 @@ thread (the cyphal_source pattern): subscriber callbacks feed thread-safe state,
 and the RPCs cross over via `run_coroutine_threadsafe`.
 """
 
+import concurrent.futures
 import errno
 import os
 import queue
 import tempfile
 import threading
+import struct
 import time
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
 
-from nxs._generated_constants import CyphalDefaults
+from nxs._generated_constants import CyphalDefaults, NxsRegisters
 from nxs.client import (
+    CAL_VECTORS,
+    CALIB_ERR_REASON,
+    CAL_READ_ATTEMPTS,
     COMMISSION_ERR_REASON,
     COMMISSION_TOPICS,
+    DFU_ERASE_TIMEOUT_S,
+    ERRNO_ENOENT,
+    STORE_CMD_TIMEOUT_S,
+    CalibrationRecord,
     DeviceRefused,
+    LOAD_ERR_REASON,
     NxsClient,
     PULL_ERR_REASON,
     Sample,
     SupportsBitTiming,
+    SupportsCalibration,
     SupportsCanTermination,
     SupportsCommissioning,
     SupportsEgressDecimation,
@@ -48,6 +59,8 @@ from nxs.client import (
     validate_commission,
 )
 from nxs.transports.cyphal_source import (
+    CALIBRATION_REGISTER,
+    FW_DESCRIBE_REGISTER,
     DECIMATION_REGISTER,
     TIME_US_REGISTER,
     _ensure_dsdl,
@@ -83,6 +96,13 @@ CYCLE = 0xA006
 RESET = 0xA007
 ENTER_RECOVERY = 0xA008
 IDENTIFY = 0xA009
+CAL_GYRO = 0xA00A
+CAL_MAG_START = 0xA00B
+CAL_MAG_STOP = 0xA00C
+CAL_ABORT = 0xA00D
+
+CAL_DIRTY_RETRY_S = 0.1
+"""Pause between bracket retries while another host's stage is dirty."""
 
 PARAM_REGISTER_PREFIX = "aliensense.nxs.param."
 ACTIVE_SLOT = 0xFF
@@ -112,6 +132,11 @@ def _quiet_background_logging() -> None:
     if _BG_QUIETED:
         return
     import logging
+    # Cap the whole tree. The diagnoses worth having reach us as *exceptions*
+    # and are printed by their callers (a failed open names the media
+    # configuration error verbatim); what the loggers add is a per-second
+    # traceback from the heartbeat publisher once a link is unusable, which
+    # buries the one line the operator needs.
     logging.getLogger("pycyphal").setLevel(logging.CRITICAL)
     _BG_QUIETED = True
 
@@ -119,7 +144,8 @@ def _quiet_background_logging() -> None:
 class CyphalControlClient(NxsClient, SupportsFaultCounters, SupportsSlotPeek, SupportsCommissioning,
                           SupportsIdentify, SupportsRecovery,
                           SupportsEgressDecimation, SupportsBitTiming,
-                          SupportsCanTermination, SupportsTimeSync):
+                          SupportsCanTermination, SupportsTimeSync,
+                          SupportsCalibration):
     """The full NXS control contract over Cyphal, wrapping stock pycyphal."""
 
     def __init__(self, port: str = None, baud: int = 460800,
@@ -137,6 +163,9 @@ class CyphalControlClient(NxsClient, SupportsFaultCounters, SupportsSlotPeek, Su
         self._remote_id = remote_node_id
         self._sample_subject_id = sample_subject_id
         self._timeout = timeout
+        # Device-wide decimation as found before a stream armed; restored on
+        # teardown so streaming never changes the device's resting state.
+        self._prev_decimation: Optional[int] = None
 
         self._serve_dir = tempfile.mkdtemp(prefix="nxs-cyphal-")
         self._queue: "queue.Queue[Tuple[int, bytes, Optional[int]]]" = queue.Queue(maxsize=2000)
@@ -151,6 +180,7 @@ class CyphalControlClient(NxsClient, SupportsFaultCounters, SupportsSlotPeek, Su
         self._param_info = self._driver_info = self._output_info = None
         self._node_info_client = None
         self._sample_sub = self._hb_sub = None
+        self._last_link_error: Optional[BaseException] = None
 
         if autostart:
             self._start()
@@ -165,7 +195,13 @@ class CyphalControlClient(NxsClient, SupportsFaultCounters, SupportsSlotPeek, Su
         self._thread = threading.Thread(target=self._loop.run_forever, daemon=True,
                                         name="cyphal-control-loop")
         self._thread.start()
-        asyncio.run_coroutine_threadsafe(self._async_setup(), self._loop).result(timeout=10)
+        try:
+            asyncio.run_coroutine_threadsafe(self._async_setup(), self._loop).result(timeout=10)
+        except BaseException:
+            # The node may already be publishing; the caller never gets an
+            # object to close, so unwind here or leak a thread per attempt.
+            self.close()
+            raise
 
     async def _async_setup(self) -> None:
         import pycyphal.application
@@ -226,11 +262,20 @@ class CyphalControlClient(NxsClient, SupportsFaultCounters, SupportsSlotPeek, Su
 
     async def _resolve_sample_subject(self, access_type):
         """Read ``uavcan.pub.sample.id`` from the device, or None when the
-        read times out or the register is not a natural16 (older firmware)."""
+        read times out or the register is not a natural16 (older firmware).
+
+        A transport-level failure is NOT swallowed: this is the first send on
+        a freshly built link, so a misconfigured medium surfaces here — and
+        pycyphal's message names the fix ("the device probably doesn't
+        support CAN-FD. Try setting MTU to 8"). Returning None would hand the
+        caller a client on a link that can never carry a frame."""
         import uavcan.register.Name_1_0 as Name
+        from pycyphal.transport import TransportError
         try:
             result = await self._reg.call(access_type.Request(
                 name=Name("uavcan.pub.sample.id")))
+        except TransportError:
+            raise
         except Exception:
             return None
         if result is None:
@@ -262,23 +307,54 @@ class CyphalControlClient(NxsClient, SupportsFaultCounters, SupportsSlotPeek, Su
             pass
 
     async def _on_heartbeat(self, msg, _meta) -> None:
+        # The Heartbeat subscription is subject-wide, so on a multi-node bus
+        # (a bench rig with a REF node) every node's beat arrives here. Take
+        # only the device we command — otherwise another node's OPERATIONAL
+        # beat ends a pull wait mid-transfer and the verdict reads as done.
+        if _meta.source_node_id != self._remote_id:
+            return
         self._hb_mode = int(msg.mode.value)
         self._hb_uptime = int(msg.uptime)
 
-    def _call(self, client, request):
+    def _call(self, client, request, timeout: Optional[float] = None):
         import asyncio
 
         if self._loop is None or client is None:
             return None
+        # pycyphal bounds each call by the client's own response_timeout and
+        # returns None when it expires, so both bounds have to move together.
+        held = getattr(client, "response_timeout", None)
+        if timeout is not None and held is not None:
+            client.response_timeout = timeout
         fut = asyncio.run_coroutine_threadsafe(client.call(request), self._loop)
+        self._last_link_error = None
         try:
-            result = fut.result(timeout=self._timeout)
-        except Exception:
+            result = fut.result(timeout=timeout or self._timeout)
+        except concurrent.futures.TimeoutError:
+            return None                 # the device stayed silent; nothing to add
+        except Exception as e:
+            # Never reached the wire. The caller sees only "no answer", so
+            # the reason has to survive here.
+            self._last_link_error = e
             return None
+        finally:
+            if timeout is not None and held is not None:
+                client.response_timeout = held
         if result is None:
             return None
         response, _meta = result
         return response
+
+    def probe_failure_detail(self) -> Optional[str]:
+        e = self._last_link_error
+        if e is None:
+            return None
+        if isinstance(e, OSError) and e.errno == errno.ENOBUFS and self._can_iface:
+            return (f"{e} — {self._can_iface} accepted no frames for "
+                    f"transmission. `ip -details -statistics link show "
+                    f"{self._can_iface}` reporting ERROR-PASSIVE means nothing "
+                    "on the bus is acknowledging")
+        return str(e) or type(e).__name__
 
     def link_dropped(self) -> bool:
         # A wedged/unplugged serial device vanishes from /dev; a device that is
@@ -337,16 +413,20 @@ class CyphalControlClient(NxsClient, SupportsFaultCounters, SupportsSlotPeek, Su
             pass
 
     # ── ExecuteCommand + completion ───────────────────────
-    def _execute(self, command: int, parameter: bytes = b"") -> bool:
+    def _execute(self, command: int, parameter: bytes = b"",
+                 timeout: Optional[float] = None) -> bool:
         """True on STATUS_SUCCESS, False on a failure status, and raises
         RuntimeError when the device never answered — a refusal and a
         dead link are different diagnoses."""
         import uavcan.node.ExecuteCommand_1_1 as ExecuteCommand
 
         resp = self._call(self._cmd, ExecuteCommand.Request(command=command,
-                                                            parameter=list(parameter)))
+                                                            parameter=list(parameter)),
+                          timeout=timeout)
         if resp is None:
-            raise RuntimeError("device did not respond")
+            detail = self.probe_failure_detail()
+            raise RuntimeError("device did not respond"
+                               + (f" — {detail}" if detail else ""))
         return int(resp.status) == ExecuteCommand.Response.STATUS_SUCCESS
 
     def _raise_cmd_error(self, reasons=None):
@@ -364,23 +444,28 @@ class CyphalControlClient(NxsClient, SupportsFaultCounters, SupportsSlotPeek, Su
                                "(reason unavailable)") from None
         raise DeviceRefused(code, err_reason(code, reasons))
 
-    def _wait_idle(self, timeout: float = 15.0) -> None:
-        """Wait for a provisioning session to finish: the node's Heartbeat mode
-        is SOFTWARE_UPDATE during the pull and returns to OPERATIONAL after. A
-        pull shorter than the 1 Hz Heartbeat is never observed active, so a 2 s
-        settle without seeing it is treated as already done."""
+    def _await_pull_verdict(self, timeout: float = 15.0) -> int:
+        """Poll the driver-pull verdict out of the cmd_error register.
+
+        The device marks cmd_error PENDING at pull accept and overwrites it
+        with the on_load rc the instant the pull latches, so this is an
+        explicit register edge — immune to the heartbeat loss and cross-node
+        aliasing that watching the SOFTWARE_UPDATE mode suffered. The
+        FileServer keeps serving on the background loop throughout. Raises
+        TimeoutError if the pull never resolves."""
         end = time.monotonic() + timeout
-        settle = time.monotonic() + 2.0
-        saw_active = False
         while time.monotonic() < end:
-            mode = self._hb_mode
-            if mode == MODE_SOFTWARE_UPDATE:
-                saw_active = True
-            elif saw_active:
-                return
-            elif time.monotonic() > settle:
-                return
-            time.sleep(0.1)
+            try:
+                code = self._read_natural16("aliensense.nxs.cmd_error")
+            except RuntimeError:
+                # A read timed out mid-flash; the device is busy, not done.
+                time.sleep(0.2)
+                continue
+            if code != NxsRegisters.CMD_ERR_PENDING:
+                return code
+            time.sleep(0.2)
+        raise TimeoutError(
+            f"file pull did not resolve — no verdict within {timeout:.0f} s")
 
     def _wait_for_update(self, timeout: float, total: int = 0, progress_cb=None) -> bool:
         """Hold this node + FileServer up while the device pulls the firmware
@@ -422,8 +507,18 @@ class CyphalControlClient(NxsClient, SupportsFaultCounters, SupportsSlotPeek, Su
         return bytes(info.unique_id[:12]) if info is not None else None
 
     def read_fw_version(self) -> Optional[str]:
-        """`software_version` via `uavcan.node.GetInfo`, as "MAJOR.MINOR"
-        (the wire carries no patch level)."""
+        """The firmware build identity, verbatim `git describe`, from
+        the `aliensense.nxs.fw.describe` register. Firmware without the
+        register falls back to "MAJOR.MINOR" from `uavcan.node.GetInfo`
+        (an unknown register answers with an empty value)."""
+        try:
+            value = self._access(FW_DESCRIBE_REGISTER)
+        except RuntimeError:
+            value = None
+        if value is not None and value.string is not None:
+            text = bytes(value.string.value).split(b"\x00", 1)[0]
+            if text:
+                return text.decode("ascii", "replace")
         info = self._node_info()
         if info is None:
             return None
@@ -440,7 +535,11 @@ class CyphalControlClient(NxsClient, SupportsFaultCounters, SupportsSlotPeek, Su
         self._serve("driver.nxs", image)
         if not self._execute(LOAD_FROM_FILE, b"driver.nxs"):
             self._raise_cmd_error(PULL_ERR_REASON)
-        self._wait_idle()
+        # Wait for the pull's own verdict edge, not a heartbeat mode change:
+        # "Uploaded" must mean the device confirmed the on_load parse, and a
+        # non-zero verdict names why the driver did not load.
+        if self._await_pull_verdict() != 0:
+            self._raise_cmd_error(LOAD_ERR_REASON)
 
     def vm_run(self):
         self._execute(RUN)
@@ -462,7 +561,10 @@ class CyphalControlClient(NxsClient, SupportsFaultCounters, SupportsSlotPeek, Su
         name = os.path.basename(bin_path)
         self._serve(name, data)
         self._fileserver.served = 0
-        if not self._execute(COMMAND_BEGIN_SOFTWARE_UPDATE, name.encode()):
+        # The erase runs inside this call and outlasts the default service
+        # timeout — see DFU_ERASE_TIMEOUT_S.
+        if not self._execute(COMMAND_BEGIN_SOFTWARE_UPDATE, name.encode(),
+                             timeout=DFU_ERASE_TIMEOUT_S):
             self._raise_cmd_error(PULL_ERR_REASON)
         # The device pulls the image from our FileServer asynchronously — tens
         # of seconds for a full firmware over the serial link — then swaps and
@@ -513,15 +615,17 @@ class CyphalControlClient(NxsClient, SupportsFaultCounters, SupportsSlotPeek, Su
 
     # ── Driver store ──────────────────────────────────────
     def save_slot(self, slot: int):
-        if not self._execute(SAVE, bytes([slot & 0xFF])):
+        if not self._execute(SAVE, bytes([slot & 0xFF]),
+                             timeout=STORE_CMD_TIMEOUT_S):
             self._raise_cmd_error()
 
     def delete_slot(self, slot: int):
-        if not self._execute(DELETE_SLOT, bytes([slot & 0xFF])):
+        if not self._execute(DELETE_SLOT, bytes([slot & 0xFF]),
+                             timeout=STORE_CMD_TIMEOUT_S):
             self._raise_cmd_error()
 
     def clear_store(self):
-        if not self._execute(CLEAR_STORE):
+        if not self._execute(CLEAR_STORE, timeout=STORE_CMD_TIMEOUT_S):
             self._raise_cmd_error()
 
     def cycle(self):
@@ -599,6 +703,16 @@ class CyphalControlClient(NxsClient, SupportsFaultCounters, SupportsSlotPeek, Su
         """Probe give-up count since boot (`aliensense.nxs.probe_failed_count`)."""
         return self._read_natural16("aliensense.nxs.probe_failed_count")
 
+    def read_drdy_coalesced_count(self) -> int:
+        """Missed sample intervals (`aliensense.nxs.drdy_coalesced_count`)."""
+        return self._read_natural16("aliensense.nxs.drdy_coalesced_count")
+
+    def read_ingress_reject_count(self) -> int:
+        """Arbiter claim rejects (`aliensense.nxs.ingress_reject_count`).
+        Refreshed on the device at the status cadence, so it can lag the
+        I2C diag view by one heartbeat."""
+        return self._read_natural16("aliensense.nxs.ingress_reject_count")
+
     # ── Output descriptors ────────────────────────────────
     def read_outputs(self) -> Optional[List[dict]]:
         import aliensense.nxs.GetOutputInfo_1_0 as GetOutputInfo
@@ -630,8 +744,18 @@ class CyphalControlClient(NxsClient, SupportsFaultCounters, SupportsSlotPeek, Su
         return outs
 
     def _descriptor_token(self) -> int:
-        # The active slot changes when the loaded driver does, so it serves as a
-        # cheap descriptor-set generation for mid-stream re-fetch.
+        # The descriptor epoch changes on every load; the active slot does
+        # not — all transient drivers share 0xFF, so a RAM-to-RAM swap
+        # would keep the token and the stream would decode the new
+        # driver's bytes with the old layout. Firmware without the
+        # register falls back to the slot, where name-preserving swaps
+        # stay undetected.
+        try:
+            value = self._access("aliensense.nxs.descriptor.epoch")
+            if value.natural16 is not None and len(value.natural16.value) >= 1:
+                return int(value.natural16.value[0])
+        except Exception:
+            pass
         return self.read_active_slot()
 
     # ── Streaming primitives ──────────────────────────────
@@ -740,6 +864,206 @@ class CyphalControlClient(NxsClient, SupportsFaultCounters, SupportsSlotPeek, Su
         name = DECIMATION_REGISTER + (f".{subject}" if subject else "")
         self._write_natural16(name, value)
 
+    # ── Calibration ───────────────────────────────────────
+    def _access(self, name: str, value=None):
+        import uavcan.register.Access_1_0 as Access
+        import uavcan.register.Name_1_0 as Name
+        import uavcan.register.Value_1_0 as Value
+        req = Access.Request(name=Name(name),
+                             value=value if value is not None else Value())
+        resp = self._call(self._reg, req)
+        if resp is None:
+            raise RuntimeError(f"register '{name}' access timed out (no response)")
+        return resp.value
+
+    def _read_reals(self, name: str, expect: int):
+        value = self._access(name)
+        if value.real32 is None or len(value.real32.value) < expect:
+            raise RuntimeError(f"register '{name}' is not a real32[{expect}] value")
+        return [float(v) for v in value.real32.value[:expect]]
+
+    def _write_reals(self, name: str, values) -> None:
+        """Write a real32 register and verify the echo. The device rejects
+        an invalid write by echoing the unchanged value, so a fired-and-
+        forgotten write can silently leave this register stale while its
+        siblings update. Comparison is after float32 rounding — a
+        representability difference is not a rejection."""
+        import uavcan.primitive.array.Real32_1_0 as Real32
+        import uavcan.register.Value_1_0 as Value
+        echo = self._access(name, Value(real32=Real32(list(values))))
+        sent = [struct.unpack('<f', struct.pack('<f', v))[0] for v in values]
+        got = ([float(v) for v in echo.real32.value[:len(sent)]]
+               if echo.real32 is not None else [])
+        if len(got) != len(sent) or any(
+                a != b and not (a != a and b != b) for a, b in zip(sent, got)):
+            raise DeviceRefused(22, err_reason(22, CALIB_ERR_REASON))
+
+    def _write_verified(self, name: str, value, extract) -> None:
+        """Non-real32 twin of the `_write_reals` echo check: `extract`
+        pulls the comparable payload from an Access response value."""
+        echo = self._access(name, value)
+        if extract(echo) != extract(value):
+            raise DeviceRefused(22, err_reason(22, CALIB_ERR_REASON))
+
+    def read_cal_epoch(self) -> int:
+        value = self._access(f"{CALIBRATION_REGISTER}.epoch")
+        if value.natural16 is None or len(value.natural16.value) < 1:
+            raise RuntimeError("calibration epoch register is not natural16")
+        return int(value.natural16.value[0])
+
+    def read_calibration(self) -> CalibrationRecord:
+        # Epoch bracket (the DESCRIPTOR_EPOCH idiom): the record spans
+        # seven registers, so a solve landing mid-read would hand back a
+        # torn mix. Equal epochs before and after mean no change landed;
+        # a moved bracket retries. The field registers serve the staged
+        # record, which tracks the applied one only while clean — another
+        # host mid-edit makes them a mix the device is not applying, so a
+        # dirty stage retries too and refuses past the budget.
+        for _ in range(CAL_READ_ATTEMPTS):
+            before = self.read_cal_epoch()
+            dirty = self._access(f"{CALIBRATION_REGISTER}.dirty")
+            if dirty.natural8 is not None and len(dirty.natural8.value) >= 1 \
+                    and int(dirty.natural8.value[0]) != 0:
+                time.sleep(CAL_DIRTY_RETRY_S)
+                continue
+            vectors = [self._read_reals(f"{CALIBRATION_REGISTER}.{vec}", 12)
+                       for vec in CAL_VECTORS]
+            tags_value = self._access(f"{CALIBRATION_REGISTER}.driver_tags")
+            if tags_value.natural32 is None or len(tags_value.natural32.value) < 4:
+                raise RuntimeError("driver_tags register is not a natural32[4] value")
+            tags = [int(v) for v in tags_value.natural32.value[:4]]
+            orient_value = self._access(f"{CALIBRATION_REGISTER}.orientation")
+            if orient_value.natural8 is None or len(orient_value.natural8.value) < 1:
+                raise RuntimeError("orientation register is not a natural8 value")
+            encoder_zero = self._read_reals(
+                    f"{CALIBRATION_REGISTER}.encoder_zero", 1)[0]
+            # A stage that BEGAN mid-read moves no epoch; the second dirty
+            # read catches it. One that began after this read left our
+            # field values untouched — they are the applied record.
+            dirty = self._access(f"{CALIBRATION_REGISTER}.dirty")
+            if dirty.natural8 is not None and len(dirty.natural8.value) >= 1 \
+                    and int(dirty.natural8.value[0]) != 0:
+                time.sleep(CAL_DIRTY_RETRY_S)
+                continue
+            if self.read_cal_epoch() != before:
+                continue
+            return CalibrationRecord(
+                orientation=int(orient_value.natural8.value[0]),
+                m=tuple(tuple(v[:9]) for v in vectors),
+                b=tuple(tuple(v[9:12]) for v in vectors),
+                encoder_zero=encoder_zero,
+                driver_tags=tuple(tags[:3]),
+                encoder_tag=tags[3])
+        raise RuntimeError("calibration record kept changing or stayed "
+                           "mid-edit during read (concurrent writer?)")
+
+    def _commit_calibration(self) -> None:
+        """Apply the staged calibration record.
+
+        The six field writes land in a staging window, so nothing recomposes
+        the live affine until this. The commit register answers with the
+        status code rather than the written value — `Access` performs its read
+        after the write regardless of outcome, so one round trip reports
+        whether the record was accepted. Firmware without the register echoes
+        empty, which reads as success: there the field writes already applied.
+        """
+        import uavcan.primitive.array.Natural8_1_0 as Natural8
+        import uavcan.register.Value_1_0 as Value
+        echo = self._access(f"{CALIBRATION_REGISTER}.commit",
+                            Value(natural8=Natural8([1])))
+        code = int(echo.natural8.value[0]) if echo.natural8 is not None else 0
+        if code != 0:
+            raise DeviceRefused(code, err_reason(code, CALIB_ERR_REASON))
+
+    def _discard_calibration_stage(self) -> None:
+        """Best-effort stage reset before re-raising a staging failure.
+
+        A sequence that died mid-stage leaves a dirty partial on the
+        device, and the next single-field commit would apply it whole.
+        Writing 0 to the commit register drops the stage; swallowing any
+        secondary failure keeps the original exception the caller sees.
+        """
+        import uavcan.primitive.array.Natural8_1_0 as Natural8
+        import uavcan.register.Value_1_0 as Value
+        try:
+            self._access(f"{CALIBRATION_REGISTER}.commit",
+                         Value(natural8=Natural8([0])))
+        except Exception:
+            pass
+
+    def write_calibration(self, record: CalibrationRecord,
+                          persist: bool = True) -> None:
+        import uavcan.primitive.array.Natural32_1_0 as Natural32
+        import uavcan.primitive.array.Natural8_1_0 as Natural8
+        import uavcan.register.Value_1_0 as Value
+        try:
+            for vec_idx, vec in enumerate(CAL_VECTORS):
+                self._write_reals(f"{CALIBRATION_REGISTER}.{vec}",
+                                  list(record.m[vec_idx]) + list(record.b[vec_idx]))
+            self._write_reals(f"{CALIBRATION_REGISTER}.encoder_zero",
+                              [record.encoder_zero])
+            self._write_verified(
+                    f"{CALIBRATION_REGISTER}.orientation",
+                    Value(natural8=Natural8([record.orientation])),
+                    lambda v: list(v.natural8.value[:1]) if v.natural8 else None)
+            self._write_verified(
+                    f"{CALIBRATION_REGISTER}.driver_tags",
+                    Value(natural32=Natural32(
+                            list(record.driver_tags) + [record.encoder_tag])),
+                    lambda v: list(v.natural32.value[:4]) if v.natural32 else None)
+            self._commit_calibration()
+        except BaseException:
+            self._discard_calibration_stage()
+            raise
+        if persist:
+            self.save_calibration()
+
+    def set_orientation(self, rotation: int, persist: bool = True) -> None:
+        import uavcan.primitive.array.Natural8_1_0 as Natural8
+        import uavcan.register.Value_1_0 as Value
+        try:
+            self._write_verified(
+                    f"{CALIBRATION_REGISTER}.orientation",
+                    Value(natural8=Natural8([rotation])),
+                    lambda v: list(v.natural8.value[:1]) if v.natural8 else None)
+            self._commit_calibration()
+        except BaseException:
+            self._discard_calibration_stage()
+            raise
+        if persist:
+            self.save_calibration()
+
+    def cal_gyro(self) -> None:
+        if not self._execute(CAL_GYRO):
+            self._raise_cmd_error(CALIB_ERR_REASON)
+
+    def cal_mag_start(self) -> None:
+        if not self._execute(CAL_MAG_START):
+            self._raise_cmd_error(CALIB_ERR_REASON)
+
+    def cal_mag_stop(self) -> None:
+        if not self._execute(CAL_MAG_STOP):
+            self._raise_cmd_error(CALIB_ERR_REASON)
+
+    def cal_abort(self) -> None:
+        # ENOENT — nothing was running — is success for a release.
+        if not self._execute(CAL_ABORT):
+            try:
+                self._raise_cmd_error(CALIB_ERR_REASON)
+            except DeviceRefused as e:
+                if e.code != ERRNO_ENOENT:
+                    raise
+
+    def read_cal_progress(self):
+        value = self._access(f"{CALIBRATION_REGISTER}.progress")
+        if value.natural8 is None or len(value.natural8.value) < 3:
+            raise RuntimeError("calibration.progress is not a natural8[3] value")
+        return tuple(int(v) for v in value.natural8.value[:3])
+
+    def save_calibration(self) -> None:
+        if not self._execute(COMMAND_STORE_PERSISTENT_STATES):
+            self._raise_cmd_error(CALIB_ERR_REASON)
+
     # ── Commissioning (identity) ──────────────────────────
     def read_identity(self) -> dict:
         node = self._read_natural16("uavcan.node.id")
@@ -789,14 +1113,30 @@ class CyphalControlClient(NxsClient, SupportsFaultCounters, SupportsSlotPeek, Su
             self._write_natural16("uavcan.node.id", node_addr)
         for name, addr in (topics or {}).items():
             self._write_natural16(f"uavcan.pub.{name}.id", addr)
-        if not self._execute(COMMAND_STORE_PERSISTENT_STATES):
+        if not self._execute(COMMAND_STORE_PERSISTENT_STATES,
+                             timeout=STORE_CMD_TIMEOUT_S):
             self._raise_cmd_error(COMMISSION_ERR_REASON)
 
     def _arm_stream(self, every_nth: int):
+        """Throttle the device's output to the requested rate, remembering
+        what it was.
+
+        DEC_RATE is the device's *output gate*, not this link's egress knob:
+        the firmware checks it before the I2C sample window, the host link
+        and the CAN publish alike. Overwriting it without restoring left the
+        device muted for every other transport once the stream ended — an
+        `nxs stream` over CAN followed by one over I2C returned zero samples,
+        and a later Save persisted the zero.
+        """
+        self._prev_decimation = self.read_decimation()
         self.write_decimation(max(1, every_nth))
 
     def _disarm_stream(self):
-        self.write_decimation(0)
+        """Put the operator's decimation back, including a deliberate 0."""
+        if self._prev_decimation is None:
+            return
+        self.write_decimation(self._prev_decimation)
+        self._prev_decimation = None
 
     def _next_raw(self, timeout: float) -> Optional[Tuple[int, bytes, Optional[int]]]:
         try:

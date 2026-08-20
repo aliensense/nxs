@@ -227,6 +227,8 @@ def _cmd_switch(args, cfg, state, config_path) -> int:
         print(f"{mark} {report.name} ({report.link})")
         for action in report.actions:
             print(f"    {action}")
+        for note in report.notes:
+            print(f"    {note}")
         if not report.ok:
             print(f"    {report.error}")
             failed += 1
@@ -319,6 +321,8 @@ def _cmd_reset(args, cfg, state) -> int:
         print(f"{mark} {report.name} ({report.link})")
         for action in report.actions:
             print(f"    {action}")
+        for note in report.notes:
+            print(f"    {note}")
         if not report.ok:
             print(f"    {report.error}")
             failed += 1

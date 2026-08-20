@@ -18,14 +18,18 @@ except ImportError:  # absent off-Linux; test seams inject the bus
     smbus2 = None
 
 from nxs.client import (
-    CAN_TERM_UNSET, COMMISSION_ERR_REASON, COMMISSION_TOPICS, DFU_ERR_REASON,
-    DeviceRefused, NxsClient, SupportsBitTiming, SupportsCanTermination,
-    SupportsCommissioning, SupportsIdentify, SupportsRecovery,
-    SupportsSlotPeek, SupportsTimeSync, err_reason,
+    CALIB_ERR_REASON, CAL_READ_ATTEMPTS, CAN_TERM_UNSET, COMMISSION_ERR_REASON, COMMISSION_TOPICS, DFU_ERR_REASON,
+    DFU_ERASE_TIMEOUT_S, ERRNO_ENOENT, LOAD_ERR_REASON, XFER_ERR_REASON,
+    STORE_CMD_TIMEOUT_S as _STORE_CMD_TIMEOUT_S,
+    CalibrationRecord, DeviceRefused, NxsClient, SupportsCalibration, SupportsBitTiming, SupportsCanTermination,
+    SupportsCommissioning, SupportsFaultCounters, SupportsIdentify,
+    SupportsRecovery, SupportsSlotPeek, SupportsTimeSync, XFER_EBUSY,
+    err_reason,
     validate_can_bitrate, validate_can_term, validate_commission)
 from nxs.image import FIELD_TYPE_NAMES
 from nxs._generated_constants import (
-    CyphalDefaults, FieldSemantics, NxsRegisters, RunnerStates, NxsDevices)
+    Calibration as CalConstants, CyphalDefaults, FieldSemantics, NxsRegisters,
+    RunnerStates, NxsDevices)
 
 # Compiled subject-ID default per commission topic (constants SSOT). Resolves an
 # UNSET (0xFFFF) record field to the value the device actually runs on, so I²C
@@ -122,7 +126,9 @@ REG_SEL_OUTPUT_SEMANTIC = _Reg.SEL_OUTPUT_SEMANTIC
 REG_SEL_OUTPUT_COUNT    = _Reg.SEL_OUTPUT_COUNT  # 2 bytes (u16 LE): string width, 0 for numeric
 REG_SEL_OUTPUT_AT       = _Reg.SEL_OUTPUT_AT  # byte position within the sample
 
-REG_DRIVER_SELECT = _Reg.DRIVER_SELECT  # any write -> SEL window shows the driver name
+REG_DRIVER_SELECT = _Reg.DRIVER_SELECT  # DRIVER_VIEW_DIAG -> diag view; else driver name
+DRIVER_VIEW_DIAG = NxsRegisters.DRIVER_VIEW_DIAG
+_Diag = NxsRegisters.DiagCounter
 REG_SEL_DRIVER_NUM_PARAMS = _Reg.SEL_DRIVER_NUM_PARAMS
 REG_SEL_DRIVER_NUM_OUTPUTS = _Reg.SEL_DRIVER_NUM_OUTPUTS
 REG_SEL_DRIVER_SLOT = _Reg.SEL_DRIVER_SLOT
@@ -163,10 +169,8 @@ RUNNER_STATES = dict(RunnerStates.RunnerState._NAMES)
 WHO_AM_I_VALUE = NxsRegisters.WHO_AM_I_VALUE
 UPLOAD_CHUNK_SIZE = NxsRegisters.PROGRAM_CHUNK_SIZE
 
-# Highest register-map contract version this host tool understands. A host-side
-# capability, deliberately NOT sourced from the firmware's PROTO_VERSION_VALUE:
-# bump it only when this tool actually learns to speak a new contract version.
-SUPPORTED_PROTO_VERSION = 1
+# The contract capability lives in nxs.client (SUPPORTED_PROTO_VERSION,
+# contract_mismatch); re-exported here for the existing import sites.
 
 # DFU + store command registers. XFER_TYPE selects the PROGRAM_DATA
 # consumer; XFER_PHASE / XFER_ACK pace a DFU push; CMD_ERROR holds the last
@@ -185,16 +189,38 @@ XFER_TYPE_DFU_IMAGE   = NxsRegisters.XFER_TYPE_DFU_IMAGE
 XFER_TYPE_CONFIG      = NxsRegisters.XFER_TYPE_CONFIG
 XFER_TYPE_TIME_SYNC   = NxsRegisters.XFER_TYPE_TIME_SYNC
 TIME_SYNC_RECORD_SIZE = NxsRegisters.TIME_SYNC_RECORD_SIZE
+XFER_TYPE_CALIB       = NxsRegisters.XFER_TYPE_CALIB
+XFER_TYPE_BUILD_INFO  = NxsRegisters.XFER_TYPE_BUILD_INFO
+BUILD_INFO_SIZE       = NxsRegisters.BUILD_INFO_SIZE
 
 CMD_DFU_BEGIN  = _Cmd.DFU_BEGIN
 CMD_DFU_FINISH = _Cmd.DFU_FINISH
+CMD_XFER_ABORT = _Cmd.XFER_ABORT
 CMD_REBOOT     = _Cmd.REBOOT
 CMD_ENTER_RECOVERY = _Cmd.ENTER_RECOVERY
 CMD_STORE_PERSIST = _Cmd.STORE_PERSIST
+CMD_CALIB_APPLY   = _Cmd.CALIB_APPLY
+CMD_CALIB_PERSIST = _Cmd.CALIB_PERSIST
+CMD_CAL_GYRO      = _Cmd.CAL_GYRO
+CMD_CAL_MAG_START = _Cmd.CAL_MAG_START
+CMD_CAL_MAG_STOP  = _Cmd.CAL_MAG_STOP
 
 CONFIG_RECORD_SIZE = NxsRegisters.CONFIG_RECORD_SIZE
 # The u32 CAN bitrate pair sits after the u16 node address + subject addresses.
 _BITRATE_OFFSET = 2 + 2 * len(COMMISSION_TOPICS)
+
+DFU_XFER_REASONS = {**DFU_ERR_REASON, **XFER_ERR_REASON}
+
+_PHASE_NAMES = _DfuPhase._NAMES
+_MODE_NAMES = {0: "VM_BYTECODE", 1: "DFU_IMAGE", 2: "CONFIG", 3: "TIME_SYNC",
+               4: "CALIB"}
+# Calibration record window: staged in PROGRAM_CHUNK_SIZE chunks under
+# XFER_TYPE = CALIB, read back one STORE_SELECT-selected page at a time
+# (re-read the whole record and retry on a mismatch to bracket a
+# concurrent change). On-device procedure progress reuses the DFU
+# transfer registers: XFER_PHASE = CalState, XFER_ACK = detail, and the
+# completion verdict rides CMD_ERROR.
+CALIB_PAGE_SIZE = NxsRegisters.PROGRAM_CHUNK_SIZE
 
 DFU_PHASE_IDLE      = _DfuPhase.IDLE
 DFU_PHASE_ERASING   = _DfuPhase.ERASING
@@ -204,10 +230,15 @@ DFU_PHASE_FINISHING = _DfuPhase.FINISHING
 DFU_PHASE_ERROR     = _DfuPhase.ERROR
 
 
+class _BuildInfoBusy(Exception):
+    """Internal: the build-info window is session-held; fall back."""
+
+
 class NxsI2cTransport(NxsClient, SupportsCommissioning, SupportsIdentify,
                       SupportsSlotPeek, SupportsBitTiming,
                       SupportsCanTermination, SupportsTimeSync,
-                      SupportsRecovery):
+                      SupportsRecovery, SupportsFaultCounters,
+                      SupportsCalibration):
     """I2C register-map transport for a single NXS device."""
 
     def __init__(self, bus=None, address: int = NxsDevices.RBDevice.NXS,
@@ -225,6 +256,7 @@ class NxsI2cTransport(NxsClient, SupportsCommissioning, SupportsIdentify,
         """
         super().__init__()
         self._addr = address
+        self._last_probe_error: Optional[OSError] = None
         self._record_data_len = 0  # cached SAMPLE_SIZE; set at stream arm
         self._last_count = 0
         self._poll_hz = None
@@ -255,11 +287,18 @@ class NxsI2cTransport(NxsClient, SupportsCommissioning, SupportsIdentify,
 
     def probe(self) -> bool:
         """Check if the module is present at the configured address."""
+        self._last_probe_error = None
         try:
             who = self._bus.read_byte_data(self._addr, REG_WHO_AM_I)
             return who == WHO_AM_I_VALUE
-        except OSError:
+        except OSError as e:
+            # Not the same as absent hardware: EACCES is group membership,
+            # ENXIO a wrong address, ENOENT a bus that does not exist.
+            self._last_probe_error = e
             return False
+
+    def probe_failure_detail(self) -> Optional[str]:
+        return str(self._last_probe_error) if self._last_probe_error else None
 
     def interface_version(self) -> int:
         """Register-map contract version (0 on firmware that predates it)."""
@@ -271,10 +310,45 @@ class NxsI2cTransport(NxsClient, SupportsCommissioning, SupportsIdentify,
             self._addr, REG_SERIAL, SERIAL_LEN))
 
     def read_fw_version(self) -> Optional[str]:
-        """Firmware version from the FW_VERSION registers, as
-        "MAJOR.MINOR" — the same value Cyphal serves via GetInfo. None
-        when the window is unseeded (major reads 0: firmware that
-        predates the registers)."""
+        """The firmware build identity, verbatim `git describe`
+        ("v1.0.0-4-g87fdf5b"), from the BUILD_INFO transfer. Firmware
+        predating the transfer falls back to "MAJOR.MINOR" from the
+        FW_VERSION registers; None when both are dark. XFER_TYPE and
+        STORE_SELECT are restored around the read (never forced to 0:
+        an XFER_TYPE = 0 write clears CMD_ERROR, and a status poll
+        must not eat a pending command verdict)."""
+        prev_xfer = self._bus.read_byte_data(self._addr, REG_XFER_TYPE)
+        prev_page = self._bus.read_byte_data(self._addr, REG_STORE_SELECT)
+        raw = b""
+        try:
+            # The mode write commits deferred: page only after the echo, or
+            # the first read consumes the previous mode's window and this
+            # silently degrades to the legacy pair. A refusal (live
+            # transfer session) skips to that fallback — the window is
+            # owned, and reading it would answer with another transfer's
+            # bytes.
+            try:
+                self._claim_xfer_mode(XFER_TYPE_BUILD_INFO)
+            except DeviceRefused:
+                raise _BuildInfoBusy()
+            for page in range(BUILD_INFO_SIZE // NxsRegisters.PROGRAM_CHUNK_SIZE):
+                self._bus.write_byte_data(self._addr, REG_STORE_SELECT, page)
+                raw += bytes(self._bus.read_i2c_block_data(
+                        self._addr, REG_PROGRAM_DATA,
+                        NxsRegisters.PROGRAM_CHUNK_SIZE))
+                if 0 in raw:
+                    break
+        except _BuildInfoBusy:
+            pass
+        finally:
+            self._bus.write_byte_data(self._addr, REG_STORE_SELECT, prev_page)
+            if prev_xfer != XFER_TYPE_BUILD_INFO:
+                self._bus.write_byte_data(self._addr, REG_XFER_TYPE, prev_xfer)
+        text = raw.split(b"\x00", 1)[0]
+        if text and all(0x20 < b < 0x7F for b in text):
+            return text.decode("ascii")
+        # Legacy firmware: the window served the identity-config mirror
+        # (or zeros); the numeric pair is the only version the wire proves.
         major = self._bus.read_byte_data(self._addr, REG_FW_VERSION_MAJOR)
         if major == 0:
             return None
@@ -331,6 +405,22 @@ class NxsI2cTransport(NxsClient, SupportsCommissioning, SupportsIdentify,
         self._await_selector(REG_DECIMATION_SELECT, bucket)
 
     # ── Time sync (star push) ─────────────────────────────
+    def _claim_xfer_mode(self, mode: int):
+        """Write `XFER_TYPE` and detect the silent refusal by readback:
+        a live transfer session holds the mux and the mode does not move.
+        The write commits deferred (the device queues control writes for
+        its comm thread), so the readback polls a short echo budget — a
+        lagging drain must not read as a refusal. Raises
+        DeviceRefused(EBUSY) so callers never stream into another
+        transfer's sink."""
+        self._bus.write_byte_data(self._addr, REG_XFER_TYPE, mode)
+        for _ in range(SEL_POLL_ATTEMPTS):
+            if self._bus.read_byte_data(self._addr, REG_XFER_TYPE) == mode:
+                return
+            time.sleep(SEL_POLL_INTERVAL_S)
+        raise DeviceRefused(XFER_EBUSY,
+                            err_reason(XFER_EBUSY, XFER_ERR_REASON))
+
     def push_time_sync(self, offset_us: int, bound_us: int,
                        rate_ppb: int = 0,
                        valid_for_us: int = 0) -> None:
@@ -339,8 +429,9 @@ class NxsI2cTransport(NxsClient, SupportsCommissioning, SupportsIdentify,
         push."""
         record = struct.pack('<qIiI', offset_us, bound_us, rate_ppb,
                              valid_for_us)
-        self._bus.write_byte_data(self._addr, REG_XFER_TYPE,
-                                  XFER_TYPE_TIME_SYNC)
+        # A held mux would land the record in someone else's sink; the
+        # claim raises and the pusher skips this interval.
+        self._claim_xfer_mode(XFER_TYPE_TIME_SYNC)
         self._bus.write_i2c_block_data(self._addr, REG_PROGRAM_DATA,
                                        list(record))
 
@@ -351,20 +442,40 @@ class NxsI2cTransport(NxsClient, SupportsCommissioning, SupportsIdentify,
         lands, so poll until the record parses in-contract (valid 0/1,
         source <= 3) — a not-yet-selected window serves other-mode
         bytes."""
-        self._bus.write_byte_data(self._addr, REG_XFER_TYPE,
-                                  XFER_TYPE_TIME_SYNC)
-        for _ in range(SEL_POLL_ATTEMPTS):
-            raw = bytes(self._bus.read_i2c_block_data(
-                    self._addr, REG_PROGRAM_DATA, TIME_SYNC_RECORD_SIZE))
-            offset_us, bound_us, rate_ppb, valid_for_us, source, valid = \
-                    struct.unpack('<qIiIBB', raw)
-            if valid in (0, 1) and source <= 3:
-                return (offset_us, bound_us, rate_ppb, valid_for_us,
-                        source, bool(valid))
-            time.sleep(SEL_POLL_INTERVAL_S)
-        log.warning("time-sync mirror unreadable after %d polls",
-                    SEL_POLL_ATTEMPTS)
-        return 0, 0, 0, 0, 0, False
+        # Claim the mode with the echo-polled budget, not a single readback:
+        # the write commits deferred, so a lagging drain must not read as a
+        # refusal (that false negative also skipped the finally and parked
+        # the mux at TIME_SYNC).
+        try:
+            self._claim_xfer_mode(XFER_TYPE_TIME_SYNC)
+        except DeviceRefused:
+            # A transfer session genuinely holds the mux (an upload or
+            # firmware push in flight); the mirror is unreadable until it
+            # ends. Expected texture of a status call during a push.
+            log.info("time-sync mirror unavailable: transfer session live")
+            return 0, 0, 0, 0, 0, False
+        try:
+            for _ in range(SEL_POLL_ATTEMPTS):
+                raw = bytes(self._bus.read_i2c_block_data(
+                        self._addr, REG_PROGRAM_DATA, TIME_SYNC_RECORD_SIZE))
+                offset_us, bound_us, rate_ppb, valid_for_us, source, valid = \
+                        struct.unpack('<qIiIBB', raw)
+                if valid in (0, 1) and source <= 3:
+                    return (offset_us, bound_us, rate_ppb, valid_for_us,
+                            source, bool(valid))
+                time.sleep(SEL_POLL_INTERVAL_S)
+            log.warning("time-sync mirror unreadable after %d polls",
+                        SEL_POLL_ATTEMPTS)
+            return 0, 0, 0, 0, 0, False
+        finally:
+            # Leave the mux on the bytecode consumer, like read_identity —
+            # safe now that a mode write never clears CMD_ERROR (a pending
+            # store result survives this restore).
+            try:
+                self._bus.write_byte_data(self._addr, REG_XFER_TYPE,
+                                          XFER_TYPE_VM_BYTECODE)
+            except OSError:
+                pass
 
     def read_device_time_us(self) -> Optional[int]:
         """The device µs clock via the sample-window latch: the target
@@ -378,13 +489,13 @@ class NxsI2cTransport(NxsClient, SupportsCommissioning, SupportsIdentify,
     # ── Commissioning (identity) ──────────────────────────
     def _read_config_record(self) -> bytes:
         """Read the identity record from the config window."""
-        self._bus.write_byte_data(self._addr, REG_XFER_TYPE, XFER_TYPE_CONFIG)
+        self._claim_xfer_mode(XFER_TYPE_CONFIG)
         return bytes(self._bus.read_i2c_block_data(self._addr, REG_PROGRAM_DATA,
                                                    CONFIG_RECORD_SIZE))
 
     def _write_config_record(self, record: bytes) -> None:
         """Stage a full identity record (re-enters config mode to reset the offset)."""
-        self._bus.write_byte_data(self._addr, REG_XFER_TYPE, XFER_TYPE_CONFIG)
+        self._claim_xfer_mode(XFER_TYPE_CONFIG)
         self._bus.write_i2c_block_data(self._addr, REG_PROGRAM_DATA,
                                        list(record[:CONFIG_RECORD_SIZE]))
 
@@ -468,6 +579,133 @@ class NxsI2cTransport(NxsClient, SupportsCommissioning, SupportsIdentify,
         """Commit the pair through the config record (the record is the only
         I²C commissioning surface, so the write persists immediately)."""
         self.commission(can_bitrate=(nominal, data))
+
+    # ── Calibration ───────────────────────────────────────
+    def read_cal_epoch(self) -> int:
+        """Byte RECORD_SIZE of the CALIB read-back — the bank's change
+        counter. STORE_SELECT and XFER_TYPE are restored so a probe on a
+        streaming cadence leaves both where their owner put them; a mode
+        of 0 is never written back (that write clears CMD_ERROR and
+        would eat a pending command verdict)."""
+        size = CalConstants.RECORD_SIZE
+        prev_page = self._bus.read_byte_data(self._addr, REG_STORE_SELECT)
+        prev_xfer = self._bus.read_byte_data(self._addr, REG_XFER_TYPE)
+        self._claim_xfer_mode(XFER_TYPE_CALIB)
+        try:
+            self._bus.write_byte_data(self._addr, REG_STORE_SELECT,
+                                      size // CALIB_PAGE_SIZE)
+            page = self._bus.read_i2c_block_data(
+                    self._addr, REG_PROGRAM_DATA,
+                    size % CALIB_PAGE_SIZE + 1)
+            return page[size % CALIB_PAGE_SIZE]
+        finally:
+            self._bus.write_byte_data(self._addr, REG_STORE_SELECT, prev_page)
+            if prev_xfer not in (0, XFER_TYPE_CALIB):
+                self._bus.write_byte_data(self._addr, REG_XFER_TYPE, prev_xfer)
+
+    def read_calibration(self) -> CalibrationRecord:
+        size = CalConstants.RECORD_SIZE
+        # Byte RECORD_SIZE of the read-back is the bank's change counter;
+        # one extra byte rides the final page for free.
+        pages = (size + 1 + CALIB_PAGE_SIZE - 1) // CALIB_PAGE_SIZE
+        epoch_page = size // CALIB_PAGE_SIZE
+        epoch_off = size % CALIB_PAGE_SIZE
+
+        def read_epoch() -> int:
+            self._bus.write_byte_data(self._addr, REG_STORE_SELECT, epoch_page)
+            page = self._bus.read_i2c_block_data(self._addr, REG_PROGRAM_DATA,
+                                                 epoch_off + 1)
+            return page[epoch_off]
+
+        def read_record() -> bytes:
+            buf = bytearray()
+            for page in range(pages):
+                self._bus.write_byte_data(self._addr, REG_STORE_SELECT, page)
+                n = min(CALIB_PAGE_SIZE, size + 1 - page * CALIB_PAGE_SIZE)
+                buf += bytes(self._bus.read_i2c_block_data(
+                        self._addr, REG_PROGRAM_DATA, n))
+            return bytes(buf)
+
+        try:
+            self._claim_xfer_mode(XFER_TYPE_CALIB)
+            # Epoch bracket (the DESCRIPTOR_EPOCH idiom): epoch, record,
+            # epoch. Equal brackets mean no repaint landed mid-read; a
+            # moved bracket retries.
+            for _ in range(CAL_READ_ATTEMPTS):
+                before = read_epoch()
+                buf = read_record()
+                if buf[size] == before and read_epoch() == before:
+                    return CalibrationRecord.unpack(buf[:size])
+            # A host-side coherence failure (a concurrent writer kept moving
+            # the record), not a device verdict — never DeviceRefused, whose
+            # errnos carry calibration semantics (11 would read as EAGAIN,
+            # "insufficient coverage").
+            raise RuntimeError("calibration record kept changing during read "
+                               "(concurrent writer?)")
+        finally:
+            self._bus.write_byte_data(self._addr, REG_XFER_TYPE, XFER_TYPE_VM_BYTECODE)
+
+    def write_calibration(self, record: CalibrationRecord,
+                          persist: bool = True) -> None:
+        data = record.pack()
+        try:
+            self._claim_xfer_mode(XFER_TYPE_CALIB)
+            for off in range(0, len(data), CALIB_PAGE_SIZE):
+                self._bus.write_i2c_block_data(
+                        self._addr, REG_PROGRAM_DATA,
+                        list(data[off:off + CALIB_PAGE_SIZE]))
+            self._bus.write_byte_data(self._addr, REG_CMD, CMD_CALIB_APPLY)
+            self._await_store_result(reasons=CALIB_ERR_REASON)
+            if persist:
+                self._bus.write_byte_data(self._addr, REG_CMD, CMD_CALIB_PERSIST)
+                self._await_store_result(reasons=CALIB_ERR_REASON)
+        finally:
+            self._bus.write_byte_data(self._addr, REG_XFER_TYPE, XFER_TYPE_VM_BYTECODE)
+        log.info("Applied calibration record%s", " (persisted)" if persist else "")
+
+    def set_orientation(self, rotation: int, persist: bool = True) -> None:
+        record = self.read_calibration()
+        record.orientation = rotation
+        self.write_calibration(record, persist)
+
+    def cal_gyro(self) -> None:
+        self._bus.write_byte_data(self._addr, REG_CMD, CMD_CAL_GYRO)
+        self._await_store_result(reasons=CALIB_ERR_REASON)
+
+    def cal_mag_start(self) -> None:
+        self._bus.write_byte_data(self._addr, REG_CMD, CMD_CAL_MAG_START)
+        self._await_store_result(reasons=CALIB_ERR_REASON)
+
+    def cal_mag_stop(self) -> None:
+        self._bus.write_byte_data(self._addr, REG_CMD, CMD_CAL_MAG_STOP)
+        self._await_store_result(reasons=CALIB_ERR_REASON)
+
+    def cal_abort(self) -> None:
+        # XFER_ABORT is the register-map release for any open session and
+        # any running procedure. Await the resolution: a fire-and-forget
+        # write would report "nothing applied" to an operator whose abort
+        # never landed. ENOENT (nothing was open) is success here — the
+        # caller wanted nothing running, and nothing is.
+        self._bus.write_byte_data(self._addr, REG_CMD, CMD_XFER_ABORT)
+        try:
+            self._await_store_result(reasons=CALIB_ERR_REASON)
+        except DeviceRefused as e:
+            if e.code != ERRNO_ENOENT:
+                raise
+
+    def read_cal_progress(self):
+        # Progress rides the reused transfer registers: XFER_PHASE = state,
+        # XFER_ACK = detail, CMD_ERROR = the completion verdict (0 while the
+        # procedure runs, then the errno on the idle edge).
+        return (self._bus.read_byte_data(self._addr, REG_XFER_PHASE),
+                self._bus.read_byte_data(self._addr, REG_XFER_ACK),
+                self._bus.read_byte_data(self._addr, REG_CMD_ERROR))
+
+    def save_calibration(self) -> None:
+        # CALIB_PERSIST, not STORE_PERSIST: this save carries no identity
+        # record, and the device must not have to infer which was meant.
+        self._bus.write_byte_data(self._addr, REG_CMD, CMD_CALIB_PERSIST)
+        self._await_store_result(reasons=CALIB_ERR_REASON)
 
     def read_vm_state(self) -> int:
         """Read the VM state byte (0 idle, 1 running, 2 error)."""
@@ -558,16 +796,80 @@ class NxsI2cTransport(NxsClient, SupportsCommissioning, SupportsIdentify,
     def upload_image(self, image_data: bytes, link: int = 0):
         """Upload a full NXS driver image (bytecode + capabilities).
 
+        Claims the bytecode consumer explicitly (an inherited mode is how
+        uploads used to stream into the time-sync sink), then reads the
+        announce's verdict — the device arms `CMD_ERR_PENDING` and resolves
+        0 / EBUSY / EPROTO / EFBIG — before streaming a single chunk.
+
         Args:
             image_data: Serialized NXS image from nxs.image.serialize().
         """
         size = len(image_data)
+        self._claim_xfer_mode(XFER_TYPE_VM_BYTECODE)
         self._bus.write_word_data(self._addr, REG_PROGRAM_SIZE, size)
-        for offset in range(0, size, UPLOAD_CHUNK_SIZE):
-            chunk = list(image_data[offset:offset + UPLOAD_CHUNK_SIZE])
-            self._bus.write_i2c_block_data(self._addr, REG_PROGRAM_DATA, chunk)
-        self._bus.write_byte_data(self._addr, REG_CMD, CMD_LOAD)
+        self._await_store_result(reasons=XFER_ERR_REASON)
+        # The announce opened a session; any exit before LOAD must release
+        # it or the next attempt eats an unexplained EBUSY until the stale
+        # window runs out. `finally` covers the operator's Ctrl-C too —
+        # KeyboardInterrupt is not an Exception, and a deliberate cancel is
+        # precisely what XFER_ABORT is for.
+        staged = False
+        try:
+            for offset in range(0, size, UPLOAD_CHUNK_SIZE):
+                chunk = list(image_data[offset:offset + UPLOAD_CHUNK_SIZE])
+                self._bus.write_i2c_block_data(self._addr, REG_PROGRAM_DATA,
+                                               chunk)
+            self._bus.write_byte_data(self._addr, REG_CMD, CMD_LOAD)
+            staged = True
+        finally:
+            if not staged:
+                self._abort_transfer()
+        # LOAD is async like the store commands: the device armed
+        # CMD_ERR_PENDING in the ISR and resolves it with the parse's
+        # verdict. Only a confirmed 0 earns the "Uploaded" log line.
+        self._await_store_result(reasons=LOAD_ERR_REASON)
         log.info("Uploaded NXS image (%d bytes) to link %d", size, link)
+
+
+    # ── Fault counters (SEL diag view) ─────────────────────
+
+    def _read_diag_counter(self, index: int) -> int:
+        """Page one fault counter out of the SEL diag view: select the
+        view, pick the index, read the u32 window (the u16 counter
+        zero-extended). Selector writes commit deferred, so each is
+        awaited via its echo before the read. Leaves the SEL window in
+        the diag view — every other reader re-selects its own view
+        first, as this one does."""
+        self._bus.write_byte_data(self._addr, REG_DRIVER_SELECT,
+                                  DRIVER_VIEW_DIAG)
+        got_view = self._await_selector(REG_DRIVER_SELECT, DRIVER_VIEW_DIAG)
+        self._bus.write_byte_data(self._addr, REG_SEL_VALUE_INDEX, index)
+        got_index = self._await_selector(REG_SEL_VALUE_INDEX, index)
+        if not (got_view and got_index):
+            # The selector never committed: SEL_VALUE still holds another
+            # view's bytes. Fail loudly rather than return them as a counter
+            # (nxs status catches this and omits the line).
+            raise TimeoutError(
+                "diag view did not commit — counter unreadable "
+                "(device busy or a session holds the comm thread)")
+        raw = self._bus.read_i2c_block_data(self._addr, REG_SEL_VALUE, 4)
+        return int.from_bytes(bytes(raw), "little")
+
+    def read_io_err_count(self) -> int:
+        return self._read_diag_counter(_Diag.VM_IO_ERRORS)
+
+    def read_probe_failed_count(self) -> int:
+        return self._read_diag_counter(_Diag.PROBE_FAILURES)
+
+    def read_drdy_coalesced_count(self) -> int:
+        return self._read_diag_counter(_Diag.DRDY_COALESCED)
+
+    def read_ingress_reject_count(self) -> int:
+        return self._read_diag_counter(_Diag.INGRESS_REJECTS)
+
+    def read_cmd_queue_overflow_count(self) -> int:
+        """I2C-only: host writes dropped at a full device command queue."""
+        return self._read_diag_counter(_Diag.I2C_CMD_QUEUE_OVERFLOWS)
 
     # ── Capabilities readback ──────────────────────────────
 
@@ -616,18 +918,20 @@ class NxsI2cTransport(NxsClient, SupportsCommissioning, SupportsIdentify,
         """Read the number of configurable parameters."""
         return self._bus.read_byte_data(self._addr, REG_NUM_PARAMS)
 
-    def _await_selector(self, reg: int, index: int):
+    def _await_selector(self, reg: int, index: int) -> bool:
         """Block until a deferred selector commit lands — echo == index.
 
-        Best-effort: returns after the budget so a wedged comm thread
-        degrades to a (possibly stale) read rather than hanging. See
-        SEL_POLL_* and SELECTOR_INACTIVE for the handshake.
+        Best-effort: returns True on commit, False after the budget so a
+        wedged comm thread degrades rather than hanging. Callers that would
+        otherwise serve garbage from the previous view must check the
+        result. See SEL_POLL_* and SELECTOR_INACTIVE for the handshake.
         """
         for _ in range(SEL_POLL_ATTEMPTS):
             if self._bus.read_byte_data(self._addr, reg) == index:
-                return
+                return True
             time.sleep(SEL_POLL_INTERVAL_S)
         log.debug("selector 0x%02X commit not observed (wrote %d)", reg, index)
+        return False
 
     def read_param(self, index: int) -> dict:
         """Read a parameter descriptor by index.
@@ -994,15 +1298,18 @@ class NxsI2cTransport(NxsClient, SupportsCommissioning, SupportsIdentify,
 
     # ── Firmware DFU push ─────────────────────────────────
 
-    # `begin` blocks on the bulk slot erase (~1.5 s on STM32G491);
-    # each chunk lands within a queue-drain tick once the comm thread
-    # picks it up. The erase (and each page program) stalls flash
-    # code-fetch, freezing the MCU — the slave NACKs for the duration,
-    # so every wait loop tolerates OSError and keeps polling.
-    DFU_BEGIN_TIMEOUT_S = 5.0
-    DFU_ACK_TIMEOUT_S = 1.0
+    # Each chunk lands within a queue-drain tick once the comm thread picks
+    # it up. The begin-erase (and each page program) stalls flash code-fetch,
+    # freezing the MCU — the slave NACKs for the duration, so every wait loop
+    # tolerates OSError and keeps polling.
+    DFU_BEGIN_TIMEOUT_S = DFU_ERASE_TIMEOUT_S
+    DFU_FINISH_POLL_S = 1.0
+    DFU_FINISH_RETRIES = 3
+    # Shared contract: the device's transfer-session stale window is twice
+    # this ack timeout.
+    DFU_ACK_TIMEOUT_S = NxsRegisters.DFU_ACK_TIMEOUT_MS / 1000.0
     DFU_WRITE_RETRIES = 4
-    STORE_CMD_TIMEOUT_S = 2.0
+    STORE_CMD_TIMEOUT_S = _STORE_CMD_TIMEOUT_S
 
     def push_image(self, bin_path: str, chunk_size: int = UPLOAD_CHUNK_SIZE,
                    progress_cb=None) -> int:
@@ -1028,11 +1335,20 @@ class NxsI2cTransport(NxsClient, SupportsCommissioning, SupportsIdentify,
                 f"chunk_size {chunk_size} exceeds the "
                 f"{UPLOAD_CHUNK_SIZE}-byte PROGRAM_DATA window")
 
-        self._bus.write_byte_data(self._addr, REG_XFER_TYPE,
-                                  XFER_TYPE_DFU_IMAGE)
+        self._claim_xfer_mode(XFER_TYPE_DFU_IMAGE)
+        # BEGIN and its verdict sit OUTSIDE the abort-unwind: a refusal here
+        # (EBUSY: another host's live push) is not our session, and aborting
+        # would destroy the holder's progress with the very command the
+        # device's EBUSY guard exists to prevent. Only a failure after our
+        # session provably opened (READY observed) may release it.
+        self._bus.write_byte_data(self._addr, REG_CMD, CMD_DFU_BEGIN)
+        self._dfu_wait_ready()
+        # Say goodbye properly on any exit: XFER_ABORT closes OUR session
+        # and hands the mux back. `finally` covers the operator's Ctrl-C
+        # during a long push — KeyboardInterrupt is not an Exception. A host
+        # that dies before this lands is covered by the stale window.
+        streamed = False
         try:
-            self._bus.write_byte_data(self._addr, REG_CMD, CMD_DFU_BEGIN)
-            self._dfu_wait_ready()
             offset = 0
             chunk_idx = 0
             while offset < total:
@@ -1042,45 +1358,122 @@ class NxsI2cTransport(NxsClient, SupportsCommissioning, SupportsIdentify,
                 chunk_idx += 1
                 if progress_cb is not None:
                     progress_cb(offset, total)
-        except Exception:
-            # Hand PROGRAM_DATA back to the VM-bytecode consumer so a
-            # later NXS upload isn't routed into the dead DFU session.
-            try:
-                self._bus.write_byte_data(self._addr, REG_XFER_TYPE,
-                                          XFER_TYPE_VM_BYTECODE)
-            except OSError:
-                pass
-            raise
+            streamed = True
+        finally:
+            if not streamed:
+                self._abort_transfer()
 
-        # The finish command arms the swap and reboots the board — the
-        # tail of this transaction may NACK as the reset lands.
-        try:
-            self._bus.write_byte_data(self._addr, REG_CMD, CMD_DFU_FINISH)
-        except OSError:
-            pass
-        log.info("Pushed %d bytes; board resetting into the new image",
-                 total)
+        self._dfu_finish(total)
         return total
 
+    def _dfu_finish(self, total: int):
+        """Close the DFU session and confirm the board actually rebooted.
+
+        Success requires positive evidence — the device latches FINISHING
+        before its reboot delay, and the reboot then kills the bus. A
+        finish silently dropped at a full command queue leaves the bus
+        alive with the phase unchanged; that is retried, not reported as
+        success (the old code's timeout-into-success bug). A latched ERROR
+        phase is a failed finish (old firmware still runs): release the
+        session and raise its reason.
+        """
+        for _ in range(self.DFU_FINISH_RETRIES):
+            try:
+                self._bus.write_byte_data(self._addr, REG_CMD, CMD_DFU_FINISH)
+            except OSError:
+                # The finish write itself NACKed: nothing was delivered
+                # (a reboot only follows a processed finish), so resend.
+                time.sleep(0.05)
+                continue
+            deadline = time.monotonic() + self.DFU_FINISH_POLL_S
+            while time.monotonic() < deadline:
+                try:
+                    phase = self._bus.read_byte_data(self._addr, REG_XFER_PHASE)
+                except OSError:
+                    # Bus dead after a delivered finish: the reboot signature.
+                    log.info("Pushed %d bytes; board resetting into the "
+                             "new image", total)
+                    return
+                if phase == DFU_PHASE_ERROR:
+                    err = self._bus.read_byte_data(self._addr, REG_CMD_ERROR)
+                    self._abort_transfer()
+                    raise DeviceRefused(err, "dfu finish failed (device "
+                                        "sampling halted; session released): "
+                                        + err_reason(err, DFU_XFER_REASONS))
+                if phase == DFU_PHASE_FINISHING:
+                    log.info("Pushed %d bytes; board resetting into the "
+                             "new image", total)
+                    return
+                time.sleep(0.05)
+            # The window elapsed with the bus alive and no terminal phase:
+            # the finish was dropped before dispatch — resend.
+        self._abort_transfer()
+        raise RuntimeError(
+            "dfu finish: no reboot after retries — the finish never "
+            f"applied and the old image still runs ({self._xfer_state()})")
+
     def _dfu_wait_ready(self, timeout_s: float = None):
-        """Poll XFER_PHASE until the begin-time erase finishes (READY)."""
+        """Wait out DFU_BEGIN by polling its own CMD_ERROR edge, then READY.
+
+        The begin arms `CMD_ERR_PENDING` and resolves it with the verdict —
+        0, or a refusal (EBUSY: someone else's session; EPROTO: wrong mode)
+        — and that edge is the only thing a refused host may trust:
+        `XFER_PHASE` shows the *holder's* progress and would lure it into
+        streaming over a live push. The MCU NACKs through the bulk erase,
+        so OSError is the expected texture of this wait.
+        """
         if timeout_s is None:
             timeout_s = self.DFU_BEGIN_TIMEOUT_S
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             try:
-                phase = self._bus.read_byte_data(self._addr, REG_XFER_PHASE)
+                err = self._bus.read_byte_data(self._addr, REG_CMD_ERROR)
             except OSError:
                 time.sleep(0.05)  # MCU frozen mid-erase; slave NACKs
                 continue
+            if err == CMD_ERR_PENDING:
+                time.sleep(0.02)
+                continue
+            if err != 0:
+                raise DeviceRefused(err, "dfu begin refused: "
+                                    + err_reason(err, DFU_XFER_REASONS))
+            try:
+                phase = self._bus.read_byte_data(self._addr, REG_XFER_PHASE)
+            except OSError:
+                time.sleep(0.05)  # same erase-freeze texture as the CMD read
+                continue
             if phase == DFU_PHASE_READY:
                 return
-            if phase == DFU_PHASE_ERROR:
-                err = self._read_cmd_error()
-                raise DeviceRefused(err, "dfu begin failed: "
-                                    + err_reason(err, DFU_ERR_REASON))
             time.sleep(0.02)
-        raise TimeoutError("dfu begin: XFER_PHASE never reached READY")
+        raise TimeoutError("dfu begin: no verdict within "
+                           f"{timeout_s:.1f} s — {self._xfer_state()}")
+
+    def _xfer_state(self) -> str:
+        """Best-effort transfer-state triple for timeout diagnostics —
+        phase=IDLE with a foreign XFER_TYPE names a mux hijacker in one
+        line instead of an evening."""
+        try:
+            phase = self._bus.read_byte_data(self._addr, REG_XFER_PHASE)
+            mode = self._bus.read_byte_data(self._addr, REG_XFER_TYPE)
+            err = self._bus.read_byte_data(self._addr, REG_CMD_ERROR)
+        except OSError:
+            return "device not answering"
+        return (f"XFER_PHASE={_PHASE_NAMES.get(phase, phase)} "
+                f"XFER_TYPE={_MODE_NAMES.get(mode, mode)} "
+                f"CMD_ERROR={err}")
+
+    def _abort_transfer(self):
+        """Send `Cmd::XFER_ABORT`, retrying through the erase's NACK window
+        (~2.4 s of MCU deafness); both outcomes — released (0) and nothing
+        to release (ENOENT) — are fine for an unwind path."""
+        deadline = time.monotonic() + self.DFU_BEGIN_TIMEOUT_S
+        while time.monotonic() < deadline:
+            try:
+                self._bus.write_byte_data(self._addr, REG_CMD,
+                                          CMD_XFER_ABORT)
+                return
+            except OSError:
+                time.sleep(0.05)
 
     def _dfu_ack_wait(self, expected: int, timeout_s: float = None) -> bool:
         """Poll XFER_ACK until it reads `expected` (mod 256).

@@ -8,7 +8,7 @@
 
 uint8 index
 
-@sealed
+@extent 48 * 8
 
 ---
 
@@ -20,4 +20,4 @@ uint32[<=16] values     # allowed values (enum list); array length is the count
 uint8[<=8] unit         # physical unit (ASCII)
 uint8[<=16] name        # parameter name (ASCII)
 
-@sealed
+@extent 256 * 8

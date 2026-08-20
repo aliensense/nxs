@@ -59,8 +59,11 @@ class Iam20680(RegisterDriver):
 
     # ── Communication profile ───────────────────────────
     # Dual-bus part (BUSES defaults to ('i2c', 'spi')). Default transport
-    # is the Click's pre-soldered I2C; switch with --config bus=spi or
-    # `nxs set bus spi`, no recompile. SPI is a conventional InvenSense
+    # is the Click's pre-soldered I2C; switch at upload with
+    # `nxs upload iam20680 --param bus=spi`. The runtime form takes the
+    # numeric code (`nxs set bus 1`); it does not accept the value name,
+    # and it needs a driver that already probed — see issue #160.
+    # SPI is a conventional InvenSense
     # register bus (mode 0, read = reg | 0x80); only the clock ceiling
     # deviates from the 1 MHz firmware baseline. I2C max is 400 kHz =
     # the board bus, so no I2cProfile is needed (it would be a no-op).
