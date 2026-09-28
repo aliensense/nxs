@@ -1,25 +1,35 @@
-"""suite.yaml manifest: parse and validate the declared suite.
-
-The manifest is units-centric — a unit is one board (a graph node),
-its `links` are the routes that reach it (edges). Each unit bundles
-its links, an optional firmware pin, an optional serial pin, and the
-sensor panel to deploy. Config, firmware, and identity live on the
-node; only reachability lives on an edge — management flows over the
-first link that answers, in declared order. Validation is strict:
-unknown keys and malformed values fail with the YAML path spelled
-out, so a typo never half-applies.
-"""
+"""suite.yaml manifest: parse and validate the declared suite. A unit is one
+board and its `links` the routes that reach it; management flows over the
+first link that answers. Validation is strict and names the YAML path."""
 import os
 import re
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import yaml
 
-TRANSPORTS = ("i2c", "cyphal-can", "cyphal-serial", "mock")
+from nxs.suite.schema_base import ManifestError, _parse_int, _require_keys
+from nxs.suite.schema_ports import (
+    HARDWARE_LINK_KEYS, HARDWARE_PORT_KEYS, HUB_DRIVERS, SYNC_SOURCES,
+    PortLinkSpec, PortSpec, PortUnitRef, _parse_link_camera, _parse_port,
+)
+
+__all__ = [
+    "EGRESS_SUBJECTS", "EgressSpec", "HARDWARE_LINK_KEYS",
+    "HARDWARE_PORT_KEYS", "HUB_DRIVERS", "LinkSpec", "MODULES",
+    "ManifestError", "PortLinkSpec", "PortSpec", "PortUnitRef",
+    "SYNC_SOURCES", "SensorSpec", "SuiteConfig", "TRANSPORTS", "UnitSpec",
+    "device_proves_patch", "device_runs", "hardware_path",
+    "load_suite_config", "normalize_serial",
+    "parse_device_version", "parse_suite_config", "parse_version",
+    "stable_path", "_parse_int", "_parse_link_camera", "_parse_port",
+    "_require_keys",
+]
+
+TRANSPORTS = ("i2c", "cyphal-can", "cyphal-serial")
 MODULES = ("nxs",)
 
-_TOP_KEYS = {"suite", "defaults", "units"}
+_TOP_KEYS = {"suite", "defaults", "units", "ports"}
 _SUITE_KEYS = {"name"}
 _DEFAULTS_KEYS = {"firmware"}
 _UNIT_KEYS = {"name", "module", "links", "serial", "firmware", "sensors",
@@ -29,23 +39,17 @@ _EGRESS_KEYS = {"decimation", "subjects"}
 # names; the same tokens name the Cyphal decimation.<subject> registers).
 EGRESS_SUBJECTS = ("acceleration", "angular_velocity", "magnetic_field",
                    "temperature", "pressure", "scalar")
-_SENSOR_KEYS = {"driver", "config"}
+_SENSOR_KEYS = {"personality", "config"}
 _LINK_KEYS = {
-    "i2c": {"required": {"bus", "address"}, "optional": set()},
+    "i2c": {"required": set(), "optional": {"bus", "address", "link"}},
     "cyphal-can": {"required": {"iface", "node_id"}, "optional": set()},
     "cyphal-serial": {"required": {"port"}, "optional": {"baud"}},
-    "mock": {"required": set(), "optional": set()},
 }
 
 
-class ManifestError(ValueError):
-    """A manifest that failed validation; the message names the YAML path."""
-
-
 def stable_path(path: Optional[str]) -> Optional[str]:
-    """A device path resolved to its underlying node, so a stable udev
-    alias (`/dev/i2c-cam1`, `/dev/serial/by-id/...`) and the kernel's
-    enumerated node name the same link."""
+    """A device path resolved to its underlying node, so a udev alias and the
+    kernel's enumerated node name the same link."""
     return os.path.realpath(path) if path else path
 
 
@@ -58,6 +62,8 @@ class LinkSpec:
     node_id: Optional[int] = None
     port: Optional[str] = None
     baud: Optional[int] = None
+    ## i2c route form ("cam0/A"): resolved to bus+address against ports.
+    link_ref: Optional[str] = None
 
     def client_kwargs(self) -> dict:
         """Constructor kwargs for `open_client(self.transport, **kwargs)`."""
@@ -82,11 +88,8 @@ class LinkSpec:
         return self.transport
 
     def identity(self) -> tuple:
-        """The fields that address a device, for matching a manually
-        flag-addressed target against declared units (baud and other
-        tuning fields deliberately excluded). Device paths are resolved,
-        so an alias-declared link and an enumeration-named one compare
-        equal."""
+        """The fields that address a device, with device paths resolved; baud
+        and other tuning fields are excluded."""
         if self.transport == "i2c":
             return ("i2c", stable_path(self.bus), self.address)
         if self.transport == "cyphal-can":
@@ -120,9 +123,8 @@ class UnitSpec:
     egress: Optional[EgressSpec] = None
     serial: Optional[str] = None
     firmware: Optional[str] = None
-    # Declared mounting orientation (a ROTATION_* name) — installer intent,
-    # tied to the position: it transfers to a swapped board, unlike the
-    # solved per-silicon calibration, which never enters the manifest.
+    # Declared mounting orientation (a ROTATION_* name): installer intent tied
+    # to the position, so it transfers to a swapped board.
     orientation: Optional[str] = None
 
 
@@ -130,6 +132,7 @@ class UnitSpec:
 class SuiteConfig:
     name: str = ""
     units: List[UnitSpec] = field(default_factory=list)
+    ports: dict = field(default_factory=dict)  # name -> PortSpec
 
 
 def parse_version(text: str) -> tuple:
@@ -147,19 +150,9 @@ _DEVICE_VERSION_RE = re.compile(
 
 
 def parse_device_version(text):
-    """Version triple proven by a device identity string, or None.
-
-    The wire serves either the legacy "MAJOR.MINOR" pair or the full
-    build identity: "v1.0.0-4-g87fdf5b" (`git describe` — tag, commits
-    above it, short SHA), "-dirty" suffixed on an unclean build, and a
-    bare "87fdf5b" when no release tag was reachable. Only those forms
-    prove anything: a prerelease tag ("v1.0.0-rc1", with or without a
-    describe suffix) is not the release it borrows numbers from, so it
-    proves None — the pin logic then falls back to state records
-    rather than reading an RC as converged with a final pin. Unlike
-    `parse_version` this never raises — the string crossed a wire, not
-    a manifest review.
-    """
+    """Version triple proven by a device identity string, or None. Accepts the
+    legacy "MAJOR.MINOR" pair and a `git describe` build identity; a prerelease
+    tag or a bare SHA proves None. Never raises."""
     m = _DEVICE_VERSION_RE.match(str(text))
     if m is None:
         return None
@@ -168,22 +161,27 @@ def parse_device_version(text):
 
 
 def device_proves_patch(text):
-    """Whether a device identity string pins its patch component.
-
-    Legacy firmware serves the bare "MAJOR.MINOR" pair, which proves
-    nothing below the minor; a full build identity carries the tag's
-    triple and makes the patch comparable against a pin.
-    """
+    """Whether a device identity string pins its patch component: a legacy
+    "MAJOR.MINOR" pair does not, a full build identity does."""
     m = _DEVICE_VERSION_RE.match(str(text))
 
     return m is not None and m.group(3) is not None
 
 
+def device_runs(identity, want: tuple):
+    """Whether a device identity runs version `want`, at the precision the
+    identity proves: True/False for a legacy pair or a full build identity,
+    None when it proves nothing."""
+    ver = parse_device_version(identity)
+    if ver is None:
+        return None
+    n = 3 if device_proves_patch(identity) else 2
+    return ver[:n] == tuple(want)[:n]
+
+
 def normalize_serial(text, where: str) -> str:
-    """Lowercased 24-hex-digit UID96, separators stripped. Only YAML
-    strings are accepted: a bare `<digits>e<digits>` UID resolves as
-    scientific notation in float-resolving parsers and silently loses
-    digits, so a numeric value here means the manifest needs quotes."""
+    """Lowercased 24-hex-digit UID96, separators stripped. Only YAML strings
+    are accepted: a bare `<digits>e<digits>` UID resolves as a float."""
     if not isinstance(text, str):
         raise ManifestError(
             f"{where}: serial parsed as a YAML number, not a string — an "
@@ -195,28 +193,6 @@ def normalize_serial(text, where: str) -> str:
             f"{where}: serial must be the 12-byte UID96 as 24 hex digits, "
             f"got {text!r}")
     return raw
-
-
-def _require_keys(mapping: dict, allowed: set, where: str):
-    if not isinstance(mapping, dict):
-        raise ManifestError(f"{where}: expected a mapping, got {type(mapping).__name__}")
-    unknown = set(mapping) - allowed
-    if unknown:
-        raise ManifestError(
-            f"{where}: unknown key(s) {sorted(unknown)} (allowed: {sorted(allowed)})")
-
-
-def _parse_int(value, where: str) -> int:
-    if isinstance(value, bool):
-        raise ManifestError(f"{where}: expected an integer, got a boolean")
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str):
-        try:
-            return int(value, 0)
-        except ValueError:
-            pass
-    raise ManifestError(f"{where}: expected an integer (any base), got {value!r}")
 
 
 def _parse_link(raw, where: str) -> LinkSpec:
@@ -235,12 +211,22 @@ def _parse_link(raw, where: str) -> LinkSpec:
 
     link = LinkSpec(transport=transport)
     if transport == "i2c":
-        link.bus = str(raw["bus"])
-        link.address = _parse_int(raw["address"], f"{where}.address")
-        if not 0x08 <= link.address <= 0x77:
+        if "link" in raw:
+            if "bus" in raw or "address" in raw:
+                raise ManifestError(
+                    f"{where}: give either link: port/LINK or bus+address, "
+                    f"not both")
+            link.link_ref = str(raw["link"])
+        elif "bus" in raw and "address" in raw:
+            link.bus = str(raw["bus"])
+            link.address = _parse_int(raw["address"], f"{where}.address")
+            if not 0x08 <= link.address <= 0x77:
+                raise ManifestError(
+                    f"{where}.address: 0x{link.address:X} is not a usable "
+                    f"7-bit I2C address (0x08-0x77)")
+        else:
             raise ManifestError(
-                f"{where}.address: 0x{link.address:X} is not a usable "
-                f"7-bit I2C address (0x08-0x77)")
+                f"{where}: i2c link needs bus+address, or link: port/LINK")
     elif transport == "cyphal-can":
         link.iface = str(raw["iface"])
         link.node_id = _parse_int(raw["node_id"], f"{where}.node_id")
@@ -255,15 +241,15 @@ def _parse_link(raw, where: str) -> LinkSpec:
 
 def _parse_sensor(raw, where: str) -> SensorSpec:
     _require_keys(raw, _SENSOR_KEYS, where)
-    if "driver" not in raw or not isinstance(raw["driver"], str):
-        raise ManifestError(f"{where}: sensor needs a 'driver' name")
+    if not isinstance(raw.get("personality"), str):
+        raise ManifestError(f"{where}: sensor needs a personality (personality: <name>)")
     # Marketing names hyphenate (neo-m9n); module files underscore.
-    driver = raw["driver"].replace("-", "_")
-    # Driver names become module names and filesystem paths; the token
+    driver = raw["personality"].replace("-", "_")
+    # Personality names become module names and filesystem paths; the token
     # shape rules out traversal (`../evil`) by construction.
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", driver):
         raise ManifestError(
-            f"{where}.driver: {raw['driver']!r} is not a module name "
+            f"{where}.personality: {raw['personality']!r} is not a module name "
             f"(letters, digits, underscores)")
     config = raw.get("config", {}) or {}
     if not isinstance(config, dict):
@@ -294,8 +280,7 @@ def _parse_unit(raw, where: str, defaults: dict) -> UnitSpec:
         raise ManifestError(f"{where}.links: the same link is declared twice")
 
     # Tri-state panel intent: an absent `sensors` key leaves the panel
-    # unmanaged; an explicit `sensors: []` is enforced — converge to an
-    # empty store.
+    # unmanaged; an explicit `sensors: []` converges to an empty store.
     if "sensors" not in raw or raw["sensors"] is None:
         sensors = None
     else:
@@ -304,9 +289,8 @@ def _parse_unit(raw, where: str, defaults: dict) -> UnitSpec:
             raise ManifestError(f"{where}.sensors: expected a list")
         sensors = [_parse_sensor(s, f"{where}.sensors[{i}]")
                    for i, s in enumerate(sensors_raw)]
-    # A unit is one physical link, so a driver is a stable identity within
-    # its panel — drift/freeze match the active driver by name. A duplicate
-    # would shadow the second entry, so reject it here.
+    # A driver is a stable identity within its panel (drift and freeze match
+    # the active driver by name), so a duplicate is rejected.
     driver_names = [s.driver for s in (sensors or [])]
     dupes = sorted({d for d in driver_names if driver_names.count(d) > 1})
     if dupes:
@@ -367,6 +351,42 @@ def _parse_unit(raw, where: str, defaults: dict) -> UnitSpec:
                     orientation=orientation)
 
 
+def _resolve_link_refs(cfg: SuiteConfig, where: str) -> None:
+    """Fill route-form unit links (link: port/LINK) from the ports."""
+    by_name = {u.name: u for u in cfg.units}
+    for pname, port in cfg.ports.items():
+        for plink in port.links:
+            if plink.unit and plink.unit.name not in by_name:
+                raise ManifestError(
+                    f"{where}.ports.{pname}.links.{plink.name}.unit: "
+                    f"no unit named {plink.unit.name!r}")
+    for unit in cfg.units:
+        for i, link in enumerate(unit.links):
+            if link.transport != "i2c" or link.link_ref is None:
+                continue
+            lw = f"{where}.units[{unit.name}].links[{i}]"
+            try:
+                pname, lname = link.link_ref.split("/", 1)
+            except ValueError:
+                raise ManifestError(
+                    f"{lw}.link: expected port/LINK, got "
+                    f"{link.link_ref!r}") from None
+            port = cfg.ports.get(pname)
+            if port is None:
+                raise ManifestError(f"{lw}.link: no port named {pname!r}")
+            plink = next((l for l in port.links if l.name == lname), None)
+            if plink is None:
+                raise ManifestError(
+                    f"{lw}.link: port {pname!r} has no link {lname!r}")
+            if plink.unit is None or plink.unit.name != unit.name:
+                raise ManifestError(
+                    f"{lw}.link: {link.link_ref} does not declare unit "
+                    f"{unit.name!r} (add unit: to the port link)")
+            link.bus = port.bus
+            link.address = (plink.unit.alias if port.hub_compatible
+                            else plink.unit.target)
+
+
 def parse_suite_config(raw: dict, where: str = "suite.yaml") -> SuiteConfig:
     """Validate a loaded YAML mapping into a `SuiteConfig`."""
     _require_keys(raw, _TOP_KEYS, where)
@@ -381,9 +401,17 @@ def parse_suite_config(raw: dict, where: str = "suite.yaml") -> SuiteConfig:
         except ValueError as e:
             raise ManifestError(f"{where}.defaults.firmware: {e}") from None
 
+    ports_raw = raw.get("ports") or {}
+    if not isinstance(ports_raw, dict):
+        raise ManifestError(f"{where}.ports: expected a mapping")
+    ports = {str(name): _parse_port(name, spec, f"{where}.ports.{name}")
+             for name, spec in ports_raw.items()}
+
     units_raw = raw.get("units")
-    if not isinstance(units_raw, list) or not units_raw:
-        raise ManifestError(f"{where}: needs a non-empty 'units' list")
+    if units_raw is None and ports:
+        units_raw = []
+    if not isinstance(units_raw, list) or (not units_raw and not ports):
+        raise ManifestError(f"{where}: needs 'units' (or 'ports')")
     units = [_parse_unit(u, f"{where}.units[{i}]", defaults)
              for i, u in enumerate(units_raw)]
 
@@ -392,15 +420,17 @@ def parse_suite_config(raw: dict, where: str = "suite.yaml") -> SuiteConfig:
     if dupes:
         raise ManifestError(f"{where}: duplicate unit name(s) {dupes}")
 
-    # One route reaches one board, so an edge belongs to exactly one
-    # unit. Mock links carry no address — their identity is degenerate,
-    # so collisions between them are meaningless.
+    # Route-form links resolve to bus+address before the edge checks,
+    # so identity comparison sees real addresses.
+    cfg = SuiteConfig(name=str(suite_raw.get("name", "")), units=units,
+                      ports=ports)
+    _resolve_link_refs(cfg, where)
+
+    # One route reaches one board, so an edge belongs to exactly one unit.
     edge_owner: dict = {}
     for u in units:
         for link in u.links:
             ident = link.identity()
-            if ident == ("mock",):
-                continue
             if ident in edge_owner:
                 raise ManifestError(
                     f"{where}: units {edge_owner[ident]!r} and {u.name!r} "
@@ -409,9 +439,8 @@ def parse_suite_config(raw: dict, where: str = "suite.yaml") -> SuiteConfig:
                     f"several links")
             edge_owner[ident] = u.name
 
-    # One board is one unit: two units pinning the same silicon would
-    # converge one store with two intents, fighting on every apply. A
-    # multi-homed board is one unit with several links.
+    # One board is one unit: two units pinning the same silicon would fight
+    # on every apply. A multi-homed board is one unit with several links.
     pinned: dict = {}
     for u in units:
         if u.serial:
@@ -422,20 +451,46 @@ def parse_suite_config(raw: dict, where: str = "suite.yaml") -> SuiteConfig:
                     f"unit; merge their links into one entry")
             pinned[u.serial] = u.name
 
-    return SuiteConfig(name=str(suite_raw.get("name", "")), units=units)
+    return cfg
 
 
-def load_suite_config(path: str) -> SuiteConfig:
-    """Load and validate the manifest at `path`. Every read/parse
-    failure — unreadable file, bad encoding, malformed YAML — surfaces
-    as `ManifestError`, so callers handle one exception type."""
+def _read_yaml(path: str) -> Any:
     try:
         with open(path, encoding="utf-8") as f:
-            raw = yaml.safe_load(f)
+            return yaml.safe_load(f)
     except OSError as e:
         raise ManifestError(f"{path}: {e.strerror or e}") from None
     except (yaml.YAMLError, UnicodeDecodeError) as e:
         raise ManifestError(f"{path}: not valid YAML ({e})") from None
+
+
+def load_suite_config(path: str) -> SuiteConfig:
+    """Load and validate the declaration at `path`. The hardware file
+    beside it is `nxs generate`'s report and is never read here. Every
+    read or parse failure raises `ManifestError`."""
+    raw = _read_yaml(path)
     if raw is None:
         raise ManifestError(f"{path}: empty manifest")
-    return parse_suite_config(raw, where=path)
+    if not isinstance(raw, dict):
+        raise ManifestError(f"{path}: not a mapping")
+    cfg = parse_suite_config(raw, where=path)
+    # A port that names no bus is one of the host's, by name; a unit
+    # that rides one of its links takes the same bus.
+    if any(port.bus is None for port in cfg.ports.values()):
+        from nxs import host as host_layer
+        buses = host_layer.current().camera_buses()
+        for port in cfg.ports.values():
+            if port.bus is None:
+                port.bus = buses.get(port.name)
+        for unit in cfg.units:
+            for link in unit.links:
+                if link.bus is None and link.link_ref:
+                    port = cfg.ports.get(link.link_ref.split("/", 1)[0])
+                    if port is not None:
+                        link.bus = port.bus
+    return cfg
+
+
+def hardware_path(manifest: str) -> str:
+    """The generated wiring file that belongs to a manifest."""
+    return os.path.join(os.path.dirname(manifest) or ".", "hardware.yaml")

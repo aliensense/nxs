@@ -1,13 +1,6 @@
-"""Calibration verbs: on-device procedure triggers plus the accel wizard.
-
-Gyro and mag solve on the device through the `CAL_GYRO` and
-`CAL_MAG_START/STOP` vendor commands, the same surface a Cyphal autopilot
-drives with no tool. The verbs here trigger them and render progress.
-The accel wizard acquires and solves host-side, at the raw descriptor
-tier and in the sensor frame. The mounting orientation is a separate
-record field the appliers compose on top. Every solve is gated by
-falsifiability checks, and a failed gate uploads nothing.
-"""
+"""Calibration verbs: on-device procedure triggers (gyro, mag) and the
+host-side accel wizard, which solves at the raw tier in the sensor frame. A
+solve whose parameters leave their bounds uploads nothing."""
 import math
 import sys
 import time
@@ -16,36 +9,32 @@ from typing import List, Optional, Sequence, Tuple
 
 from nxs import calsolve
 from nxs._generated_constants import Calibration as CalConstants
-from nxs._generated_constants import FieldSemantics
+from nxs._generated_constants import FieldSemantics, RunnerStates
+from nxs.term import status_line
 from nxs.client import (CALIB_ERR_REASON, ERRNO_EAGAIN, DeviceRefused,
                         SupportsCalibration, active_driver_tag, err_reason,
-                        rotation_name)
+                        rotation_name, runner_state_name)
 
 # Accel-wizard tuning. The stillness threshold pairs with the metric
-# `is_still` computes — retune them together.
+# `is_still` computes; retune them together.
 STILL_WINDOW_S = 0.5           # rolling window the stillness gate inspects
-ACCEL_STILL_THRESHOLD = 0.5    # m/s^2 p2p: 2x the ~0.25 quiet-bench floor
-                               # of a full 0.5 s window at 250 Hz (IAM-20680,
-                               # FS=8g); hand tremor measures >=1.5
+ACCEL_STILL_THRESHOLD = 0.5    # m/s^2 p2p over the window; hand tremor is >= 1.5
 POSE_SAMPLES = 100             # still samples averaged per accel pose
-POSE_DOMINANCE = 0.8           # |axis| >= 80% of |g| claims a pose
-POSE_TILT_HINT_DEG = 5.0       # past this, the capture is worth re-seating:
-                               # solve_accel's reference asserts the pose is
-                               # exactly axis-aligned, and |a| — the only other
-                               # number shown — is rotation-invariant, so tilt
-                               # is otherwise invisible until verification
+POSE_DOMINANCE = 0.8           # |axis| >= 80% of the reading's length claims
+                               # a pose; the six need only span all three axes
+CHECK_MIN_COMPONENT = 0.4      # every axis >= 40% of the reading's length (and
+                               # none past POSE_DOMINANCE) claims a check pose
+POSE_MIN_NORM = 0.5            # of |g|: below this a reading is not gravity
 ENCODER_SAMPLES = 50
 STREAM_TIMEOUT_S = 1.0
 
-# On-device procedure pacing: poll period and give-up windows. The
-# coverage scale the mag verb renders and auto-stops on is the device's
-# own (`Calibration.MAG_COVERAGE_*`), and its gate stays authoritative.
+# On-device procedure pacing. The mag coverage scale rendered and auto-stopped
+# on is the device's own, and its gate stays authoritative.
 PROGRESS_POLL_S = 0.2
 GYRO_WATCH_TIMEOUT_S = 90.0
 MAG_WATCH_TIMEOUT_S = 120.0
-# Pause before asking the device to solve again after an EAGAIN: the
-# solve is real arithmetic on the device, and the operator needs a
-# moment to turn it somewhere new for the answer to change.
+# Pause before asking the device to solve again after an EAGAIN, so the
+# operator can turn it to another orientation.
 MAG_RETRY_S = 2.0
 
 _POSE_LABELS = {(0, 1): '+X', (0, -1): '-X', (1, 1): '+Y', (1, -1): '-Y',
@@ -54,13 +43,9 @@ _POSE_LABELS = {(0, 1): '+X', (0, -1): '-X', (1, 1): '+Y', (1, -1): '-Y',
 
 def is_still(window: Sequence[Tuple[float, float, float]],
              threshold: float) -> bool:
-    """True when the vectors in `window` show no motion.
-
-    `window` spans `STILL_WINDOW_S` of one vector quantity (accel in
-    m/s^2, or gyro rates in rad/s when the panel has no accel);
-    `threshold` is the matching *_STILL_THRESHOLD constant. Gates both
-    the gyro-bias averaging and each accel-pose capture.
-    """
+    """True when the vectors in `window` (spanning `STILL_WINDOW_S` of one
+    vector quantity) show no motion; `threshold` is the matching
+    *_STILL_THRESHOLD. Gates gyro-bias averaging and each accel-pose capture."""
     if not window:
         return False
 
@@ -108,20 +93,6 @@ def _bar(fraction: float, width: int = 10) -> str:
     return '━' * filled + '─' * (width - filled)
 
 
-def _pose_tilt_deg(mean, axis: int) -> float:
-    """Angle between a captured pose and the axis it claims to be aligned with.
-
-    `solve_accel` builds each reference as exactly ±g on this axis and zero on
-    the other two, so a tilted pose hands the fit a contradiction. The captured
-    magnitude cannot expose that — a rotated vector has the same length — which
-    leaves tilt invisible until the calibration is verified against gravity.
-    """
-    norm = math.hypot(*mean)
-    if norm <= 0.0:
-        return 0.0
-    return math.degrees(math.acos(min(1.0, abs(mean[axis]) / norm)))
-
-
 def _bucket_index(name: str) -> int:
     return {'accel': 0, 'gyro': 1, 'mag': 2}[name]
 
@@ -135,7 +106,7 @@ def _driver_tag(t) -> Tuple[str, int]:
 
 
 def _require(t, args, bucket_names, what: str):
-    """Common verb preamble: capability, driver, and panel checks."""
+    """Common verb preamble: capability, driver, panel, and runner-state checks."""
     if not isinstance(t, SupportsCalibration):
         print(f"calibrate: not supported on transport '{args.transport}'",
               file=sys.stderr)
@@ -148,6 +119,14 @@ def _require(t, args, bucket_names, what: str):
         else bucket_names(fields)
     if not names:
         print(f"calibrate: the loaded driver has no {what}", file=sys.stderr)
+        return None, None
+    # A driver whose sensor never answered declares the vector but delivers
+    # no samples; the device would only wait out its stillness timeout.
+    runner = t.read_runner_state()
+    if runner != RunnerStates.RunnerState.MEASURING:
+        print(f"calibrate: the driver is not measuring (runner "
+              f"{runner_state_name(runner)}) — no samples to calibrate from",
+              file=sys.stderr)
         return None, None
     return fields, names
 
@@ -189,15 +168,9 @@ def _finish_procedure(t, args, result: int) -> int:
 
 
 def _release(t) -> bool:
-    """Drop a procedure still running on the device, changing nothing.
-
-    A procedure holds the device's transfer session until it ends, and a
-    held session refuses every later command — a store read, and even the
-    firmware push that would recover the unit. `stop` also releases, but
-    it solves and applies on the way out; this must not. Returns whether
-    the release landed. Catches BaseException: a second Ctrl-C during the
-    release must not replace the exception the caller is unwinding.
-    """
+    """Drop a procedure still running on the device, changing nothing; returns
+    whether the release landed. Catches BaseException so a second Ctrl-C does
+    not replace the exception the caller is unwinding."""
     try:
         t.cal_abort()
     except BaseException:
@@ -216,21 +189,26 @@ def _release_interrupted(t) -> None:
 
 
 def _watch_procedure(t, args, timeout_s: float, render) -> int:
-    """Poll the on-device procedure until it completes; render progress."""
+    """Poll the on-device procedure until it completes; render progress.
+    On a 0 verdict `render` is called once more with the idle state and
+    returns its finished line."""
     deadline = time.monotonic() + timeout_s
     try:
         while time.monotonic() < deadline:
             state, detail, result = t.read_cal_progress()
             if state == CalConstants.CalState.IDLE:
-                print()
+                if result == 0:
+                    # The device goes idle between two polls, so the last
+                    # bar drawn is whatever the previous poll saw.
+                    status_line(render(state, detail), done=True)
+                else:
+                    print()
                 return _finish_procedure(t, args, result)
-            print(f"\r{render(state, detail)}", end="")
+            status_line(render(state, detail))
             time.sleep(PROGRESS_POLL_S)
     except BaseException:
-        # Ctrl-C included, and it is the case an operator actually hits.
-        # KeyboardInterrupt is not an Exception, so a bare `except
-        # Exception` would walk straight past it and leave the procedure
-        # running with the session held.
+        # Ctrl-C included: KeyboardInterrupt is not an Exception, and a bare
+        # `except Exception` would leave the procedure running, session held.
         _release_interrupted(t)
         raise
     print()
@@ -253,81 +231,95 @@ def cmd_gyro(t, args) -> int:
 
     def render(state, detail):
         if state == CalConstants.CalState.GYRO_WAIT_STILL:
-            return "waiting for stillness              "
-        return f"{_bar(detail / 100.0)} {detail}%           "
+            return "waiting for stillness"
+        if state == CalConstants.CalState.IDLE:
+            return f"{_bar(1.0)} 100%"
+        return f"{_bar(detail / 100.0)} {detail}%"
 
     return _watch_procedure(t, args, GYRO_WATCH_TIMEOUT_S, render)
 
 
-def cmd_accel(t, args) -> int:
+def _pose_label(v, check) -> Optional[str]:
+    """The axis label of a dominant-axis pose; `'check'` for a near-diagonal
+    one, or `'flipped'` once `check` (the first check pose's mean) exists
+    and this one sits in the opposite octant; None for anything between."""
+    # Fractions of the reading's own length, so an uncalibrated scale or
+    # offset the solve accepts cannot keep a pose from ever being labelled.
+    norm = math.hypot(*v)
+    if norm < POSE_MIN_NORM * calsolve.STANDARD_GRAVITY:
+        return None
+    axis = max(range(3), key=lambda i: abs(v[i]))
+    if abs(v[axis]) >= POSE_DOMINANCE * norm:
+        return _POSE_LABELS[(axis, 1 if v[axis] > 0 else -1)]
+    if min(abs(x) for x in v) < CHECK_MIN_COMPONENT * norm:
+        return None
+    if check is None:
+        return 'check'
+    return 'flipped' if all(x * c < 0 for x, c in zip(v, check)) else None
+
+
+def _capture_poses(t, names, labels, clock=time.monotonic) -> dict:
+    """Stream until every label in `labels` has a still `POSE_SAMPLES`-sample
+    mean, in any order, or the stream ends; returns what was captured."""
+    gate = _StillGate(names, ACCEL_STILL_THRESHOLD)
+    means: dict = {}
+    run: Optional[Tuple[str, list]] = None
+    for s in t.iter_samples(timeout=STREAM_TIMEOUT_S, calibrated=False,
+                            max_silence_s=STREAM_TIMEOUT_S):
+        v = _vector(s.values, names)
+        if v is None:
+            continue
+        still = gate.push(s.values, clock())
+        label = _pose_label(v, means.get('check')) if still else None
+        if label not in labels or label in means:
+            run = None
+            g = calsolve.STANDARD_GRAVITY
+            reading = " ".join(f"{x / g:+.2f}" for x in v)
+            note = f", {label} already captured" if label in means else ""
+            status_line("waiting: " + " ".join(l for l in labels if l not in means)
+                    + f"   (reading {reading} g{note})")
+            continue
+        if run is None or run[0] != label:
+            run = (label, [])
+        run[1].append(v)
+        status_line(f"{label} {_bar(len(run[1]) / POSE_SAMPLES)} "
+                f"{len(run[1])}/{POSE_SAMPLES}")
+        if len(run[1]) >= POSE_SAMPLES:
+            mean = tuple(sum(x[i] for x in run[1]) / POSE_SAMPLES
+                         for i in range(3))
+            means[label] = mean
+            status_line(f"✓ {label}  ({math.hypot(*mean) / calsolve.STANDARD_GRAVITY:.3f} g)",
+                    done=True)
+            run = None
+            if len(means) == len(labels):
+                break
+    return means
+
+
+def cmd_accel(t, args, clock=time.monotonic) -> int:
     fields, names = _require(
             t, args, FieldSemantics.SubjectBucket.ACCELERATION,
             'accel vector (ACCEL_X/Y/Z semantics)')
     if names is None:
         return 1
-    gate = _StillGate(names, ACCEL_STILL_THRESHOLD)
-    g = calsolve.STANDARD_GRAVITY
-    print("accel calibration — hold the unit still in 6 orientations "
-          "(each axis up and down)")
-
-    poses: dict = {}
-    accum: List[Tuple[float, float, float]] = []
-    current_pose = None
-    while len(poses) < 6:
-        got_sample = False
-        for s in t.iter_samples(timeout=STREAM_TIMEOUT_S, calibrated=False,
-                             max_silence_s=STREAM_TIMEOUT_S):
-            got_sample = True
-            now = time.monotonic()
-            v = _vector(s.values, names)
-            if v is None:
-                continue
-            still = gate.push(s.values, now)
-            axis = max(range(3), key=lambda i: abs(v[i]))
-            sign = 1 if v[axis] > 0 else -1
-            pose = (axis, sign)
-            dominant = abs(v[axis]) >= POSE_DOMINANCE * g
-            if not still or not dominant or pose in poses:
-                if accum:
-                    accum = []
-                current_pose = None
-                remaining = " ".join(_POSE_LABELS[p]
-                                     for p in sorted(_POSE_LABELS)
-                                     if p not in poses)
-                print(f"\rwaiting: {remaining}                ", end="")
-                continue
-            if pose != current_pose:
-                current_pose = pose
-                accum = []
-            accum.append(v)
-            print(f"\r{_POSE_LABELS[pose]} {_bar(len(accum) / POSE_SAMPLES)} "
-                  f"{len(accum)}/{POSE_SAMPLES}          ", end="")
-            if len(accum) >= POSE_SAMPLES:
-                mean = tuple(sum(x[i] for x in accum) / len(accum)
-                             for i in range(3))
-                reference = [0.0, 0.0, 0.0]
-                reference[pose[0]] = pose[1] * g
-                poses[pose] = (mean, reference)
-                mag = math.hypot(*mean) / g
-                tilt = _pose_tilt_deg(mean, pose[0])
-                # The pose is captured either way — it is already in `poses`
-                # and the loop will not ask for it again — so this names the
-                # cost rather than promising a recapture the run cannot make.
-                hint = "  (drags the fit — re-run for a tighter residual)" \
-                    if tilt > POSE_TILT_HINT_DEG else ""
-                print(f"\r✓ {_POSE_LABELS[pose]}  ({mag:.3f} g, "
-                      f"{tilt:.1f}° off axis){hint}"
-                      f"                              ")
-                accum = []
-                current_pose = None
-                break
-        if not got_sample:
-            print("\ncalibrate: stream ended before all 6 poses",
-                  file=sys.stderr)
-            return 1
+    print("accel calibration — 8 still poses, any order:\n"
+          "  +X -X +Y -Y +Z -Z   each axis pointing up, then down\n"
+          "  check               resting on a corner: every axis reads "
+          "0.40-0.80 g\n"
+          "  flipped             the same corner pointing down (every axis "
+          "reversed)")
+    labels = list(_POSE_LABELS.values()) + ['check', 'flipped']
+    means = _capture_poses(t, names, labels, clock)
+    missing = [l for l in labels if l not in means]
+    if missing:
+        print(f"\ncalibrate: stream ended before {' '.join(missing)}",
+              file=sys.stderr)
+        return 1
+    checks = [means.pop('check'), means.pop('flipped')]
 
     try:
-        sol = calsolve.solve_accel(list(poses.values()))
+        sol = calsolve.solve_accel(list(means.values()))
+        err = max(calsolve.verify_accel(sol, c) for c in checks)
     except calsolve.CalSolveError as e:
         print(f"✗ {e}", file=sys.stderr)
         return 1
@@ -335,7 +327,9 @@ def cmd_accel(t, args) -> int:
     record = t.read_calibration().replace_vector(
             _bucket_index('accel'), sol.m, sol.b, tag)
     t.write_calibration(record, persist=not args.no_persist)
-    print(f"solve: max residual {sol.max_residual * 100:.1f}% of g")
+    print(f"solve: scale ({', '.join(f'{x:.4f}' for x in sol.scale)}), "
+          f"offset ({', '.join(f'{x:+.3f}' for x in sol.offset)}) m/s^2, "
+          f"check poses {err * 100:.2f}% off g")
     print(f"✓ applied{'' if args.no_persist else ' + persisted'}"
           f" (tag {driver or 'unguarded'})")
     return 0
@@ -353,9 +347,8 @@ def cmd_mag(t, args) -> int:
         print(f"✗ {e}", file=sys.stderr)
         return 1
 
-    # Watch the device's coverage; auto-stop once it can gate a solve
-    # (its own coverage gate stays authoritative), or at the timeout so an
-    # under-rotated run fails loudly rather than collecting forever.
+    # Watch the device's coverage; auto-stop once it can gate a solve, or at
+    # the timeout so an under-rotated run fails rather than collecting forever.
     deadline = time.monotonic() + MAG_WATCH_TIMEOUT_S
     try:
         while True:
@@ -365,28 +358,22 @@ def cmd_mag(t, args) -> int:
                 state, coverage, result = t.read_cal_progress()
                 if state != CalConstants.CalState.MAG_COLLECT:
                     break
-                print(f"\rcoverage "
-                      f"{_bar(coverage / CalConstants.MAG_COVERAGE_FULL)} "
-                      f"{coverage}/{CalConstants.MAG_COVERAGE_FULL}", end="")
+                status_line(f"coverage "
+                        f"{_bar(coverage / CalConstants.MAG_COVERAGE_FULL)} "
+                        f"{coverage}/{CalConstants.MAG_COVERAGE_FULL}")
                 if coverage >= CalConstants.MAG_COVERAGE_ENOUGH:
                     break
                 time.sleep(PROGRESS_POLL_S)
             print()
             if state == CalConstants.CalState.IDLE:
-                # The procedure ended without our stop — the device's
-                # give-up window, or another host — and the progress
-                # record carries its verdict. A stop now would only
-                # answer EINVAL (no collection open).
+                # The procedure ended without this stop (the device's give-up
+                # window, or another host); the progress record has the verdict.
                 return _finish_procedure(t, args, result)
             try:
                 t.cal_mag_stop()
             except DeviceRefused as e:
-                # The device decides coverage after the fit, where it can
-                # divide the mount's own distortion out, so the progress
-                # byte is an estimate and can reach its stopping point
-                # while the solve still wants more rotation. EAGAIN keeps
-                # the collection open on the device, so keep turning and
-                # ask again rather than throwing the rotation away.
+                # Coverage is decided after the fit, so the progress byte can
+                # reach its stop while the solve wants more rotation; keep turning.
                 if e.code == ERRNO_EAGAIN and time.monotonic() < deadline:
                     print(f"not yet — {e}. Keep rotating, especially about "
                           f"an axis you have not inverted", file=sys.stderr)
@@ -397,12 +384,8 @@ def cmd_mag(t, args) -> int:
                 return 1
             break
     except BaseException:
-        # Ctrl-C included: the collection holds the transfer session, and
-        # leaving it held wedges every later command — a store read, and
-        # even the firmware push that would recover the unit — until the
-        # device's own window expires. KeyboardInterrupt is not an
-        # Exception, so a bare `except Exception` would miss the case an
-        # operator actually hits.
+        # Ctrl-C included: a held collection wedges every later command until
+        # the device's own window expires, and a bare `except Exception` misses it.
         _release_interrupted(t)
         raise
     return _finish_procedure(t, args, 0)
@@ -515,7 +498,7 @@ def add_calibrate_parser(sub) -> None:
     cal = p.add_subparsers(dest='cal_cmd', required=True)
     for name, help_text in (
             ('gyro', 'Average the at-rest rates into a bias (hold still)'),
-            ('accel', 'Guided 6-pose scale/misalignment solve'),
+            ('accel', 'Guided scale/offset solve: six poses plus two check poses'),
             ('mag', 'In-situ hard/soft-iron ellipsoid fit (mounted in the '
                     'vehicle, rotate through all orientations)'),
             ('encoder-zero', 'Declare the current encoder angle as zero')):

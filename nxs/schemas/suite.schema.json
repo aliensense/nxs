@@ -1,0 +1,289 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aliensense.github.io/nxs-docs/schemas/suite.schema.json",
+  "title": "NXS suite manifest (suite.yaml)",
+  "description": "The declared suite: hub ports with their camera links and the NXS units reachable over declared routes. Shape only — mode feasibility, fps ceilings, and sensor parameter laws are checked by `nxs check` against the descriptors.",
+  "type": "object",
+  "additionalProperties": false,
+  "anyOf": [
+    {"required": ["units"], "properties": {"units": {"minItems": 1}}},
+    {"required": ["ports"], "properties": {"ports": {"minProperties": 1}}}
+  ],
+  "properties": {
+    "suite": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {"type": "string"}
+      }
+    },
+    "defaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "firmware": {"$ref": "#/$defs/version"}
+      }
+    },
+    "units": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/unit"}
+    },
+    "ports": {
+      "type": "object",
+      "description": "Carrier connectors by name (cam0, cam1, …).",
+      "additionalProperties": {"$ref": "#/$defs/port"}
+    }
+  },
+  "$defs": {
+    "int": {
+      "description": "An integer in any base: a YAML integer, or a string such as \"0x30\".",
+      "anyOf": [
+        {"type": "integer"},
+        {"type": "string", "pattern": "^[+-]?(0[xX][0-9a-fA-F]+|0[oO][0-7]+|0[bB][01]+|[0-9]+)$"}
+      ]
+    },
+    "version": {
+      "description": "MAJOR.MINOR[.PATCH]; quote it so YAML keeps it a string.",
+      "anyOf": [
+        {"type": "string", "pattern": "^[0-9]+\\.[0-9]+(\\.[0-9]+)?$"},
+        {"type": "number"}
+      ]
+    },
+    "serial": {
+      "description": "The 12-byte UID96 as 24 hex digits (separators allowed). Always quote it — an unquoted <digits>e<digits> reads as a float.",
+      "type": "string",
+      "pattern": "^[0-9a-fA-F:\\-]{24,35}$"
+    },
+    "link": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["transport"],
+      "properties": {
+        "transport": {"enum": ["i2c", "cyphal-can", "cyphal-serial"]},
+        "bus": {"type": "string"},
+        "address": {"$ref": "#/$defs/int"},
+        "link": {
+          "type": "string",
+          "description": "Route form: port/LINK (the port's link declares this unit).",
+          "pattern": "^[^/\\s]+/[^/\\s]+$"
+        },
+        "iface": {"type": "string"},
+        "node_id": {"$ref": "#/$defs/int"},
+        "port": {"type": "string"},
+        "baud": {"$ref": "#/$defs/int"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"transport": {"const": "i2c"}}},
+          "then": {
+            "anyOf": [
+              {"required": ["link"]},
+              {"required": ["bus", "address"]}
+            ],
+            "not": {"anyOf": [{"required": ["iface"]}, {"required": ["node_id"]}, {"required": ["port"]}, {"required": ["baud"]}]}
+          }
+        },
+        {
+          "if": {"properties": {"transport": {"const": "cyphal-can"}}},
+          "then": {
+            "required": ["iface", "node_id"],
+            "not": {"anyOf": [{"required": ["bus"]}, {"required": ["address"]}, {"required": ["link"]}, {"required": ["port"]}, {"required": ["baud"]}]}
+          }
+        },
+        {
+          "if": {"properties": {"transport": {"const": "cyphal-serial"}}},
+          "then": {
+            "required": ["port"],
+            "not": {"anyOf": [{"required": ["bus"]}, {"required": ["address"]}, {"required": ["link"]}, {"required": ["iface"]}, {"required": ["node_id"]}]}
+          }
+        }
+      ]
+    },
+    "sensor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["personality"],
+      "properties": {
+        "personality": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_\\-]*$",
+                        "description": "The sensor personality by name."},
+        "config": {"type": "object"}
+      }
+    },
+    "egress": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "decimation": {"$ref": "#/$defs/int"},
+        "subjects": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "acceleration": {"$ref": "#/$defs/int"},
+            "angular_velocity": {"$ref": "#/$defs/int"},
+            "magnetic_field": {"$ref": "#/$defs/int"},
+            "temperature": {"$ref": "#/$defs/int"},
+            "pressure": {"$ref": "#/$defs/int"},
+            "scalar": {"$ref": "#/$defs/int"}
+          }
+        }
+      }
+    },
+    "unit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "links"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "module": {"enum": ["nxs"]},
+        "links": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Routes that reach the board; management uses the first that answers, in declared order.",
+          "items": {"$ref": "#/$defs/link"}
+        },
+        "serial": {"$ref": "#/$defs/serial"},
+        "firmware": {"$ref": "#/$defs/version"},
+        "sensors": {
+          "description": "Absent: the panel is unmanaged. An explicit empty list enforces an empty store.",
+          "type": ["array", "null"],
+          "items": {"$ref": "#/$defs/sensor"}
+        },
+        "egress": {"$ref": "#/$defs/egress"},
+        "orientation": {"type": "string", "description": "A ROTATION_* mounting orientation name."}
+      }
+    },
+    "hub": {
+      "description": "The deserializer: its compatible alone (the pack's address and driver), or the mapping with them.",
+      "anyOf": [
+        {"type": "string", "minLength": 1},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["compatible"],
+          "properties": {
+            "compatible": {"type": "string"},
+            "addr": {"$ref": "#/$defs/int"},
+            "driver": {"enum": ["nxs", "kernel"]}
+          }
+        }
+      ]
+    },
+    "port_unit": {
+      "anyOf": [
+        {"type": "string", "minLength": 1},
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name"],
+          "properties": {
+            "name": {"type": "string", "minLength": 1},
+            "alias": {
+              "$ref": "#/$defs/int",
+              "description": "The host address the link presents the pod at. Omitted, the pod answers at target; with more than one pod behind the hub each needs its own alias, different from its target."
+            },
+            "target": {"$ref": "#/$defs/int"}
+          }
+        }
+      ]
+    },
+    "port_link": {
+      "type": "object",
+      "description": "A camera head on the port. Behind a hub the link names its serializer, its deserializer window and its virtual channel.",
+      "additionalProperties": false,
+      "properties": {
+        "camera": {
+          "description": "The sensor compatible, or {sensor, mode, fps} for a link with its own mode or free-run rate (a mixed hub, or links at different rates); a link that names none takes the port's camera.sensor default and the port's rate.",
+          "anyOf": [
+            {"type": "string", "minLength": 1},
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "minProperties": 1,
+              "properties": {
+                "sensor": {"type": "string", "minLength": 1},
+                "mode": {"type": "string", "minLength": 1},
+                "fps": {"type": "number", "exclusiveMinimum": 0}
+              }
+            }
+          ]
+        },
+        "ser": {"type": "string"},
+        "des_window": {"$ref": "#/$defs/int"},
+        "csi_vc": {"$ref": "#/$defs/int"},
+        "ser_addr": {"$ref": "#/$defs/int"},
+        "sensor_addr": {"$ref": "#/$defs/int"},
+        "tca_addr": {"$ref": "#/$defs/int"},
+        "capture_id": {"anyOf": [{"$ref": "#/$defs/int"}, {"type": "null"}]},
+        "inck_hz": {"anyOf": [{"$ref": "#/$defs/int"}, {"type": "null"}]},
+        "unit": {"$ref": "#/$defs/port_unit"}
+      }
+    },
+    "camera": {
+      "type": "object",
+      "additionalProperties": false,
+      "minProperties": 1,
+      "properties": {
+        "mode": {
+          "type": "string",
+          "minLength": 1,
+          "description": "A descriptor mode name or WxH geometry, with an optional @fps (2064x1552@25)."
+        },
+        "sync": {"enum": ["free_run", "fsync"]},
+        "sensor": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The port's default sensor compatible for links that name none."
+        },
+        "exposure_us": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Under frame sync, the integration time in microseconds: the generator runs a multiple of the frame rate and the sensors take every n-th pulse, so the exposure lands on the nearest step."
+        }
+      }
+    },
+    "port": {
+      "type": "object",
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {"required": ["camera"],
+                 "anyOf": [{"not": {"required": ["links"]}},
+                           {"properties": {"links": {"maxProperties": 0}}}]},
+          "then": {"required": ["hub"]}
+        },
+        {
+          "if": {"required": ["hub"]},
+          "else": {
+            "properties": {"links": {"maxProperties": 1, "additionalProperties": {
+              "propertyNames": {"not": {"enum": ["ser", "des_window", "ser_addr", "tca_addr"]}},
+              "properties": {"csi_vc": {"enum": [0, "0", "0x0"]},
+                             "unit": {"if": {"type": "object"}, "then": {"not": {"required": ["alias"]}}}}}}}
+          }
+        }
+      ],
+      "properties": {
+        "bus": {"type": "string"},
+        "hub": {"$ref": "#/$defs/hub"},
+        "csi_lanes": {
+          "anyOf": [
+            {"type": "integer", "minimum": 1, "maximum": 4},
+            {"type": "string", "pattern": "^[1-4]$"}
+          ]
+        },
+        "sync": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "source": {"enum": ["free_run", "fsync"]},
+            "fps": {"type": "number"}
+          }
+        },
+        "links": {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/$defs/port_link"}
+        },
+        "camera": {"$ref": "#/$defs/camera"}
+      }
+    }
+  }
+}

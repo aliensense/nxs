@@ -47,7 +47,7 @@ class NxsRegisters:
         WHO_AM_I = 0
         STATUS = 1  # bits: SAMPLE_READY / ERROR / RUNNING.
         VM_STATE = 2  # VmState enum.
-        ERROR_CODE = 3  # VM error code synced from `vm_status`: 0 when the VM is healthy, otherwise the positive errno of the most recent VM fault (e.g. a probe/measure I/O error). Host command and DFU results report in `CMD_ERROR` instead.
+        ERROR_CODE = 3  # VM error byte synced from `vm_status`: 0 when the VM is healthy, otherwise the operand of the `OP_ERROR` that faulted (`constants/op_error.yaml` names the compiler-emitted values; a driver may raise its own). Every other VM fault leaves it 0 and reports through `VM_STATE`. Host command and DFU results report in `CMD_ERROR` instead.
         SAMPLE_COUNT_LO = 4
         SAMPLE_COUNT_HI = 5
         SAMPLE_SIZE = 6
@@ -63,21 +63,21 @@ class NxsRegisters:
         CMD = 16  # Single-byte Cmd dispatch. Bit 0x80 is the optional doorbell — host may write `(opcode | 0x80)` to disambiguate `Cmd::LOAD` (opcode 0) from "no command pending". Firmware masks the high bit before dispatch.
         PROGRAM_SIZE_LO = 17  # Bytecode image size, LE low byte. A 2-byte announce opens the upload session: it requires `XFER_TYPE = 0` and no live session, arms `CMD_ERR_PENDING`, and resolves 0 (session open) or EBUSY / EPROTO / EFBIG — the host reads that edge before streaming a single chunk.
         PROGRAM_SIZE_HI = 18
-        PARAM_SELECT = 19  # Chooses which param descriptor is exposed.
-        PARAM_SET_VALUE = 20  # 4 bytes (u32 LE).
-        STORE_SELECT = 24  # Slot for SAVE / DELETE. Under `XFER_TYPE = CALIB` it doubles as the read-back page index: the `PROGRAM_DATA` window then serves calibration-record bytes [page*32 .. page*32+31] of the live record.
+        PARAM_SELECT = 19  # Chooses which param descriptor is exposed. Under the peek view of a camera slot it selects the run parameter `PARAM_SET_VALUE` stages, and the view stays.
+        PARAM_SET_VALUE = 20  # 4 bytes (u32 LE): sets the selected parameter of the loaded driver. Under the peek view of a camera slot (`Cmd::PEEK_SLOT` on it, `DRIVER_SELECT` echoing `DRIVER_VIEW_PEEK`) it stages the value for that slot's next `Cmd::CAM_RUN` instead: nothing is patched, the stage holds one value per parameter (`MAX_PARAMS` entries), and reading the window returns the staged value, else the value the slot's last completed run ended with, else the slot's compiled default. The stage is dropped when a different slot is peeked and consumed by the run.
+        STORE_SELECT = 24  # Slot for SAVE / DELETE. Under `XFER_TYPE = CALIB` it doubles as the read-back page index: the `PROGRAM_DATA` window then serves calibration-record bytes [page*32 .. page*32+31] of the live record. Under `XFER_TYPE = PERSONALITY_INFO` it is `slot << 5 | page` of the descriptor trailer served (under `PERSONALITY_INFO_HI` the same select names page 32 + page), and the write is async like a command: `CMD_ERROR` reads `CMD_ERR_PENDING` until the page is staged, then 0, ENOENT (empty slot), ENOEXEC (a driver slot), or ENODEV (no camera backend). For `Cmd::CAM_RUN` it is the slot to run.
         PROTO_VERSION = 25  # Read-only. Version of the register-map contract (currently `PROTO_VERSION_VALUE`).
-        XFER_TYPE = 26  # Selects the consumer of `PROGRAM_DATA` writes: 0 = VM bytecode (default; NXS upload), 1 = DFU image bytes (forwarded to the DFU sink), 2 = config record (identity commissioning; `PROGRAM_DATA` carries a `CONFIG_RECORD_SIZE`-byte record and `Cmd::STORE_PERSIST` commits it), 3 = time-sync record (a `TIME_SYNC_RECORD_SIZE`-byte volatile record applied as its 20th byte lands; never persisted), 4 = calibration record (`Calibration.RECORD_SIZE` bytes staged in 32-byte chunks, applied by `Cmd::CALIB_APPLY`), 5 = build identity (read-only `git describe` string, `BUILD_INFO_SIZE` bytes). The `_regs[PROGRAM_DATA..]` window mirrors the current record for read-back in modes 2 and 3; modes 4 and 5 serve their record through the same window page-by-page via `STORE_SELECT`. A write during a live transfer session (an open upload or DFU push) is refused silently — the mode does not move, and the writer detects refusal by reading it back; sessions end at their terminator (`Cmd::LOAD`, `DFU_FINISH`), by `Cmd::XFER_ABORT`, or after `XFER_SESSION_STALE_MS` of holder silence.
-        XFER_PHASE = 27  # Read-only transfer phase. During a DFU it is a `DfuPhase` the master polls to pace `DFU_BEGIN`'s erase and detect a rejected write (detail in `CMD_ERROR`). While an on-device calibration procedure runs (started by `Cmd::CAL_GYRO`/`CAL_MAG_START`) it is the `Calibration.CalState` (0 idle, 1 gyro-wait-still, 2 gyro-averaging, 3 mag-collect); the procedure completes when it returns to idle, its verdict in `CMD_ERROR`. DFU and calibration never run at once — a procedure claims the transfer session when its start command is accepted (`Cmd::CAL_GYRO`/`CAL_MAG_START` and their Cyphal equivalents answer `EBUSY` when a contender holds it) and releases it on the edge back to idle, so the contender's gate refuses the overlap. IDLE when neither is active.
-        XFER_ACK = 28  # Read-only single-byte progress counter, untearable under an I²C poll. During a DFU it is the accepted-chunk counter (mod 256): 0 after `DFU_BEGIN`, +1 per committed `PROGRAM_DATA` chunk; the master paces its push on it. While a calibration procedure runs it is the detail: gyro percent averaged, or mag rotation coverage on a 0-14 scale, where 12 is the stopping point at which a host asks the solve (which can still answer EAGAIN and keep the collection open).
-        CMD_ERROR = 29  # Read-only result of the most recent host command op: 0 = OK, otherwise the positive errno value. Owned by the command-dispatch path and, while it holds the transfer session, a completing calibration procedure — the `vm_status` heartbeat never writes it, the DFU data path never zeroes it, and a bystander's refused `XFER_TYPE` write is silent — so a pending result cannot be clobbered — with one narrow exception: a command *refused* EBUSY under a held calibration session latches here, and the procedure's verdict landing in the same ~100 ms comm pass overwrites it, reading as the procedure's outcome rather than the refusal (and `ERROR_CODE` stays with VM health). The async ops — `LOAD`, store SAVE / DELETE_SLOT / CLEAR_STORE / STORE_PERSIST / PEEK_SLOT, `DFU_BEGIN`, `XFER_ABORT`, and a `PROGRAM_SIZE` announce — read `CMD_ERR_PENDING` from enqueue until the deferred handler resolves them; a host polls its own edge. Refusals resolve here too: EBUSY (a transfer session is live), EPROTO (wrong mode for the op), EFBIG (announce exceeds staging), ENODATA (`LOAD` on a short stage), ENOEXEC (`LOAD` parse failure), EAGAIN (the command queue was full and the op was dropped before dispatch — retry).
+        XFER_TYPE = 26  # Selects the consumer of `PROGRAM_DATA` writes: 0 = VM bytecode (default; NXS upload), 1 = DFU image bytes (forwarded to the DFU sink), 2 = config record (identity commissioning; `PROGRAM_DATA` carries a `CONFIG_RECORD_SIZE`-byte record and `Cmd::STORE_PERSIST` commits it), 3 = time-sync record (a `TIME_SYNC_RECORD_SIZE`-byte volatile record applied as its 20th byte lands; never persisted), 4 = calibration record (`Calibration.RECORD_SIZE` bytes staged in 32-byte chunks, applied by `Cmd::CALIB_APPLY`), 5 = build identity (read-only `git describe` string, `BUILD_INFO_SIZE` bytes), 6 = personality info (read-only: the descriptor trailer of the camera personality in slot `STORE_SELECT >> 5`, page `STORE_SELECT & 0x1F`, 32 bytes per page), 7 = personality info, second bank (the same select names page 32 + `STORE_SELECT & 0x1F`; the two banks cover a `MAX_TRAILER_SIZE` trailer). The `_regs[PROGRAM_DATA..]` window mirrors the current record for read-back in modes 2 and 3; modes 4 to 7 serve their record through the same window page-by-page via `STORE_SELECT`. A write during a live transfer session (an open upload or DFU push) is refused silently — the mode does not move, and the writer detects refusal by reading it back; sessions end at their terminator (`Cmd::LOAD`, `DFU_FINISH`), by `Cmd::XFER_ABORT`, or after `XFER_SESSION_STALE_MS` of holder silence.
+        XFER_PHASE = 27  # Read-only transfer phase. During a DFU it is a `DfuPhase` the master polls to pace `DFU_BEGIN`'s erase and detect a rejected write (detail in `CMD_ERROR`). While an on-device calibration procedure runs (started by `Cmd::CAL_GYRO`/`CAL_MAG_START`) it is the `Calibration.CalState` (0 idle, 1 gyro-wait-still, 2 gyro-averaging, 3 mag-collect); the procedure completes when it returns to idle, its verdict in `CMD_ERROR`. DFU and calibration never run at once — a procedure claims the transfer session when its start command is accepted (`Cmd::CAL_GYRO`/`CAL_MAG_START` and their Cyphal equivalents answer `EBUSY` when a contender holds it) and releases it on the edge back to idle, so the contender's gate refuses the overlap. While a camera run is live (`Cmd::CAM_RUN` claims the session the same way) it mirrors `CAM_STATE`: the `Personality.CamRunState` LOADING, PROBING, CONFIGURING, then the terminal DONE / PROBE_FAILED / FAULTED / ABORTED, on whose edge the session releases with the verdict in `CMD_ERROR`. IDLE when nothing is active.
+        XFER_ACK = 28  # Read-only single-byte progress counter, untearable under an I²C poll. During a DFU it is the accepted-chunk counter (mod 256): 0 after `DFU_BEGIN`, +1 per committed `PROGRAM_DATA` chunk; the master paces its push on it. While a calibration procedure runs it is the detail: gyro percent averaged, or mag rotation coverage on a 0-14 scale, where 12 is the stopping point at which a host asks the solve (which can still answer EAGAIN and keep the collection open). While a camera run is live it is the low byte of the camera VM's program counter.
+        CMD_ERROR = 29  # Read-only result of the most recent host command op: 0 = OK, otherwise the positive errno value. Owned by the command-dispatch path and, while it holds the transfer session, a completing calibration procedure — the `vm_status` heartbeat never writes it, the DFU data path never zeroes it, and a bystander's refused `XFER_TYPE` write is silent — so a pending result cannot be clobbered — with one narrow exception: a command *refused* EBUSY under a held calibration session latches here, and the procedure's verdict landing in the same ~100 ms comm pass overwrites it, reading as the procedure's outcome rather than the refusal (and `ERROR_CODE` stays with VM health). The async ops — `LOAD`, store SAVE / DELETE_SLOT / CLEAR_STORE / STORE_PERSIST / PEEK_SLOT, `DFU_BEGIN`, `XFER_ABORT`, the camera ops `CAM_RUN` / `CAM_ABORT`, a `STORE_SELECT` write under `XFER_TYPE = PERSONALITY_INFO`, and a `PROGRAM_SIZE` announce — read `CMD_ERR_PENDING` from enqueue until the deferred handler resolves them; a host polls its own edge. Refusals resolve here too: EBUSY (a transfer session is live), EPROTO (wrong mode for the op), EFBIG (announce exceeds staging), ENODATA (`LOAD` on a short stage), ENOEXEC (`LOAD` parse failure), EAGAIN (the command queue was full and the op was dropped before dispatch — retry).
         DESCRIPTOR_EPOCH = 30  # Read-only descriptor-set generation: 0 until the first driver load, then 1..255 (wrapping past 0), bumped on every driver (re)load. A host caches descriptors against this and re-reads when it changes.
         OUTPUT_SELECT = 31  # Writable. Chooses which output descriptor the SEL window exposes — and switches the window to the output view.
         PROGRAM_DATA = 32  # 32-byte incoming-bytecode window.
-        SAMPLE_DATA = 64  # 128-byte latest-sample record window (0x40..0xBF): `latch_time_us u64 | timestamp_us u64 | seq u16 | data[SAMPLE_SIZE]`, all little-endian (offsets `SAMPLE_RECORD_*`). One latched read returns a coherent record; `latch_time_us` is stamped by the I²C target at first byte, so every poll doubles as a two-way time-sync observation.
+        SAMPLE_DATA = 64  # 128-byte latest-sample record window (0x40..0xBF): `latch_time_us u64 | timestamp_us u64 | seq u16 | data[SAMPLE_SIZE]`, all little-endian (offsets `SAMPLE_RECORD_*`). One latched read returns a coherent record; `latch_time_us` is stamped by the I²C target at first byte, so every poll doubles as a two-way time-sync observation. A 2-byte cursor (u16 LE) written after the register pointer, in the transaction that then reads, serves a burst of queued records instead (`SAMPLE_BURST_*`): the records from that FIFO index on, everything before it released.
         SEL_NAME_LEN = 192
         SEL_NAME = 193  # 16 bytes. Driver view: the loaded driver's name.
-        SEL_TYPE = 209  # Param view: bits[3:0] param_type (0 = enum, 1 = range), bit[4] ParamKind (0 = reload, 1 = live). Output view: NXS field_type code.
+        SEL_TYPE = 209  # Param view: bits[3:0] param_type (0 = enum, 1 = range), bit[4] ParamKind (0 = reload, 1 = live). Output view: NXS field_type code. Peek view: the slot's `NxsDriverImage.ImageKind` (0 driver, 1 camera).
         SEL_PARAM_DEFAULT = 210  # Param view: 4 bytes (u32 LE).
         SEL_DRIVER_NUM_PARAMS = 211  # Driver/peek view: declared parameter count.
         SEL_DRIVER_NUM_OUTPUTS = 212  # Driver/peek view: declared output count.
@@ -90,15 +90,17 @@ class NxsRegisters:
         SEL_OUTPUT_BYTE_ORDER = 218  # Output view: sample-data endianness: 0 = big, 1 = little.
         SEL_UNIT_LEN = 219
         SEL_UNIT = 220  # 8 bytes.
-        SEL_VALUE_INDEX = 228  # Param view, writable: which declared value `SEL_VALUE` exposes (0..num_values-1). Resets to 0 on `PARAM_SELECT`. In the diag view: which `DiagCounter` `SEL_VALUE` exposes; resets to 0 on entering the view.
+        SEL_VALUE_INDEX = 228  # Param view, writable: which declared value `SEL_VALUE` exposes (0..num_values-1). Resets to 0 on `PARAM_SELECT`. In the diag view: which `DiagCounter` `SEL_VALUE` exposes; in the device-parameter view: which `DeviceParam`. Resets to 0 on entering either view.
         SEL_OUTPUT_SEMANTIC = 228  # Output view: semantic category code (0 = generic).
-        SEL_VALUE = 229  # Param view: 4 bytes (u32 LE) — values[SEL_VALUE_INDEX]. Diag view: the selected fault counter, u16 zero-extended to u32 LE. An out-of-range index reads 0 in both views.
+        SEL_VALUE = 229  # Param view: 4 bytes (u32 LE) — values[SEL_VALUE_INDEX]. Diag view: the selected fault counter, u16 zero-extended to u32 LE. Device-parameter view: the selected parameter's value in effect. An out-of-range index reads 0 in every view.
         SEL_OUTPUT_COUNT = 229  # Output view: 2 bytes (u16 LE) — string payload width, 0 for numeric fields.
         SEL_OUTPUT_AT = 231  # Output view: the field's byte position within the sample (gaps are legal).
-        DRIVER_SELECT = 233  # Writable. Writing `DRIVER_VIEW_DIAG` switches the SEL window to the diag view (fault counters via `SEL_VALUE_INDEX`/`SEL_VALUE`, indices in `DiagCounter`); any other write switches to the driver view (name via SEL_NAME_LEN/SEL_NAME). Echoes 1 in the live driver view, `DRIVER_VIEW_PEEK` after Cmd::PEEK_SLOT, and `DRIVER_VIEW_DIAG` in the diag view.
+        DRIVER_SELECT = 233  # Writable. Writing `DRIVER_VIEW_DIAG` switches the SEL window to the diag view (fault counters via `SEL_VALUE_INDEX`/`SEL_VALUE`, indices in `DiagCounter`); writing `DRIVER_VIEW_DEVICE` switches it to the device-parameter view (`SEL_VALUE_INDEX` picks a `DeviceParam`, `PARAM_SET_VALUE` reads and writes its setting, `SEL_VALUE` serves the value in effect); any other write switches to the driver view (name via SEL_NAME_LEN/SEL_NAME). Echoes 1 in the live driver view, `DRIVER_VIEW_PEEK` after Cmd::PEEK_SLOT, `DRIVER_VIEW_DIAG` in the diag view, and `DRIVER_VIEW_DEVICE` in the device-parameter view.
         DECIMATION_SELECT = 234  # Writable per-subject decimation selector: a SubjectBucket value (0..NUM_SUBJECT_BUCKETS-1). Commit is deferred — the host polls until the register echoes the written value; an out-of-range or unbound select echoes `SELECTOR_INACTIVE`. Selecting repaints `DECIMATION_VALUE` with that subject's live factor.
         DECIMATION_VALUE = 235  # 2 bytes (u16 LE), read/write: the selected subject's decimation factor (0 = off, 1 = every device-output sample, N = every Nth), thinning only the Cyphal SI fan-out — the register mirror of `aliensense.nxs.decimation.<subject>`. Both bytes must be written in one transaction. Volatile until `Cmd::STORE_PERSIST` snapshots the live factors.
         CAN_TERM = 237  # RW CAN split-termination selection: 0 = off (the uncommissioned default), 1 = on, 0xFF = revert to the default. A write stages the persisted selection (committed by `Cmd::STORE_PERSIST` / a Cyphal Save) and the comm loop live-applies it on boards with the termination pin; an unsaved change reverts at reboot. Reads mirror the effective state (0 or 1); an out-of-vocabulary write is ignored.
+        CAM_STATE = 238  # Read-only `Personality.CamRunState` of the camera run: IDLE until the first `Cmd::CAM_RUN`, then LOADING, PROBING, CONFIGURING, and a terminal DONE / PROBE_FAILED / FAULTED / ABORTED that stands until the next run. Live single-byte state, untearable under an I²C poll.
+        CAM_ERROR = 239  # Read-only positive errno of the last camera run's terminal state: 0 after DONE, the probe errno after PROBE_FAILED, ETIMEDOUT / EIO after FAULTED, ECANCELED after ABORTED. The same value `CMD_ERROR` carries on the terminal edge; this one stays readable after the session is released.
         SERIAL = 240  # Read-only 12-byte chip UID96 (STM32 unique ID), MSB-first, app-injected. 0 until set.
         FW_VERSION_MAJOR = 252  # Read-only firmware version major, app-injected from the build's VERSION file — the same value Cyphal serves in `GetInfo.software_version`. 0 until seeded.
         FW_VERSION_MINOR = 253  # Read-only firmware version minor. 0xFE is reserved for a future patch byte.
@@ -154,6 +156,8 @@ class NxsRegisters:
             234: 'DECIMATION_SELECT',
             235: 'DECIMATION_VALUE',
             237: 'CAN_TERM',
+            238: 'CAM_STATE',
+            239: 'CAM_ERROR',
             240: 'SERIAL',
             252: 'FW_VERSION_MAJOR',
             253: 'FW_VERSION_MINOR',
@@ -176,14 +180,17 @@ class NxsRegisters:
         REBOOT = 10  # Reboot the device (a pending swap applies on next boot).
         STORE_PERSIST = 11  # Validate the staged identity config (the `CONFIG_RECORD_SIZE`-byte record written to `PROGRAM_DATA` under `XFER_TYPE = CONFIG`) and commit it to NVS, together with the live decimation state and the running calibration record. Refuses EPROTO with no live stage — a host persisting a solve wants `Cmd::CALIB_PERSIST`. Async like SAVE: arms `CMD_ERR_PENDING`, then `CMD_ERROR` reads 0 (committed) or a positive errno (e.g. EINVAL for an out-of-range address). Identity changes take effect at the next reboot.
         IDENTIFY = 12  # Strobe the status LED (~10 s) so an operator can physically locate the unit.
-        PEEK_SLOT = 13  # Peek store[STORE_SELECT] without loading it (STORE_SELECT = 0xFF peeks the active driver). Async like SAVE: arms `CMD_ERR_PENDING`, then `CMD_ERROR` reads 0 (peek view valid) or +errno — ENOENT empty/out-of-range slot, EBADF corrupt image, ENOTSUP foreign image version. On success the SEL window switches to the peek view: name via `SEL_NAME_LEN`/`SEL_NAME`, counts via `SEL_DRIVER_NUM_PARAMS`/`SEL_DRIVER_NUM_OUTPUTS`, `SEL_DRIVER_SLOT` echoes the peeked slot, `SEL_DRIVER_I2C_ADDR` the latched mikroBUS address (0 unless peeking the active driver), and `DRIVER_SELECT` echoes `DRIVER_VIEW_PEEK`. The view is a snapshot — re-issue after store mutations.
-        ENTER_RECOVERY = 14  # Arm the MCUboot serial-recovery flag and cold-reset into it. The device then holds in the bootloader until a host completes an mcumgr image upload — there is no timed window to catch. Dispatched independently of the VM handler, like `REBOOT`, so it works on a device whose driver never loaded. The Cyphal equivalent is the `ENTER_RECOVERY` (0xA008) ExecuteCommand.
+        PEEK_SLOT = 13  # Peek store[STORE_SELECT] without loading it (STORE_SELECT = 0xFF peeks the active driver). Async like SAVE: arms `CMD_ERR_PENDING`, then `CMD_ERROR` reads 0 (peek view valid) or +errno — ENOENT empty/out-of-range slot, EBADF corrupt image, ENOTSUP foreign image version. On success the SEL window switches to the peek view: name via `SEL_NAME_LEN`/`SEL_NAME`, counts via `SEL_DRIVER_NUM_PARAMS`/`SEL_DRIVER_NUM_OUTPUTS`, `SEL_DRIVER_SLOT` echoes the peeked slot, `SEL_TYPE` the image kind (driver or camera), `SEL_DRIVER_I2C_ADDR` the latched mikroBUS address (0 unless peeking the active driver), and `DRIVER_SELECT` echoes `DRIVER_VIEW_PEEK`. The view is a snapshot — re-issue after store mutations. Peeking a camera slot also arms its run-parameter stage (`PARAM_SELECT` / `PARAM_SET_VALUE`); peeking a different slot drops the stage.
+        ENTER_RECOVERY = 14  # Arm the MCUboot serial-recovery flag and cold-reset into it. The device then holds in the bootloader until a host completes an mcumgr image upload — there is no timed window to catch. Arms `CMD_ERR_PENDING`: on success the sentinel stays pending until the reset drops the bus (the NACK is the acknowledgement); a failed flag write leaves the device in the application and resolves it to the positive errno. Dispatched independently of the VM handler, like `REBOOT`, so it works on a device whose driver never loaded. The Cyphal equivalent is the `ENTER_RECOVERY` (0xA008) ExecuteCommand.
         XFER_ABORT = 15  # Deliberately close the open transfer session (bytecode upload or DFU push) and cancel any calibration procedure in progress, whichever transport started it. A cancelled procedure applies nothing; the previous record stays, and the engine's verdict (ECANCELED, visible in the Cyphal progress register) is consumed on this bus by the abort's own acknowledgement. `Cmd::CAL_MAG_STOP` is the other way out of a collection and it solves and applies, so it cannot express a cancel. Arms `CMD_ERR_PENDING`; resolves 0 when something was released, ENOENT when there was nothing to do. The abort path for a host giving up mid-transfer — a crashed host needs nothing: an idle session is reclaimable by the next contender after `XFER_SESSION_STALE_MS`.
         CALIB_APPLY = 16  # Validate the staged calibration record (`Calibration.RECORD_SIZE` bytes written to `PROGRAM_DATA` under `XFER_TYPE = CALIB`) and apply it to the running state; `Cmd::CALIB_PERSIST` persists it. Async like SAVE: arms `CMD_ERR_PENDING`, then `CMD_ERROR` reads 0 (applied), EBUSY while a DFU or a running procedure holds the status registers, or a positive errno (EINVAL for a malformed record).
         CAL_GYRO = 17  # Start the on-device gyro still-average: the device waits for stillness, averages the rates, and applies the bias to the running state (Save persists). `CMD_ERROR` reports acceptance (0; EBUSY during a mag collection or while a transfer session is live; EOPNOTSUPP when the active driver has no gyro vector; ENODEV with no driver); progress reads from `XFER_PHASE`/`XFER_ACK` under `XFER_TYPE = CALIB`, and the completion verdict lands in `CMD_ERROR` when the phase returns to idle.
         CAL_MAG_START = 18  # Start the on-device mag collection: rotate the vehicle while the device accumulates the ellipsoid fit; coverage progress reads from `XFER_ACK` under `XFER_TYPE = CALIB`. `CMD_ERROR` reports acceptance (0; EBUSY during a gyro procedure or while a transfer session is live; EOPNOTSUPP when the active driver has no mag vector; ENODEV with no driver).
         CAL_MAG_STOP = 19  # Close the mag collection: coverage-gate, solve, self-check, and apply on success. `CMD_ERROR` carries the verdict — 0 applied, EAGAIN insufficient coverage/points (the collection stays open and its give-up window restarts), ERANGE degenerate (non-ellipsoid) fit, EBADMSG failed the sphere self-check, EBUSY while a DFU holds the status registers; every failure keeps the previous calibration.
         CALIB_PERSIST = 20  # Commit the running calibration record to NVS, leaving identity untouched — the save a host performs after a solve, when it has no identity record to stage. Snapshots the same live state a full Save does (the calibration bank and the decimation factors), so both save forms persist one consistent set; the Cyphal equivalent is `COMMAND_STORE_PERSISTENT_STATES`. Async like SAVE: arms `CMD_ERR_PENDING`, then `CMD_ERROR` reads 0 (committed), EBUSY while a DFU or a running procedure holds the status registers, ENODEV on a device with no calibration bank, or a positive errno on a validation or write failure.
+        CONFIRM_FW = 21  # Confirm the running firmware image so MCUboot keeps it across the next reset instead of reverting to the previous one. The supervisor's verdict after it has validated the new image end to end; idempotent on an image that is already confirmed. Arms `CMD_ERR_PENDING`, then `CMD_ERROR` reads 0 (confirmed) or the positive errno of a failed trailer write. Dispatched independently of the VM handler, like `REBOOT`. The Cyphal equivalent is the `CONFIRM_FW` (0xA00E) ExecuteCommand.
+        CAM_RUN = 22  # Run the camera personality stored in slot `STORE_SELECT` once on the pod-side bus: a second VM instance loads the slot, runs its probe and configure programs, and halts. The unit is the bus master for the sensor until the run ends; the host stays off the sensor and polls `CAM_STATE`. Claims the transfer session for the run so `XFER_PHASE` mirrors `CAM_STATE` and `XFER_ACK` the program counter's low byte; `CMD_ERROR` carries the verdict on the terminal edge. Values staged for the slot under its peek view are applied to the run's program copy first (the stored image never changes) and consumed; a staged value the parameter does not accept refuses the run with EINVAL. Refused ENOEXEC when the slot holds a driver image, ENOENT when it is empty, EBUSY under another session.
+        CAM_ABORT = 23  # Stop a camera run within 50 ms. Arms `CMD_ERR_PENDING`; resolves 0 when a run was stopped, ENOENT when none was live.
 
         _NAMES = {
             0: 'LOAD',
@@ -207,6 +214,9 @@ class NxsRegisters:
             18: 'CAL_MAG_START',
             19: 'CAL_MAG_STOP',
             20: 'CALIB_PERSIST',
+            21: 'CONFIRM_FW',
+            22: 'CAM_RUN',
+            23: 'CAM_ABORT',
         }
 
     class DfuPhase:
@@ -266,6 +276,22 @@ class NxsRegisters:
             4: 'PROBE_FAILURES',
         }
 
+    class DeviceParam:
+        """
+        Index namespace of the device-parameter view: `SEL_VALUE_INDEX` picks the parameter, `PARAM_SET_VALUE` serves and sets it.
+
+        Entered by writing `DRIVER_VIEW_DEVICE` to `Reg::DRIVER_SELECT`.
+        Device parameters belong to the unit, not to the loaded
+        personality: they survive a personality change, apply live, and
+        `Cmd::STORE_PERSIST` commits them with the rest of the savable
+        config. Each mirrors a Cyphal register of the same meaning.
+        """
+        SAMPLE_FIFO_DEPTH = 0  # Records the sample FIFO retains before it overwrites the oldest: 0..`SAMPLE_FIFO_DEPTH_MAX`, where 0 selects what `SAMPLE_FIFO_CAPACITY` holds at the running sample size and a larger setting is clamped to it. `SEL_VALUE` serves the depth in effect. Cyphal: `aliensense.nxs.sample_fifo.depth`.
+
+        _NAMES = {
+            0: 'SAMPLE_FIFO_DEPTH',
+        }
+
     STATUS_SAMPLE_READY = 1  # `Reg::STATUS` bit: a fresh sample has landed in `Reg::SAMPLE_DATA`.
 
     STATUS_ERROR = 2  # `Reg::STATUS` bit: the VM is in an error state (`Reg::ERROR_CODE` carries the detail).
@@ -291,6 +317,28 @@ class NxsRegisters:
     SAMPLE_RECORD_DATA_OFF = 18  # `Reg::SAMPLE_DATA` record: offset of the sample bytes; `Reg::SAMPLE_SIZE` bytes follow.
 
     SAMPLE_RECORD_DATA_MAX = 110  # Max sample bytes the record window carries (128-byte window minus the 18-byte header); a driver's I²C-readable sample is capped here.
+
+    SAMPLE_BURST_MAX = 256  # Max bytes one burst read of `Reg::SAMPLE_DATA` serves: the header, then whole records.
+
+    SAMPLE_BURST_NEXT_INDEX_OFF = 8  # Burst header: FIFO index (u16 LE, wraps) of the first record served. It differs from the cursor when that record was overwritten or never existed, and the difference is the host's count of lost records.
+
+    SAMPLE_BURST_COUNT_OFF = 10  # Burst header: records in this burst (u8).
+
+    SAMPLE_BURST_RECORD_SIZE_OFF = 11  # Burst header: bytes per record (u8), `SAMPLE_BURST_REC_DATA_OFF` plus the sample size.
+
+    SAMPLE_BURST_PENDING_OFF = 12  # Burst header: records still queued behind this burst (u16 LE).
+
+    SAMPLE_BURST_RECORDS_OFF = 14  # Burst: offset of the first record.
+
+    SAMPLE_BURST_REC_TIMESTAMP_OFF = 0  # Burst record: acquisition `timestamp_us` (u64 LE, device clock).
+
+    SAMPLE_BURST_REC_SEQ_OFF = 8  # Burst record: sample sequence number (u16 LE).
+
+    SAMPLE_BURST_REC_DATA_OFF = 10  # Burst record: offset of the sample bytes.
+
+    SAMPLE_FIFO_CAPACITY = 2048  # Bytes of sample FIFO storage; the record size divides it into the depth ceiling (85 records of a 14-byte IMU sample).
+
+    SAMPLE_FIFO_DEPTH_MAX = 255  # Largest `DeviceParam::SAMPLE_FIFO_DEPTH` setting; a write past it is ignored. The persisted config keeps the setting in one byte.
 
     PROTO_VERSION_VALUE = 1  # Current version of the register-map contract, exposed at `Reg::PROTO_VERSION`.
 
@@ -322,6 +370,10 @@ class NxsRegisters:
 
     BUILD_INFO_SIZE = 64  # Bytes in the build-identity record served through the `PROGRAM_DATA` window under `XFER_TYPE = BUILD_INFO` (two 32-byte pages).
 
+    XFER_TYPE_PERSONALITY_INFO_HI = 7  # `Reg::XFER_TYPE` value: the second page bank of `PERSONALITY_INFO` — `STORE_SELECT`'s five page bits name trailer page 32 + page, so the two banks serve a `MAX_TRAILER_SIZE` trailer.
+
+    XFER_TYPE_PERSONALITY_INFO = 6  # `Reg::XFER_TYPE` value: read-only paged access to the descriptor trailer of the camera personality in slot `STORE_SELECT` — the modes, controls, laws and capture facts the host needs to generate a device tree, never the bytecode.
+
     CONFIG_RECORD_SIZE = 28  # Bytes in the identity-config record exchanged through the `PROGRAM_DATA` window under `XFER_TYPE = CONFIG`.
 
     CMD_DOORBELL_BIT = 128  # CMD doorbell bit — host ORs this into the opcode so firmware distinguishes `Cmd::LOAD` (0) from "no command pending".
@@ -335,6 +387,10 @@ class NxsRegisters:
     DRIVER_VIEW_PEEK = 2  # `DRIVER_SELECT` echo while the SEL window shows a peeked stored slot (the live driver view echoes 1).
 
     DRIVER_VIEW_DIAG = 3  # `DRIVER_SELECT` write/echo value selecting the diag view (fault counters via `SEL_VALUE_INDEX`/`SEL_VALUE`).
+
+    DRIVER_VIEW_DEVICE = 4  # `DRIVER_SELECT` write/echo value selecting the device-parameter view: `SEL_VALUE_INDEX` picks a `DeviceParam`, `PARAM_SET_VALUE` serves and sets its u32 setting, live on write and committed by `Cmd::STORE_PERSIST`; `SEL_VALUE` serves the value in effect.
+
+    DEVICE_PARAM_COUNT = 1  # Number of `DeviceParam` indices the device-parameter view serves.
 
     DIAG_COUNTER_COUNT = 5  # Number of `DiagCounter` indices the diag view serves.
 
@@ -498,6 +554,52 @@ class Calibration:
 
 class CyphalDefaults:
 
+    class NxsCommand:
+        """
+        Vendor-specific uavcan.node.ExecuteCommand codes.
+
+        Application range (below the 65519 standard-reserved line). The
+        firmware-update trigger reuses the stock `COMMAND_BEGIN_SOFTWARE_UPDATE`;
+        the driver pull needs its own code because its post-delivery semantics
+        differ — VM load, no reboot. `ENTER_RECOVERY` is fleet-wide: every board
+        answers it by arming MCUboot serial recovery and rebooting. The host
+        SDK and the firmware both read this table, so a new command moves the
+        contract lock.
+        """
+        LOAD_FROM_FILE = 40960  # Pull an NXS driver via uavcan.file.Read, then load it (no run).
+        RUN = 40961  # Start the loaded driver.
+        STOP = 40962  # Halt the running driver.
+        SAVE = 40963  # Persist the staged driver to a store slot (slot in parameter[0]).
+        DELETE_SLOT = 40964  # Erase a store slot (slot in parameter[0]).
+        CLEAR_STORE = 40965  # Wipe every store slot.
+        CYCLE = 40966  # Advance to the next populated store slot.
+        RESET = 40967  # Unload the driver (distinct from COMMAND_RESTART, which reboots).
+        ENTER_RECOVERY = 40968  # Arm MCUboot serial recovery, then reboot and hold there.
+        IDENTIFY = 40969  # Strobe the status LED (~10 s) to physically locate the unit.
+        CAL_GYRO = 40970  # Start the on-device gyro still-average (result in the progress register).
+        CAL_MAG_START = 40971  # Start the on-device mag collection (rotate the vehicle).
+        CAL_MAG_STOP = 40972  # Close the mag collection: gate + solve + self-check + apply.
+        CAL_ABORT = 40973  # Drop the procedure in progress without solving; the previous calibration stays.
+        CONFIRM_FW = 40974  # Confirm the running image so MCUboot keeps it across the next reset.
+
+        _NAMES = {
+            40960: 'LOAD_FROM_FILE',
+            40961: 'RUN',
+            40962: 'STOP',
+            40963: 'SAVE',
+            40964: 'DELETE_SLOT',
+            40965: 'CLEAR_STORE',
+            40966: 'CYCLE',
+            40967: 'RESET',
+            40968: 'ENTER_RECOVERY',
+            40969: 'IDENTIFY',
+            40970: 'CAL_GYRO',
+            40971: 'CAL_MAG_START',
+            40972: 'CAL_MAG_STOP',
+            40973: 'CAL_ABORT',
+            40974: 'CONFIRM_FW',
+        }
+
     DEFAULT_NODE_ID = 125  # Compiled-default Cyphal node-ID, used when the device has no commissioned address in NVS.
 
     HOST_NODE_ID = 127  # Node-ID the host tooling (nxs / yakut / yukon) claims for its own Cyphal node.
@@ -535,8 +637,6 @@ class NxsDevices:
         Device addresses in a pocket clear of common camera /
         GPIO-expander / serializer / EEPROM I²C addresses. One address per
         board, used on every host link (I²C target and frame address).
-        Convert via `static_cast<DeviceAddress>(RBDevice::NXS)` for frame
-        fields.
         """
         NXS = 48
         COMPUTE = 49
@@ -630,11 +730,98 @@ class NxsDriverImage:
             1: 'CRC8',
         }
 
-    NXS_MAJOR = 1  # NXS format major version (incompatible-change counter).
+    class ImageKind:
+        """
+        What a personality image is for; the header byte after the required minor.
 
-    NXS_MINOR = 0  # NXS format minor version (highest backward-compatible minor firmware implements).
+        `DRIVER` runs on the sensor VM against the mikroBUS bus and measures.
+        `CAMERA` runs once, under the host's token, on a second VM instance
+        bound to the pod-side bus: probe is the alive check, configure is the
+        init program plus the mode and trigger blocks selected by the enum
+        params, and there is no measure loop. The runner never auto-loads a
+        CAMERA slot and skips it when advancing past a probe failure.
+        `HUB` is a CAMERA-shaped program for a device on the host's own bus
+        (a deserializer, a serializer behind its window): the host executor
+        runs it, one phase per run selected by its params, and a unit refuses
+        it at upload.
+        """
+        DRIVER = 0
+        CAMERA = 1
+        HUB = 2
+
+        _NAMES = {
+            0: 'DRIVER',
+            1: 'CAMERA',
+            2: 'HUB',
+        }
+
+    class TrailerRecord:
+        """
+        Record types of the descriptor trailer that follows the bus profiles.
+
+        The trailer is host-owned data the firmware stores opaquely and
+        serves back through `XFER_TYPE = PERSONALITY_INFO`: a count byte,
+        then records of `type u8, len u16, bytes`. Unknown types are kept
+        and skipped. `IDENTITY` names the part and its bus profile, `MODES`
+        carries the index of the `mode` param and each mode's value,
+        `TRIGGERS` the same for the `trigger` param, `PROGRAM` the family's
+        program settings, `SHIPPED` the fps range, line length and trigger
+        frame a mode ships per camera count and lane count (a tool that predates it
+        skips the record and offers no mode), `STATUS` the status probes a
+        host reads back from the sensor (register, format, decode table),
+        `RUN_PARAMS` the run parameters a host stages in physical units
+        (index, range, default, name, unit);
+        `INSTANCE_CAL` is reserved for per-pod calibration;
+        `VENDOR_BASE`..`VENDOR_BASE + 15` are never interpreted. A new record
+        type, or a field retired from a record, moves the format's minor.
+        """
+        MODES = 1
+        CONTROLS = 2
+        LAWS = 3
+        CAPTURE = 4
+        INSTANCE_CAL = 5
+        IDENTITY = 6
+        PROGRAM = 7
+        TRIGGERS = 8
+        SHIPPED = 9
+        STATUS = 10
+        RUN_PARAMS = 11
+        VENDOR_BASE = 224
+
+        _NAMES = {
+            1: 'MODES',
+            2: 'CONTROLS',
+            3: 'LAWS',
+            4: 'CAPTURE',
+            5: 'INSTANCE_CAL',
+            6: 'IDENTITY',
+            7: 'PROGRAM',
+            8: 'TRIGGERS',
+            9: 'SHIPPED',
+            10: 'STATUS',
+            11: 'RUN_PARAMS',
+            224: 'VENDOR_BASE',
+        }
+
+    IMAGE_FLAG_SEALED = 1  # Header flag bit; the bytecode section is AES-128-CTR sealed with the firmware's key and preceded by a `SEAL_NONCE_SIZE`-byte nonce.
+
+    IMAGE_FLAG_AUTO = 2  # Header flag bit reserved for a camera personality that configures its sensor at power-on without a host token; not implemented.
+
+    MAX_TRAILER_SIZE = 2048  # Max bytes of the descriptor trailer (count byte included); sixty-four 32-byte info pages over the two banks of `XFER_TYPE_PERSONALITY_INFO`.
+
+    SEAL_NONCE_SIZE = 16  # Bytes of the CTR nonce stored before a sealed bytecode section.
+
+    POLL_FLAG_NE = 1  # `OP_POLL_REG` flags bit: wait until the masked value differs from the operand.
+
+    POLL_FLAG_SOFT = 2  # `OP_POLL_REG` flags bit: a timeout raises the run's soft-miss flag and continues instead of faulting.
+
+    NXS_MAJOR = 2  # NXS format major version (incompatible-change counter).
+
+    NXS_MINOR = 3  # NXS format minor version (highest backward-compatible minor firmware implements).
 
     VM_MAX_PROGRAM_SIZE = 4096  # Max bytecode bytes one driver program may carry.
+
+    VM_HOST_PROGRAM_SIZE = 16384  # Max bytecode bytes a hub image may carry.
 
     MAX_DRIVER_IMAGE_SIZE = 6144  # Max serialized `.nxs` image size (header + metadata + bytecode).
 
@@ -752,8 +939,8 @@ class FieldSemantics:
         The vector and named-scalar spine quantities get a dedicated bucket
         each; the long tail of single-value SI quantities shares SCALAR,
         whose slot is the scalar-kind index (semantic − SCALAR_SEM_FIRST).
-        Indexes the device-wide per-subject decimation array (CommThread,
-        ConfigStore) — append only, never renumber.
+        Indexes the device-wide per-subject decimation array. Append only,
+        never renumber.
         """
         NONE = 0  # No standard subject: GENERIC, non-SI, and the geodetic group
         ACCELERATION = 1
@@ -922,6 +1109,84 @@ class GpsTime:
 
     GPS_WEEK_S = 604800  # Seconds per GPS week (iTOW rolls over at this bound).
 
+class NxsMcuboot:
+
+    IMAGE_MAGIC = 2532554813  # First word of an MCUboot image header.
+
+    TLV_INFO_MAGIC = 26887  # Magic of the unprotected TLV info word after the image.
+
+    IMAGE_HEADER_SIZE = 32  # Fixed MCUboot image-header length, in bytes.
+
+    TLV_INFO_SIZE = 4  # Length of the TLV info word (magic u16, total u16).
+
+    UPDATE_IMAGE_MAX_SIZE = 221184  # Largest update image the bootloader will swap in, in bytes.
+
+class OpErrors:
+
+    class OpErrorCode:
+        """
+        `OP_ERROR` operand values the compiler emits — the byte `ERROR_CODE` carries.
+
+        A faulting `OP_ERROR` stores its operand in the VM's error byte,
+        which `ERROR_CODE` mirrors. The compiler emits these four; a
+        driver may raise any other value as its own code. The firmware
+        maps `TIMEOUT` and `MISMATCH` to the `VmErr` return codes of the
+        same name so they log as `VM_TIMEOUT` / `VM_MISMATCH` instead of
+        `VM_USER_ERROR`. Every other VM fault leaves the byte 0, so
+        `VM_STATE` = 2 with `ERROR_CODE` = 0 is a fault the register map
+        cannot classify (`VM_IO_ERRORS` counts the I/O ones).
+        """
+        TIMEOUT = 17  # `read_until`/`read_n` exceeded `timeout_ms`.
+        MISMATCH = 18  # `expect()` byte mismatch.
+        WHO_AM_I_MISMATCH = 192  # The WHO_AM_I prologue read matches none of the declared values.
+        COMPANION_MISMATCH = 193  # The same check failed on a companion die (`I2C_COMPANIONS`).
+
+        _NAMES = {
+            17: 'TIMEOUT',
+            18: 'MISMATCH',
+            192: 'WHO_AM_I_MISMATCH',
+            193: 'COMPANION_MISMATCH',
+        }
+
+class Personality:
+
+    class CamRunState:
+        """
+        State of the camera run reported in `Reg::CAM_STATE` and mirrored into `XFER_PHASE` while the run holds the session.
+
+        A run is one pass of the personality's probe and configure programs
+        on the second VM instance. IDLE before the first run; a terminal
+        state stands until the next `CAM_RUN`. Terminal states carry the
+        verdict in `CMD_ERROR` and `CAM_ERROR`: DONE 0, PROBE_FAILED the
+        probe errno, FAULTED the VM fault errno (ETIMEDOUT for a hard poll,
+        EIO for a register op past its retries), ABORTED ECANCELED.
+        """
+        IDLE = 0
+        LOADING = 1
+        PROBING = 2
+        CONFIGURING = 3
+        DONE = 4
+        PROBE_FAILED = 5
+        FAULTED = 6
+        ABORTED = 7
+
+        _NAMES = {
+            0: 'IDLE',
+            1: 'LOADING',
+            2: 'PROBING',
+            3: 'CONFIGURING',
+            4: 'DONE',
+            5: 'PROBE_FAILED',
+            6: 'FAULTED',
+            7: 'ABORTED',
+        }
+
+    CAM_REG_RETRIES = 5  # Register-op retries of the camera VM instance before a fault; matches the host engine's write ladder.
+
+    CAM_REG_RETRY_DELAY_MS = 50  # Delay between camera register-op retries.
+
+    CAM_ABORT_LATENCY_MS = 50  # Upper bound on the time from `Cmd::CAM_ABORT` to the ABORTED state.
+
 class RunnerStates:
 
     class RunnerState:
@@ -943,4 +1208,83 @@ class RunnerStates:
             2: 'PROBING',
             3: 'MEASURING',
             5: 'PROBE_FAILED',
+        }
+
+class VmErrs:
+
+    class VmErr:
+        """
+        Negative return codes of the VM operations and the runner that wraps them.
+
+        `step()` runtime failures (`INVALID_OPCODE`, `PC_OUT_OF_RANGE`,
+        `REG_OUT_OF_RANGE`, `IO_ERROR`, `USER_ERROR`, `UART_ERROR`,
+        `DRDY_TIMEOUT`, `ADC_ERROR`, `TIMEOUT`, `MISMATCH`, `POLL_TIMEOUT`,
+        `PARAM_OUT_OF_RANGE`, `DIV_BY_ZERO`, `NO_STORAGE`) transition
+        the VM to `VmState::ERROR` before returning. `step()` precondition
+        failures (`NOT_RUNNING` — called while idle) do not touch state;
+        they signal "this call wasn't legal in the current state" rather
+        than "execution went wrong." `PROGRAM_TOO_LARGE` is returned by
+        `load_program()` when the image exceeds `VM_MAX_PROGRAM_SIZE`.
+
+        These are return values, promoted to log names by `vm_err_str()`;
+        they never reach the wire (`ERROR_CODE` carries the `OP_ERROR`
+        operand).
+        """
+        INVALID_OPCODE = -400
+        PC_OUT_OF_RANGE = -401
+        REG_OUT_OF_RANGE = -402
+        PROGRAM_TOO_LARGE = -403
+        NOT_RUNNING = -404
+        IO_ERROR = -405
+        USER_ERROR = -406
+        UART_ERROR = -407
+        DRDY_TIMEOUT = -408
+        ADC_ERROR = -409  # `OP_ADC_READ`: `AnalogInI::read` failed.
+        TIMEOUT = -417  # `read_until`/`read_n` exceeded `timeout_ms`.
+        MISMATCH = -418  # `TracedSlice.expect()` byte mismatch.
+        SAMPLE_WATCHDOG = -419  # No new sample within 2 × expected period.
+        RUNAWAY_LOOP = -420  # `VM_MAX_STEPS_PER_YIELD` instructions without a scheduling point.
+        POLL_TIMEOUT = -421  # `OP_POLL_REG` without the soft flag: the masked value never matched within `timeout_ms`.
+        PARAM_OUT_OF_RANGE = -422  # `OP_PARAM_LOAD` / `OP_PARAM_STORE` index past `MAX_PARAMS`.
+        DIV_BY_ZERO = -423  # `OP_DIVU_REG` with a zero divisor.
+        NO_STORAGE = -424  # A sample-commit or 64-bit work opcode on an instance built without the sample ring or the work buffer.
+
+        _NAMES = {
+            -400: 'INVALID_OPCODE',
+            -401: 'PC_OUT_OF_RANGE',
+            -402: 'REG_OUT_OF_RANGE',
+            -403: 'PROGRAM_TOO_LARGE',
+            -404: 'NOT_RUNNING',
+            -405: 'IO_ERROR',
+            -406: 'USER_ERROR',
+            -407: 'UART_ERROR',
+            -408: 'DRDY_TIMEOUT',
+            -409: 'ADC_ERROR',
+            -417: 'TIMEOUT',
+            -418: 'MISMATCH',
+            -419: 'SAMPLE_WATCHDOG',
+            -420: 'RUNAWAY_LOOP',
+            -421: 'POLL_TIMEOUT',
+            -422: 'PARAM_OUT_OF_RANGE',
+            -423: 'DIV_BY_ZERO',
+            -424: 'NO_STORAGE',
+        }
+
+class VmStates:
+
+    class VmState:
+        """
+        VM lifecycle state, served raw in the `VM_STATE` register.
+
+        `RUNNING` while a driver executes; a `step()` runtime failure
+        (see `VmErr`) moves the VM to `ERROR`; `IDLE` otherwise.
+        """
+        IDLE = 0
+        RUNNING = 1
+        ERROR = 2
+
+        _NAMES = {
+            0: 'IDLE',
+            1: 'RUNNING',
+            2: 'ERROR',
         }

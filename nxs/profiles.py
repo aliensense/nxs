@@ -1,39 +1,7 @@
-"""
-Declarative register-bus communication profiles for the NXS VM.
-
-A register-addressed sensor's wire protocol varies along a small set of
-orthogonal switches: how the address is framed, the R/W bit polarity,
-dummy bytes, auto-increment behaviour, clock, CRC. A driver declares one
-profile per bus it supports; the compiler bakes every profile into the
-image and the firmware applies the active one — selected by the runtime
-``bus`` param — to the bus device before ``probe()`` runs. Switching bus
-is a reload, never a recompile.
-
-A profile is the *bus interface* section of the datasheet rendered as
-data: no vendor names, just the switches. Omitted switches fall back to
-the conventional defaults (a standard InvenSense/ST-style register bus,
-identical to the firmware's built-in behaviour), so a typical part
-declares nothing and an exotic part lists only its deviations.
-
-Switch axes (one per bus-profile switch):
-
-    SPI: addr_bytes (S1), rw_read_level (S2), dummy_bytes (S3),
-         mode (S4), bit_order (S5), max_hz (S6), auto_inc (S8)
-    I2C: auto_inc (I4), pec (I6), max_hz (I8)
-
-The register opcode operand is a uniform 16-bit register address, so an
-8-bit-addressed part just uses values below 256. Framing a register
-address wider than 8 bits on the wire is a separate device-side concern
-that is not yet implemented — the bus devices reject a register above
-0xFF — so only 8-bit register addresses are supported end to end today.
-
-Example — NXP FXOS8700CQ: 2-byte SPI address framing with the R/W bit
-cleared for a read, standard over I²C:
-
-    SPI_PROFILE = SpiProfile(addr_bytes=2, rw_read_level=0, max_hz=1_000_000)
-    I2C_PROFILE = I2cProfile(max_hz=400_000)
-    BUS = 'spi'
-"""
+"""Register-bus communication profiles: one per bus a driver supports, baked
+into the image, applied by the firmware per the runtime ``bus`` param. Omitted
+switches take the conventional defaults: 8-bit register addresses and 8-bit
+values; an I²C profile widens both for CCI-style parts."""
 
 from __future__ import annotations
 
@@ -43,13 +11,9 @@ from typing import Optional
 
 @dataclass
 class SpiProfile:
-    """SPI register-access switch set.
-
-    Defaults describe the conventional InvenSense/ST register bus: a
-    single address byte with the R/W bit in bit 7 (set for a read), no
-    dummy bytes, SPI mode 0, MSB-first, implicit auto-increment. This is
-    byte-for-byte what the firmware does when no profile is declared.
-    """
+    """SPI register-access switch set. Defaults: one address byte with the R/W
+    bit in bit 7 (set for a read), no dummy bytes, mode 0, MSB-first, implicit
+    auto-increment; identical to the firmware's behaviour with no profile."""
 
     max_hz: Optional[int] = None     # S6: clock ceiling in Hz; None = DTS default
     mode: int = 0                    # S4: CPOL/CPHA combined, 0..3
@@ -89,18 +53,19 @@ class SpiProfile:
 
 @dataclass
 class I2cProfile:
-    """I²C register-access switch set.
-
-    Defaults describe the conventional 8-bit-sub-address register bus
-    with implicit auto-increment and no packet error checking — what the
-    firmware does when no profile is declared. ``auto_inc='msb'`` covers
-    ST LIS/LSM parts that require the sub-address MSB set to read
-    multiple bytes; ``pec='crc8'`` covers SMBus PEC parts (Melexis).
-    """
+    """I²C register-access switch set. Defaults: 8-bit sub-address, 8-bit
+    values, implicit auto-increment, no PEC. ``auto_inc='msb'`` sets the
+    sub-address MSB for a multi-byte read (ST LIS/LSM); ``pec='crc8'`` is
+    SMBus PEC. ``addr_bytes=2`` frames a 16-bit register map (CCI) and lifts
+    the compiler's 8-bit register cap; ``data_width`` and ``byte_order`` frame
+    the value a register holds."""
 
     max_hz: Optional[int] = None     # I8: clock ceiling in Hz; None = DTS default
     auto_inc: str = 'implicit'       # I4: 'implicit' | 'msb' | 'none'
     pec: str = 'none'                # I6: 'none' | 'crc8' (SMBus PEC)
+    addr_bytes: int = 1              # I1: register-address bytes on the wire, 1 | 2
+    data_width: int = 1              # I2: value bytes per register, 1 | 2 | 4
+    byte_order: str = 'big'          # I3: 'big' | 'little' for multi-byte values
 
     def __post_init__(self):
         if self.auto_inc not in ('implicit', 'msb', 'none'):
@@ -110,30 +75,19 @@ class I2cProfile:
         if self.pec not in ('none', 'crc8'):
             raise ValueError(
                 f"I2cProfile.pec must be 'none' or 'crc8', got {self.pec!r}")
-
-
-@dataclass
-class UartProfile:
-    """UART framing for stream sensors.
-
-    The byte-stream analogue of the register profiles: the same uniform
-    Communication Profile layer, expressed as line framing. Defaults are
-    8N1 at 38400 baud.
-    """
-
-    baud: Optional[int] = 38400      # peripheral baud; None = DTS current-speed
-    parity: int = 0                  # 0 = none, 1 = even, 2 = odd
-    stop_bits: int = 1               # 1 or 2
-    data_bits: int = 8               # 7 or 8
-
-    def __post_init__(self):
-        if self.parity not in (0, 1, 2):
+        if self.addr_bytes not in (1, 2):
             raise ValueError(
-                f"UartProfile.parity must be 0 (none), 1 (even) or 2 (odd), "
-                f"got {self.parity}")
-        if self.stop_bits not in (1, 2):
+                f"I2cProfile.addr_bytes must be 1 or 2, got {self.addr_bytes}")
+        if self.data_width not in (1, 2, 4):
             raise ValueError(
-                f"UartProfile.stop_bits must be 1 or 2, got {self.stop_bits}")
-        if self.data_bits not in (7, 8):
+                f"I2cProfile.data_width must be 1, 2 or 4, got {self.data_width}")
+        if self.byte_order not in ('big', 'little'):
             raise ValueError(
-                f"UartProfile.data_bits must be 7 or 8, got {self.data_bits}")
+                f"I2cProfile.byte_order must be 'big' or 'little', got "
+                f"{self.byte_order!r}")
+        if self.addr_bytes == 2 and self.auto_inc == 'msb':
+            raise ValueError(
+                "I2cProfile: addr_bytes=2 with auto_inc='msb' is "
+                "contradictory — the sub-address MSB is an address bit of a "
+                "16-bit register map")
+

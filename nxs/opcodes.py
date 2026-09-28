@@ -2,11 +2,9 @@
 # CI regenerates this on every build via
 # `python3 scripts/generate-constants.py constants/`.
 
-"""Sensor-VM opcodes. The bytecode format is the contract between
-the host compiler and the firmware interpreter.
-
-Encoding: 8-bit opcode + fixed-length operands (little-endian).
-"""
+"""Sensor-VM opcodes: the bytecode contract between the host compiler
+and the firmware interpreter. An 8-bit opcode plus fixed-length
+little-endian operands."""
 # ruff: noqa: E501
 
 from enum import IntEnum
@@ -25,6 +23,8 @@ class Op(IntEnum):
     LOAD_U16_LE = 0x14  # Zero-extend a 16-bit little-endian value from sample_buf[buf_off] into r[dst].
     LOAD_U8_REG = 0x15  # Load sample_buf[r[off_reg]] into r[dst] (runtime cursor index).
     LOAD = 0x16  # Load a sensor field from sample_buf[buf_off] into r[dst]. spec packs width (low 3 bits, 1-4 bytes), byte order (bit 3: 0=BE, 1=LE), and sign (bit 4: 1=sign-extend). One op covers u8/i8..u32/i32, so no sensor width needs a dedicated load.
+    PARAM_LOAD = 0x17  # Load run parameter `index` into r[dst]: the value the loader seeded for this run.
+    PARAM_STORE = 0x18  # Store r[src] as run parameter `index`: the value the loader reads back once the run ends.
     CMP_EQ = 0x20  # r[dst] = (r[reg] == imm) ? 1 : 0.
     AND = 0x21  # r[dst] = r[reg] & imm.
     OR = 0x22  # r[dst] = r[reg] | imm.
@@ -38,6 +38,8 @@ class Op(IntEnum):
     SUB_REG = 0x2A  # r[dst] = r[src_a] - r[src_b].
     XOR_REG = 0x2B  # r[dst] = r[src_a] ^ r[src_b].
     CMP_LT = 0x2C  # r[dst] = ((int32_t)r[reg] < (int32_t)imm) ? 1 : 0 (signed). The compiler derives >/<=/>= via operand swap + branch inversion, and != from CMP_EQ. Reserved sibling CMP_LT_U (0x2D) covers unsigned.
+    MUL_REG = 0x2E  # r[dst] = r[src_a] * r[src_b], the low 32 bits of the product.
+    DIVU_REG = 0x2F  # r[dst] = r[src_a] / r[src_b], unsigned and truncating. A zero divisor faults with DIV_BY_ZERO.
     JMP = 0x30  # Unconditional relative jump: PC = instruction_start + offset.
     JNZ = 0x31  # Jump if r[reg] != 0.
     JZ = 0x32  # Jump if r[reg] == 0.
@@ -60,7 +62,8 @@ class Op(IntEnum):
     SLEEP_MS = 0x50  # Sleep for ms milliseconds.
     SLEEP_US = 0x51  # Sleep for us microseconds.
     ACQ_FRAME = 0x52  # Set the pass's acquisition bound to the RX backlog's first-byte arrival; now when the stream serves no stamp. Compiled from self.stamp_frame().
-    ACQ_BIAS = 0x53  # Declare the driver's acquisition latency: every committed stamp is biased this many microseconds earlier. Emitted once after configure() from ACQUISITION_LATENCY_US.
+    ACQ_BIAS = 0x53  # Declare the driver's acquisition latency: every committed stamp is biased this many microseconds earlier. Held for a driver that declares its latency; no driver verb emits it.
+    POLL_REG = 0x54  # Read register `reg` every `poll_ms` ms until `(value & mask) == val` (flags bit0: != instead) or `timeout_ms` has passed; a NAK counts as not yet. On timeout, flags bit1 (soft) continues and raises the soft-miss status flag, else the VM faults with ERR_VM_POLL_TIMEOUT. The value width follows the bus profile's data width. Compiled from self.poll(); a camera personality's alive gate.
     STORE_SAMPLE = 0x60  # Commit sample_buf to the ring slot; bump the sample counter.
     SET_SAMPLE_SIZE = 0x61  # Set the published sample size in bytes.
     MEMCPY_IMM = 0x62  # Copy `len` inline program bytes into sample_buf[dst_off..]. The data follows the header; instruction_size() returns the 3-byte header and callers add len.
@@ -89,6 +92,8 @@ INSTRUCTION_SIZE: Dict[int, int] = {
     Op.LOAD_U16_LE: 3,
     Op.LOAD_U8_REG: 3,
     Op.LOAD: 4,
+    Op.PARAM_LOAD: 3,
+    Op.PARAM_STORE: 3,
     Op.CMP_EQ: 7,
     Op.AND: 7,
     Op.OR: 7,
@@ -102,6 +107,8 @@ INSTRUCTION_SIZE: Dict[int, int] = {
     Op.SUB_REG: 4,
     Op.XOR_REG: 4,
     Op.CMP_LT: 7,
+    Op.MUL_REG: 4,
+    Op.DIVU_REG: 4,
     Op.JMP: 3,
     Op.JNZ: 4,
     Op.JZ: 4,
@@ -125,6 +132,7 @@ INSTRUCTION_SIZE: Dict[int, int] = {
     Op.SLEEP_US: 3,
     Op.ACQ_FRAME: 1,
     Op.ACQ_BIAS: 5,
+    Op.POLL_REG: 16,
     Op.STORE_SAMPLE: 1,
     Op.SET_SAMPLE_SIZE: 2,
     Op.MEMCPY_IMM: 3,  # header only; + len inline bytes
@@ -155,6 +163,8 @@ OPCODE_SINCE_MINOR: Dict[int, int] = {
     Op.LOAD_U16_LE: 0,
     Op.LOAD_U8_REG: 0,
     Op.LOAD: 0,
+    Op.PARAM_LOAD: 2,
+    Op.PARAM_STORE: 2,
     Op.CMP_EQ: 0,
     Op.AND: 0,
     Op.OR: 0,
@@ -168,6 +178,8 @@ OPCODE_SINCE_MINOR: Dict[int, int] = {
     Op.SUB_REG: 0,
     Op.XOR_REG: 0,
     Op.CMP_LT: 0,
+    Op.MUL_REG: 2,
+    Op.DIVU_REG: 2,
     Op.JMP: 0,
     Op.JNZ: 0,
     Op.JZ: 0,
@@ -191,6 +203,7 @@ OPCODE_SINCE_MINOR: Dict[int, int] = {
     Op.SLEEP_US: 0,
     Op.ACQ_FRAME: 0,
     Op.ACQ_BIAS: 0,
+    Op.POLL_REG: 0,
     Op.STORE_SAMPLE: 0,
     Op.SET_SAMPLE_SIZE: 0,
     Op.MEMCPY_IMM: 0,

@@ -1,0 +1,1393 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aliensense.github.io/nxs-docs/schemas/surface.schema.json",
+  "title": "nxs --json surfaces (contract 2)",
+  "description": "Every document an `nxs \u2026 --json` verb emits, one definition per surface. Each carries `contract: 2`; a breaking change to any surface bumps the contract.",
+  "$defs": {
+    "contract": {
+      "const": 2
+    },
+    "field": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "value",
+        "options"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "value": {
+          "type": [
+            "string",
+            "number",
+            "boolean"
+          ]
+        },
+        "options": {
+          "type": "array",
+          "items": {
+            "type": [
+              "string",
+              "number",
+              "boolean"
+            ]
+          }
+        },
+        "labels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "unit": {
+          "type": "string"
+        }
+      }
+    },
+    "stream": {
+      "title": "nxs stream --count N --json",
+      "description": "A finite, decoded read of a unit: the fields with their units, then --count samples in SI. What nxs mcp serves as samples.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract",
+        "personality",
+        "fields",
+        "samples"
+      ],
+      "properties": {
+        "contract": {
+          "$ref": "#/$defs/contract"
+        },
+        "personality": {
+          "type": "string"
+        },
+        "fields": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "unit": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "samples": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "n",
+              "values"
+            ],
+            "properties": {
+              "n": {
+                "type": "integer"
+              },
+              "ts_us": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "values": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "rate_hz": {
+          "type": "number"
+        }
+      }
+    },
+    "tune": {
+      "title": "nxs tune --list/--set/--play --json",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract",
+        "manifest",
+        "channels"
+      ],
+      "properties": {
+        "contract": {
+          "$ref": "#/$defs/contract"
+        },
+        "manifest": {
+          "type": "string"
+        },
+        "channels": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "kind",
+              "declared",
+              "presence",
+              "sections"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "kind": {
+                "enum": [
+                  "port",
+                  "unit"
+                ]
+              },
+              "declared": {
+                "type": "boolean",
+                "description": "False for a node the platform carries or that answered, with no manifest entry yet; its DECLARE knobs write one."
+              },
+              "presence": {
+                "enum": [
+                  "present",
+                  "absent",
+                  "unknown"
+                ]
+              },
+              "note": {
+                "type": "string"
+              },
+              "sections": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "label",
+                    "kind",
+                    "fields"
+                  ],
+                  "properties": {
+                    "label": {
+                      "type": "string"
+                    },
+                    "kind": {
+                      "enum": [
+                        "declare",
+                        "camera",
+                        "sensor"
+                      ]
+                    },
+                    "unit": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "fields": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/$defs/field"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "applied": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "channel",
+              "section",
+              "field",
+              "value"
+            ],
+            "properties": {
+              "channel": {
+                "type": "string"
+              },
+              "section": {
+                "type": "string"
+              },
+              "field": {
+                "type": "string"
+              },
+              "value": {
+                "type": [
+                  "string",
+                  "number",
+                  "boolean"
+                ]
+              }
+            }
+          }
+        },
+        "backup": {
+          "type": "string"
+        },
+        "findings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/finding"
+          }
+        },
+        "played": {
+          "type": "boolean"
+        }
+      }
+    },
+    "scan": {
+      "title": "nxs probe --json (bare: config-free discovery)",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract",
+        "buses"
+      ],
+      "properties": {
+        "contract": {
+          "$ref": "#/$defs/contract"
+        },
+        "buses": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "bus",
+              "hubs",
+              "units",
+              "sensors"
+            ],
+            "properties": {
+              "bus": {
+                "type": "string"
+              },
+              "hubs": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "addr",
+                    "kind"
+                  ],
+                  "properties": {
+                    "addr": {
+                      "type": "integer"
+                    },
+                    "kind": {
+                      "type": "string"
+                    }
+                  }
+                }
+              },
+              "units": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "addr",
+                    "serial"
+                  ],
+                  "properties": {
+                    "addr": {
+                      "type": "integer"
+                    },
+                    "serial": {
+                      "type": "string"
+                    }
+                  }
+                }
+              },
+              "sensors": {
+                "type": "array",
+                "items": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "ack": {
+      "enum": [
+        "present",
+        "no ACK"
+      ]
+    },
+    "presence": {
+      "title": "the presence walk of a port (nxs <port> status --json, presence)",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract",
+        "port",
+        "bus",
+        "ok",
+        "walked",
+        "links"
+      ],
+      "properties": {
+        "contract": {
+          "$ref": "#/$defs/contract"
+        },
+        "error": {
+          "type": "string",
+          "description": "Why the probe stopped before the walk: the bus could not be opened or locked, or the hub cannot be identified."
+        },
+        "port": {
+          "type": "string"
+        },
+        "bus": {
+          "type": "string"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "hub": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "present"
+          ],
+          "properties": {
+            "present": {
+              "type": "boolean"
+            },
+            "id": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "verified": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            }
+          }
+        },
+        "walked": {
+          "type": "boolean"
+        },
+        "links": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "sen",
+              "units"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "ser": {
+                "$ref": "#/$defs/ack"
+              },
+              "sen": {
+                "$ref": "#/$defs/ack"
+              },
+              "sen_addr": {
+                "description": "The address the head was probed at: its host alias while the port is up, its own address before the first on maps it.",
+                "type": "integer"
+              },
+              "mapped": {
+                "description": "True when the head answered at its host alias (the port is up).",
+                "type": "boolean"
+              },
+              "units": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "addr",
+                    "state"
+                  ],
+                  "properties": {
+                    "addr": {
+                      "type": "integer"
+                    },
+                    "state": {
+                      "$ref": "#/$defs/ack"
+                    },
+                    "personalities": {
+                      "type": "array",
+                      "description": "The personalities the unit holds, read after the walk, every one the same shape: the one it measures with (`sensor`) and the one a camera run executes (`camera`, with its slot, compatible, mode values and last run). A kind the unit does not hold is not listed.",
+                      "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                          "kind",
+                          "name",
+                          "text"
+                        ],
+                        "properties": {
+                          "kind": {
+                            "enum": [
+                              "sensor",
+                              "camera"
+                            ]
+                          },
+                          "text": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          },
+                          "slot": {
+                            "type": "integer"
+                          },
+                          "compatible": {
+                            "type": "string"
+                          },
+                          "modes": {
+                            "type": "object",
+                            "additionalProperties": {
+                              "type": "integer"
+                            }
+                          },
+                          "run": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "required": [
+                              "state",
+                              "error",
+                              "values"
+                            ],
+                            "properties": {
+                              "state": {
+                                "type": "string"
+                              },
+                              "error": {
+                                "type": "integer"
+                              },
+                              "values": {
+                                "type": "object",
+                                "additionalProperties": {
+                                  "type": "integer"
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    },
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              },
+              "sensor": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "declared",
+                  "detected",
+                  "detail",
+                  "ok",
+                  "text"
+                ],
+                "properties": {
+                  "declared": {
+                    "type": "string"
+                  },
+                  "detected": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "detail": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "ok": {
+                    "type": "boolean"
+                  },
+                  "text": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "csi_lanes": {
+          "type": "integer"
+        },
+        "dt_lanes": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      }
+    },
+    "status": {
+      "title": "nxs <port> status --json",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract",
+        "port",
+        "bus",
+        "sync",
+        "ok",
+        "sections"
+      ],
+      "properties": {
+        "contract": {
+          "$ref": "#/$defs/contract"
+        },
+        "port": {
+          "type": "string"
+        },
+        "bus": {
+          "type": "string"
+        },
+        "sync": {
+          "type": "string"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "sections": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "title",
+              "results",
+              "derived"
+            ],
+            "properties": {
+              "title": {
+                "type": "string"
+              },
+              "results": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "name",
+                    "text",
+                    "raw",
+                    "ok"
+                  ],
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "text": {
+                      "type": "string"
+                    },
+                    "raw": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "ok": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "desc": {
+                      "type": "string"
+                    }
+                  }
+                }
+              },
+              "derived": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "verdict": {
+          "description": "Declared against actual: one line for the port and one per declared link; ok when every declared link is up on a ready capture stack.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "ok",
+            "lines"
+          ],
+          "properties": {
+            "ok": {
+              "type": "boolean"
+            },
+            "lines": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "sync_live": {
+          "description": "The live synced pair recorded by the last up/trigger (null when no port state is recorded).",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "source": {
+              "enum": [
+                "free_run",
+                "fsync"
+              ]
+            },
+            "fps": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "links": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              },
+              "description": "What each link does under the trigger (fsync, or free_run with the reason)."
+            },
+            "pulses_per_frame": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "The generator pulses this many times per frame; the sensors take every n-th."
+            },
+            "exposure_us": {
+              "type": "number",
+              "description": "The integration time the pulse's low time sets, microseconds."
+            },
+            "trigger_vmax": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "integer"
+              },
+              "description": "The trigger frame each synced link runs, in lines."
+            }
+          },
+          "required": [
+            "source"
+          ]
+        },
+        "presence": {
+          "description": "The presence walk the status began with: the hub, each link's chain and unit.",
+          "$ref": "#/$defs/presence"
+        }
+      }
+    },
+    "tree": {
+      "title": "nxs status --json (bare: the declaration against the rig)",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract",
+        "manifest",
+        "ok",
+        "declaration",
+        "ports",
+        "units"
+      ],
+      "properties": {
+        "contract": {
+          "$ref": "#/$defs/contract"
+        },
+        "manifest": {
+          "type": "string"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "declaration": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "in_tune",
+            "findings",
+            "unplaced"
+          ],
+          "properties": {
+            "in_tune": {
+              "type": "boolean"
+            },
+            "findings": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/finding"
+              }
+            },
+            "unplaced": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/finding"
+              }
+            }
+          }
+        },
+        "personalities": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "dir",
+            "installed"
+          ],
+          "properties": {
+            "dir": {
+              "type": "string"
+            },
+            "installed": {
+              "type": "integer"
+            }
+          }
+        },
+        "ports": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "bus",
+              "findings"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "bus": {
+                "type": "string"
+              },
+              "hub": {
+                "type": "string"
+              },
+              "driver": {
+                "type": "string"
+              },
+              "findings": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/finding"
+                }
+              },
+              "presence": {
+                "$ref": "#/$defs/presence"
+              },
+              "error": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "units": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "routes",
+              "ok",
+              "findings"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "routes": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "ok": {
+                "type": "boolean"
+              },
+              "findings": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/finding"
+                }
+              },
+              "route": {
+                "type": "string"
+              },
+              "serial": {
+                "type": "string"
+              },
+              "fw": {
+                "type": "string"
+              },
+              "personality": {
+                "type": "string"
+              },
+              "vm": {
+                "type": "string"
+              },
+              "sync": {
+                "type": "string"
+              },
+              "cal": {
+                "type": "string"
+              },
+              "drift": {
+                "type": "string"
+              },
+              "samples": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "outputs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "deviations": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                }
+              },
+              "rides": {
+                "type": "string",
+                "description": "`<port>/<link>` when the unit rides a camera link: it is that link's node."
+              }
+            }
+          }
+        }
+      }
+    },
+    "caps": {
+      "title": "nxs <port> caps --json",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract",
+        "port",
+        "link",
+        "sensor",
+        "csi_lanes",
+        "pack",
+        "modes",
+        "knobs",
+        "trigger_modes"
+      ],
+      "properties": {
+        "contract": {
+          "$ref": "#/$defs/contract"
+        },
+        "port": {
+          "type": "string"
+        },
+        "link": {
+          "type": "string"
+        },
+        "sensor": {
+          "type": "string"
+        },
+        "serializer": {
+          "type": "string",
+          "description": "The link's serializer, where the link has one."
+        },
+        "csi_lanes": {
+          "type": "integer"
+        },
+        "pack": {
+          "type": "string"
+        },
+        "cameras": {
+          "enum": [
+            1,
+            2
+          ],
+          "description": "How many cameras the port's declared links make: one, or the pair."
+        },
+        "sync_pairs": {
+          "type": "array",
+          "description": "Modes shipped for the pair under frame sync, with their rate range.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "mode",
+              "token",
+              "fps_floor",
+              "fps_ceiling"
+            ],
+            "properties": {
+              "mode": {
+                "type": "string"
+              },
+              "token": {
+                "type": "string"
+              },
+              "fps_floor": {
+                "type": "number"
+              },
+              "fps_ceiling": {
+                "type": "number"
+              }
+            }
+          }
+        },
+        "modes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "width",
+              "height",
+              "data_type",
+              "lanes",
+              "rate_mbps",
+              "fps_ceiling"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "width": {
+                "type": "integer"
+              },
+              "height": {
+                "type": "integer"
+              },
+              "data_type": {
+                "type": "string"
+              },
+              "lanes": {
+                "type": "integer"
+              },
+              "rate_mbps": {
+                "type": "integer"
+              },
+              "fps_ceiling": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "sensor_mode": {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "token": {
+                "type": "string",
+                "description": "The mode as `on --mode` takes it: WxH, or WxH-rawN when two depths share a geometry."
+              },
+              "fps_floor": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "line_time_ns": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "The line period the mode runs in this port, in nanoseconds."
+              },
+              "line_source": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "enum": [
+                  "shipped",
+                  "pair",
+                  null
+                ],
+                "description": "Where the line comes from: the shipped shipped point, or the pair line the hub's output leaves a mode that ships a solo point only."
+              },
+              "experimental": {
+                "type": "boolean",
+                "description": "True for a mode that ships no shipped point for this port: offered only under --experimental."
+              },
+              "offered": {
+                "type": "boolean",
+                "description": "True when the unit program carries the mode; false for a mode served by a bench capture alone."
+              }
+            }
+          }
+        },
+        "knobs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "trigger_modes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "oracle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "ok",
+        "detail"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "ok": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "detail": {
+          "type": "string"
+        }
+      }
+    },
+    "certify_link": {
+      "title": "one link's certification report",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract",
+        "port",
+        "link",
+        "sensor",
+        "mode",
+        "ok",
+        "oracles"
+      ],
+      "properties": {
+        "contract": {
+          "$ref": "#/$defs/contract"
+        },
+        "port": {
+          "type": "string"
+        },
+        "link": {
+          "type": "string"
+        },
+        "sensor": {
+          "type": "string"
+        },
+        "mode": {
+          "type": "string"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "oracles": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/oracle"
+          }
+        }
+      }
+    },
+    "finding": {
+      "title": "one finding: the place it names, the fact, the lawful alternatives, and the sentence a person reads",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "where",
+        "fact",
+        "alternatives",
+        "text"
+      ],
+      "properties": {
+        "where": {
+          "type": "string"
+        },
+        "fact": {
+          "type": "string"
+        },
+        "alternatives": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "text": {
+          "type": "string"
+        }
+      }
+    },
+    "refusal": {
+      "title": "a verb refused under --json: the fact and the lawful alternatives",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "refused"
+      ],
+      "properties": {
+        "refused": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "fact",
+            "alternatives"
+          ],
+          "properties": {
+            "fact": {
+              "type": "string"
+            },
+            "alternatives": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    },
+    "generate": {
+      "title": "nxs generate --json: the walk as data and what was written",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract",
+        "manifest",
+        "dry_run",
+        "hardware",
+        "seeded",
+        "kept",
+        "ports",
+        "units"
+      ],
+      "properties": {
+        "contract": {
+          "$ref": "#/$defs/contract"
+        },
+        "manifest": {
+          "type": "string"
+        },
+        "dry_run": {
+          "type": "boolean"
+        },
+        "hardware": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "seeded": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kept": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ports": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "bus",
+              "links"
+            ],
+            "description": "A port lists the nodes that answered on it; `unanswered` is a node the wiring or the platform names that did not.",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "bus": {
+                "type": "string"
+              },
+              "csi_lanes": {
+                "type": "integer"
+              },
+              "hub": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "compatible",
+                  "addr"
+                ],
+                "properties": {
+                  "compatible": {
+                    "type": "string"
+                  },
+                  "addr": {
+                    "type": "integer"
+                  }
+                }
+              },
+              "unanswered": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "kind",
+                  "compatible",
+                  "addr"
+                ],
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "hub"
+                    ]
+                  },
+                  "compatible": {
+                    "type": "string"
+                  },
+                  "addr": {
+                    "type": "integer"
+                  }
+                }
+              },
+              "links": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "name",
+                    "sensor"
+                  ],
+                  "properties": {
+                    "name": {
+                      "type": "string"
+                    },
+                    "window": {
+                      "type": "integer"
+                    },
+                    "locked": {
+                      "type": "boolean"
+                    },
+                    "ser": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "compatible",
+                        "present"
+                      ],
+                      "properties": {
+                        "compatible": {
+                          "type": "string"
+                        },
+                        "present": {
+                          "type": "boolean"
+                        }
+                      }
+                    },
+                    "sensor": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "compatible",
+                        "identity"
+                      ],
+                      "properties": {
+                        "compatible": {
+                          "type": "string"
+                        },
+                        "identity": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "unit": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": [
+                        "addr"
+                      ],
+                      "properties": {
+                        "addr": {
+                          "type": "integer"
+                        },
+                        "serial": {
+                          "type": "string"
+                        },
+                        "fw": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "unwalked": {
+                      "type": "string",
+                      "description": "Why the walk did not reach the link (a kernel-owned hub selects its own windows): the link is the declaration's word."
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "units": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "route"
+            ],
+            "properties": {
+              "route": {
+                "type": "string"
+              },
+              "serial": {
+                "type": "string"
+              },
+              "fw": {
+                "type": "string"
+              },
+              "personality": {
+                "type": "string"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,10 +1,6 @@
-"""Driver-discovery and interactive picker used by the bench harness.
-
-`discover_drivers()` walks `nxs.drivers` and returns every
-concrete `SensorDriver` subclass, keyed by class name. `pick_driver()`
-renders a numbered menu and returns the chosen `(name, cls)` pair —
-Enter or `s` skips, `q` exits the process.
-"""
+"""Driver discovery and interactive picker for the bench harness:
+`discover_drivers()` maps class name to concrete `SensorDriver` subclass,
+`pick_driver()` renders a numbered menu (Enter or `s` skips, `q` exits)."""
 
 import importlib
 import inspect
@@ -17,11 +13,8 @@ from nxs.term import RED, YELLOW, NC
 
 
 def discover_drivers() -> dict:
-    """Return `{ClassName: cls}` for every concrete `SensorDriver`
-    subclass under `nxs.drivers` — captures `RegisterDriver`
-    (IMUs), `I2cCommandDriver` (Sensirion-family), and `StreamDriver`
-    (GPS, UART-only parts). Skips private modules and the `_reference`
-    variants kept for hand-comparison."""
+    """`{ClassName: cls}` for every concrete `SensorDriver` subclass under
+    `nxs.drivers`, skipping private modules and `_reference` variants."""
     drivers: dict = {}
     for m in pkgutil.iter_modules(drivers_pkg.__path__):
         if m.name.startswith("_") or m.name.endswith("_reference"):

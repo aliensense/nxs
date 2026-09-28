@@ -1,6 +1,146 @@
 NXS SDK
 Copyright 2026 Aliensense
 
+The Python packages and the C headers of this distribution are licensed
+under the Apache License, Version 2.0 (LICENSE). The executor library,
+nxs/_lib/libnxs.so, is licensed under the NXS Runtime Library License
+(nxs/_lib/LICENSE). The descriptor pack under nxs/packs is licensed under
+the NXS Descriptor Pack License (its LICENSE-descriptors). The assets
+tarball, nxs-assets-<version>.tar.gz, is licensed under the NXS Assets
+License (the LICENSE at its root).
+
+Third-party components
+======================
+
 This product includes DSDL definitions from the OpenCyphal
-public_regulated_data_types repository (MIT license), vendored
-under nxs/dsdl/.
+public_regulated_data_types repository, vendored under nxs/dsdl/ and
+compiled into the executor library and the NXS unit firmware.
+    Copyright (c) 2014-2019 UAVCAN Development Team
+    MIT License (text below)
+
+The executor library and the NXS unit firmware include libcanard, the
+OpenCyphal CAN transport.
+    Copyright (c) 2016 OpenCyphal
+    MIT License (text below)
+
+The executor library and the NXS unit firmware include o1heap.
+    Copyright (c) 2020 Pavel Kirienko
+    MIT License (text below)
+
+The executor library and the NXS unit firmware include TinyCrypt
+(AES-128 and CTR).
+    Copyright (c) 2017, Intel Corporation. All rights reserved.
+    BSD-3-Clause (text below)
+
+The NXS unit firmware, firmware/ in the assets tarball and the release's
+nxs-<version>-firmware.bin, -firmware.hex and -factory.hex, is built on
+the Zephyr RTOS.
+    Copyright (c) The Zephyr Project contributors
+    Apache License, Version 2.0 (LICENSE-Apache-2.0 beside this file;
+    LICENSE in the wheel)
+
+The NXS unit firmware and its bootloader include the STM32Cube HAL and
+LL drivers, and the CMSIS core headers.
+    Copyright (c) STMicroelectronics. All rights reserved.
+    BSD-3-Clause (text below); the SoC support files Apache License,
+    Version 2.0
+    Copyright (c) Arm Limited. All rights reserved.
+    Apache License, Version 2.0
+
+The NXS unit's bootloader is MCUboot: the release's
+nxs-<version>-bootloader.hex, and the first part of -factory.hex, written
+at production.
+    Apache License, Version 2.0; its NOTICE reads:
+    Apache Mynewt
+    Copyright 2015-2017 The Apache Software Foundation
+
+    This product includes software developed at
+    The Apache Software Foundation (http://www.apache.org/).
+
+    Portions of this software were developed at
+    Runtime Inc, copyright 2015.
+
+    Portions of this software were developed at
+    Arm Limited, copyright 2019-2021.
+
+Nothing of NVIDIA's ships in this distribution. On a Jetson host the
+executor library loads libnvargus_socketclient, libnvbufsurface and libEGL
+from the host's Jetson Linux at run time, and is built against the Argus
+headers of the Jetson Multimedia API.
+
+MIT License
+-----------
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+BSD-3-Clause (STM32Cube)
+------------------------
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice,
+   this list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+3. Neither the name of STMicroelectronics nor the names of its contributors
+   may be used to endorse or promote products derived from this software
+   without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+
+BSD-3-Clause (TinyCrypt)
+------------------------
+
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
+
+  - Redistributions of source code must retain the above copyright notice, this
+      list of conditions and the following disclaimer.
+
+  - Redistributions in binary form must reproduce the above copyright notice,
+      this list of conditions and the following disclaimer in the documentation
+      and/or other materials provided with the distribution.
+
+  - Neither the name of the Intel Corporation nor the names of its contributors
+      may be used to endorse or promote products derived from this software
+      without specific prior written permission.
+
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.

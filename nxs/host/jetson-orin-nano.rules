@@ -1,0 +1,6 @@
+# aliensense: stable camera-connector bus names (Jetson Orin Nano).
+# The cam mux branches are matchable only by adapter name; the i2c-*
+# wildcard absorbs the parent's enumeration number, however many digits
+# it has (udev's ? matches exactly one character).
+SUBSYSTEM=="i2c-dev", ATTR{name}=="i2c-*-mux (chan_id 0)", SYMLINK+="i2c-cam0"
+SUBSYSTEM=="i2c-dev", ATTR{name}=="i2c-*-mux (chan_id 1)", SYMLINK+="i2c-cam1"

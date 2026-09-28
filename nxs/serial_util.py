@@ -1,35 +1,18 @@
 """Serial-port discovery and open helpers shared by the CLI and the transports.
+Autodetect lists USB-attached ports only (`port.vid is not None`): one match
+is picked silently, several prompt, none returns the empty string."""
 
-Backed by `pyserial`'s `serial.tools.list_ports.comports()`, which is
-platform-agnostic:
-  - macOS:   `/dev/cu.usbmodem*`, `/dev/cu.usbserial*` (CDC-ACM, FTDI, CP210x)
-  - Linux:   `/dev/ttyUSB*`, `/dev/ttyACM*`
-  - Windows: `COM1`, `COM2`, … with USB hardware IDs
-
-The autodetect filters to USB-attached ports (`port.vid is not None`)
-so onboard / Bluetooth / virtual COM ports don't pollute the list,
-picks the single match silently, prompts on multiple matches, and
-returns the empty string on zero matches.
-"""
-
-import serial
-from serial.tools import list_ports
-
+from nxs.extras import require
 from nxs.term import RED, YELLOW, NC
+
+serial = require("cyphal", "serial", "the cyphal transport")
+list_ports = require("cyphal", "serial.tools.list_ports", "the cyphal transport")
 
 
 class _ConfigureOnceSerial(serial.Serial):
     """A Serial that programs the device once, at open, and ignores later
-    `_reconfigure_port` calls. pyserial re-programs the whole termios every
-    time a config attribute (`timeout`, `write_timeout`, `baudrate`, …) is
-    assigned on an open port — and on macOS a baud with no named termios
-    constant (460800) additionally re-issues the line coding via IOSSIOSPEED
-    on every such call, changed or not. Some CDC firmwares crash on a
-    post-open line-coding request — a J-Link V9 VCOM falls off the USB bus
-    until replugged — and pycyphal assigns `timeout` right after constructing
-    the transport and `write_timeout` before every send. Timeout semantics
-    survive the freeze: pyserial's POSIX reads and writes take them from
-    host-side state (`select()`), not from termios."""
+    `_reconfigure_port` calls: some CDC firmwares drop off the USB bus on a
+    post-open line-coding request. Timeouts still apply (kept host-side)."""
 
     _configured = False
 
@@ -45,10 +28,9 @@ class _ConfigureOnceSerial(serial.Serial):
 
 
 def open_serial_once(port: str, baud: int) -> serial.SerialBase:
-    """Open `port` at `baud`, programming the device exactly once, and return
-    the open port (see `_ConfigureOnceSerial`). Raises `serial.SerialException`
-    for any open failure — pyserial's POSIX backend leaks raw `termios.error`,
-    which is not an `OSError` and would bypass the CLI's clean-error paths."""
+    """Open `port` at `baud`, programming the device exactly once. Raises
+    `serial.SerialException` for any open failure (pyserial's POSIX backend
+    leaks raw `termios.error`, which is not an `OSError`)."""
     try:
         return _ConfigureOnceSerial(port=port, baudrate=baud)
     except serial.SerialException:
@@ -58,10 +40,8 @@ def open_serial_once(port: str, baud: int) -> serial.SerialBase:
 
 
 def autodetect_serial_port() -> str:
-    """Return the device path/name of the single matching USB serial port,
-    or `""` if zero or many match. Multiple matches drop into an
-    interactive picker that shows each port's description so the
-    operator can tell, say, "Silicon Labs CP210x" from "FT232R USB UART"."""
+    """Device path of the single USB serial port, or `""` if zero or many
+    match; several matches drop into a picker showing each description."""
     candidates = sorted(
         (p for p in list_ports.comports() if p.vid is not None),
         key=lambda p: p.device,

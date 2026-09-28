@@ -1,45 +1,12 @@
 """
 NEO-M9N driver for NXS VM.
 
-u-blox NEO-M9N GNSS receiver module (u-blox M9 platform, UBX-M9140),
-streaming PVT position/velocity/time epochs over UART. The binary UBX
-protocol is the default and publishes typed geodetic fields; NMEA is a
-secondary `protocol` variant that publishes raw sentence strings.
-
-Configuration uses the u-blox M9 configuration database (UBX-CFG-VALSET,
-class 0x06 / ID 0x8A) targeting the volatile RAM layer, so the driver
-reconfigures the receiver on every load and never wears the battery-backed
-or flash layers. The epoch rate is the `rate` param, patched into the
-CFG-RATE-MEAS frame with the 8-bit Fletcher checksum recomputed at runtime.
-
-Probe sends a fixed CFG-VALSET and verifies the UBX-ACK-ACK response —
-receivers have no WHO_AM_I register.
-
-mikroBUS pin mapping (from mikroE GNSS 7 Click C driver):
-    TX  (PB6)  -> RXD1:      UART host -> module (data in)
-    RX  (PB7)  -> TXD1:      UART module -> host (data out)
-    INT (PA9)  -> TIMEPULSE: 1PPS time pulse (input)
-    RST (PB2)  -> RESET_N:   Module reset (output, active low)
-    PWM (PA10) -> EXTINT:    External interrupt / wake (input)
-    AN  (PA0)  -> D_SEL:     Interface select; high/open selects UART+I2C,
-                             the mode this driver uses (a static board fact)
-
-Interface: UART only. Default baud 38400 (GNSS 7 Click default and NEO-M9N
-production default; the pre-production R01 datasheet lists 9600). Baud is
-fixed here — a runtime change would desync the host link, which the
-fixed-baud probe handshake cannot recover. 3.3V rail (module spec 2.7-3.6V).
-
-Config keys:
-    protocol : binary | nmea   (default binary)   -- compile-time; UBX binary
-               (typed PVT fields) vs NMEA sentence strings.
-
-Params:
-    rate : {1, 5, 10, 25} Hz   (default 1)  -- GNSS measurement/nav rate
-               (CFG-RATE-MEAS). NEO-M9N supports up to 30 Hz single-GNSS;
-               the set is capped conservatively for multi-constellation.
-
-Datasheet: u-blox NEO-M9N Data sheet (UBX-19014285)
-Interface: u-blox M9 SPG 4.04 Interface description (UBX-21022436, protocol v32)
+u-blox NEO-M9N GNSS receiver (M9 platform, UBX-M9140); datasheet UBX-19014285,
+    M9 SPG 4.04 interface description UBX-21022436 (protocol v32).
+Bus: UART1, 38400 baud (fixed); UBX binary by default, NMEA variant; CFG-VALSET to the RAM layer.
+Config: protocol binary|nmea (binary), compile-time. Params: rate 1|5|10|25 Hz (1), CFG-RATE-MEAS.
+Outputs: UBX-NAV-PVT fields (see UbxNavPvtDriver), or nmea (string, 82 bytes).
+Pins: INT -> TIMEPULSE (1PPS); AN -> D_SEL (UART select). RST -> RESET_N, PWM -> EXTINT: unused.
 mikroE Click: https://www.mikroe.com/gnss-7-click
 """
 
@@ -55,9 +22,12 @@ class NeoM9n(UbxNavPvtDriver):
         'pps': 'mkbus_int',        # 1PPS time pulse (input)
     }
 
+    # Production default (the pre-production R01 datasheet lists 9600); fixed,
+    # since a runtime change would desync the fixed-baud probe handshake.
     DEFAULT_BAUD = 38400
 
-    # CFG-RATE-MEAS is the measurement period in ms: rate_hz -> 1000 // rate_hz.
+    # CFG-RATE-MEAS period = 1000 // rate_hz ms; capped at 25 Hz for
+    # multi-constellation use (30 Hz single-GNSS maximum).
     RATES = [1, 5, 10, 25]
 
     # ── M9-specific config-database key IDs (L-typed protocol enables;
@@ -80,7 +50,7 @@ class NeoM9n(UbxNavPvtDriver):
     def configure(self, config):
         protocol = config.get('protocol', 'binary')
 
-        self.declare_param("rate", values=self.RATES, default=1, unit="Hz")
+        self.declare_params_from_descriptor()
         rate_hz = config.get('rate', 1)
         meas_rate_ms = 1000 // rate_hz
 

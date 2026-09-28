@@ -3,49 +3,63 @@ requires = ["setuptools>=62"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "nxs"
-version = "1.0.0"
+name = "aliensense-nxs"
+version = "1.1.0"
 description = "NXS sensor VM compiler, suite manager, and command-line tool"
 readme = "README.md"
 requires-python = ">=3.10"
-# One wheel covers every transport: pyserial (UART), smbus2 (I2C).
-# All are small pure-Python packages, so none earns an extra —
-# a bare install must work on the default transport. ruamel.yaml is the
-# round-trip YAML editor `suite freeze` uses to update the manifest
-# without destroying the operator's comments.
+license = {text = "Apache-2.0"}
+authors = [{name = "Aliensense"}]
+# The I2C install: smbus2 for the bus, ruamel.yaml to edit the manifest round-trip,
+# pyyaml to read every other YAML, argcomplete for the shell.
 dependencies = [
     "argcomplete",
-    "pyserial",
     "pyyaml",
     "ruamel.yaml",
     "smbus2",
 ]
 
-# Cyphal is the one heavy transport — pycyphal pulls numpy + the DSDL
-# toolchain (~100 MB) — so it stays an extra. The I2C/serial install, and
-# the i2c container variant, never carry it. smbus2/pyserial stay in the
-# base above (a bare install works on the default I2C transport), so there
-# is no symmetric `[i2c]` extra: those few KB are not worth gating.
+# The Cyphal wires are the library's; the extra adds pyserial for the serial
+# port autodetect and the bench's port sweep.
 [project.optional-dependencies]
 cyphal = [
-    "pycyphal==1.27.0",
-    "nunavut==2.3.1",
-    "pydsdl==1.24.3",
-    "cobs==1.2.2",
+    "pyserial",
 ]
+# `nxs mcp` serves the verbs to an AI agent over the Model Context Protocol;
+# the SDK pulls pydantic and an HTTP stack, so it stays an extra.
+mcp = [
+    "mcp>=2,<3",
+]
+# `nxs ros2` runs inside a sourced ROS 2 environment (rclpy comes from the
+# distro, not from pip); the extra is the install marker the verb names.
+ros2 = []
 
 # `pip install` this project and `nxs` drops into PATH as a
 # real executable. Points at nxs/cli.py::main().
 [project.scripts]
 nxs = "nxs.cli:main"
+nxsd = "nxs.daemon:main"
 
 [tool.setuptools.packages.find]
 include = ["nxs*"]
 exclude = ["nxs.tests*"]
 
-# Vendored DSDL ships in the wheel so `nxs[cyphal]` is self-contained —
-# the source compiles it at first run with no repo checkout or PRDT clone.
-# The ros2/ data (launch file + RViz config) ships too, located at runtime
-# via `nxs ros2 --launch-file`.
+# The vendored DSDL ships in the wheel so `aliensense-nxs[cyphal]` is self-contained; the
+# ros2/ data (launch file, RViz config) ships too, found via `nxs ros2 --launch-file`.
+# The quiet descriptor pack (packs/<pack>: the manifest, the flows, the
+# topology, the serdes descriptors with their blobs, the pack license) is
+# exported there by release.sh before the build and is git-ignored.
 [tool.setuptools.package-data]
-nxs = ["dsdl/**/*.dsdl", "dsdl/*.md", "dsdl/LICENSE-*", "ros2/*.launch.py", "ros2/*.rviz"]
+nxs = [
+    "dsdl/**/*.dsdl", "dsdl/*.md", "dsdl/LICENSE-*", "ros2/*.launch.py", "ros2/*.rviz",
+    "host/*.rules", "drivers/*.yaml", "schemas/*.json",
+    "packs/*/pack.yaml", "packs/*/topology.yaml", "packs/*/flows.py", "packs/*/flows/*.py",
+    "packs/*/LICENSE-*",
+    "packs/*/*/*.yaml", "packs/*/*/*.py", "packs/*/*/blobs/*.yaml",
+    "_lib/libnxs.*",
+]
+
+[project.urls]
+Homepage = "https://aliensense.github.io/nxs-docs/"
+Documentation = "https://aliensense.github.io/nxs-docs/"
+Repository = "https://github.com/aliensense/nxs"

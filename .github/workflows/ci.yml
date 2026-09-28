@@ -8,6 +8,34 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The hosts' own interpreters: JetPack 6 ships 3.10, JetPack 7 3.12.
+        python-version: ['3.10', '3.12']
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install
+        run: pip install -e '.[cyphal]' build
+
+      - name: Smoke test
+        run: |
+          python -c "import nxs, nxs.compiler, nxs.client"
+          nxs --version
+
+      - name: Build wheel
+        run: python -m build --wheel
+
+  # The base install carries no Cyphal stack and no serial port: the I2C
+  # verbs must run from it, and the Cyphal ones must refuse by name.
+  base-install:
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v5
@@ -16,11 +44,15 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install
-        run: pip install -e '.[cyphal]' pytest build
+      - name: Install without extras
+        run: pip install -e . pytest
 
-      - name: Test
-        run: python -m pytest nxs/tests/ -q
-
-      - name: Build wheel
-        run: python -m build --wheel
+      - name: Smoke test
+        run: |
+          python -c "import nxs, nxs.cli, nxs.host, nxs.schemas, nxs.cam.cli"
+          if python -c "import serial" 2>/dev/null; then echo "pyserial leaked into the base install"; exit 1; fi
+          nxs --version
+          nxs host info
+          if nxs -t cyphal-serial probe > "$RUNNER_TEMP/probe.log" 2>&1; then echo "probe ran without the Cyphal extra"; exit 1; fi
+          grep -F "pip install 'aliensense-nxs[cyphal]'" "$RUNNER_TEMP/probe.log"
+          python -m pytest nxs/tests/test_declaration.py nxs/tests/test_schemas.py -q

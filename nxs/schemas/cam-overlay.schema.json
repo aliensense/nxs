@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aliensense.dev/schemas/cam-overlay.schema.json",
+  "title": "Camera descriptor overlay",
+  "description": "Board-measured values layered over a chip descriptor. Carries only what it overrides; every limit it states must be sourced 'experimental', because a value that is merely transcribed belongs in the part description instead.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "meta",
+    "limits",
+    "limits_source"
+  ],
+  "properties": {
+    "meta": {
+      "type": "object",
+      "description": "Names the part this overlay layers onto.",
+      "required": [
+        "compatible",
+        "role"
+      ],
+      "properties": {
+        "compatible": {
+          "type": "string"
+        },
+        "role": {
+          "enum": [
+            "SEN",
+            "SER",
+            "DES"
+          ]
+        },
+        "i2c_addr": {
+          "type": "integer"
+        },
+        "provenance": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "registers": {
+      "type": "object"
+    },
+    "limits": {
+      "type": "object"
+    },
+    "limits_source": {
+      "type": "object",
+      "description": "Every entry is 'experimental' \u2014 that is what an overlay is for.",
+      "additionalProperties": {
+        "const": "experimental"
+      }
+    },
+    "modes": {
+      "type": "object"
+    },
+    "trigger": {
+      "type": "object"
+    },
+    "sync": {
+      "type": "object"
+    }
+  }
+}

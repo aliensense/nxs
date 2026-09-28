@@ -1,17 +1,9 @@
-"""Container entry point: one wire in, decoded samples out.
-
-`--transport {i2c, cyphal-serial}` picks the source — the I2C reg-map bridge or
-the pycyphal `CyphalSampleSource` — and both yield the same `Sample`, so the
-output loop is wire-blind. The default sink prints decoded fields; the ROS 2
-projection is a thin sink over the same `Sample.values`.
-
-This is the host container the customer runs: `docker run … --transport
-cyphal-serial --port /dev/ttyUSB0` decodes a self-describing Cyphal node;
-`--transport i2c --bus /dev/i2c-2` decodes the GMSL reg-map. pycyphal owns the
-Cyphal wires, nxs's I2C transport owns the reg-map.
-"""
+"""Container entry point: one wire in, decoded samples out. `--transport
+{i2c, cyphal-serial}` picks the source; both yield the same `Sample`, so the
+output loop is wire-blind. Sinks print decoded fields or one JSON object per line."""
 
 import argparse
+import os
 import json
 from typing import Callable, Optional
 
@@ -19,23 +11,22 @@ from nxs.client import Sample
 
 
 def make_source(args):
-    """Build the sample source for `--transport`. Both returned objects expose
-    `iter_samples()` yielding `Sample`."""
+    """Build the sample source for `--transport`: the library's client, whose
+    `iter_samples()` yields `Sample`."""
+    from nxs.transports import open_client
     if args.transport == "i2c":
-        from nxs.transports import open_client
+        if args.bus is None:
+            raise SystemExit("container: pass --bus or set $NXS_BUS")
         return open_client("i2c", bus=args.bus, address=args.addr)
     if args.transport == "cyphal-serial":
-        from nxs.transports.cyphal_source import CyphalSampleSource
         if not args.port:
             from nxs.serial_util import autodetect_serial_port
             args.port = autodetect_serial_port()
             if not args.port:
                 raise SystemExit("no serial port: pass --port explicitly for cyphal-serial")
-        return CyphalSampleSource(port=args.port, baud=args.baud)
+        return open_client("cyphal-serial", port=args.port, baud=args.baud)
     if args.transport == "cyphal-can":
-        # The CyphalSampleSource transport is serial-only; CAN needs the pycyphal
-        # CANTransport over a socketcan media, which the container does not provide.
-        raise SystemExit("cyphal-can is unsupported in the container — use cyphal-serial or i2c")
+        return open_client("cyphal-can", can_iface=args.port or "can0")
     raise SystemExit(f"unknown transport: {args.transport}")
 
 
@@ -78,7 +69,8 @@ def main(argv=None) -> int:
                    choices=["i2c", "cyphal-serial", "cyphal-can"])
     p.add_argument("--port", default=None, help="serial device (cyphal-serial)")
     p.add_argument("--baud", type=int, default=460800)
-    p.add_argument("--bus", default="/dev/i2c-2", help="I2C bus (i2c)")
+    p.add_argument("--bus", default=os.environ.get("NXS_BUS"),
+                   help="I2C bus (i2c; $NXS_BUS)")
     p.add_argument("--addr", type=lambda x: int(x, 0), default=0x30,
                    help="I2C address (i2c)")
     p.add_argument("--count", type=int, default=None, help="stop after N samples")

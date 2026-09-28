@@ -1,0 +1,179 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aliensense.github.io/nxs-docs/schemas/blob.schema.json",
+  "title": "NXS camera register blob / engine config (*.blob.yaml)",
+  "description": "A hardware-proven register program in the engine's own shape: aliases, an event list, and named sequences of write, command, read, expect, poll, and retry steps. Composed plans dump to this shape too, so any conforming document is runnable and diffable.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["event_list", "sequences"],
+  "properties": {
+    "meta": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {"type": "string"},
+        "version": {"type": ["string", "number"]},
+        "compatible": {"type": "string"},
+        "provenance": {"type": "string"}
+      }
+    },
+    "aliases": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "commands": {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/$defs/int"}
+        },
+        "addresses": {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/$defs/int"}
+        }
+      }
+    },
+    "event_list": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "scripts": {
+      "type": "object",
+      "additionalProperties": {"type": "array", "items": {"type": "string"}}
+    },
+    "sequences": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": {"$ref": "#/$defs/step"}
+      }
+    }
+  },
+  "$defs": {
+    "int": {
+      "anyOf": [
+        {"type": "integer"},
+        {"type": "string", "pattern": "^[+-]?(0[xX][0-9a-fA-F]+|0[oO][0-7]+|0[bB][01]+|[0-9]+)$"}
+      ]
+    },
+    "byte": {
+      "description": "One bus byte, 0..255: the executor sends a 16-bit register address as two bytes (reg, offset) and 8-bit data, so a wider value would be masked on the wire.",
+      "anyOf": [
+        {"type": "integer", "minimum": 0, "maximum": 255},
+        {"type": "string", "pattern": "^0[xX]0*[0-9a-fA-F]{1,2}$"},
+        {"type": "string", "pattern": "^(0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])$"}
+      ]
+    },
+    "value": {
+      "anyOf": [
+        {"$ref": "#/$defs/byte"},
+        {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/byte"}}
+      ]
+    },
+    "step": {
+      "oneOf": [
+        {"$ref": "#/$defs/write"},
+        {"$ref": "#/$defs/cmd"},
+        {"$ref": "#/$defs/read"},
+        {"$ref": "#/$defs/expect"},
+        {"$ref": "#/$defs/poll"},
+        {"$ref": "#/$defs/retry"}
+      ]
+    },
+    "write": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["device", "reg", "value"],
+      "properties": {
+        "device": {"type": "string"},
+        "width": {"type": "integer", "minimum": 1, "maximum": 4},
+        "reg": {"$ref": "#/$defs/byte"},
+        "offset": {"$ref": "#/$defs/byte"},
+        "value": {"$ref": "#/$defs/value"},
+        "sleep_ms": {"$ref": "#/$defs/int"},
+        "sleep": {
+          "$ref": "#/$defs/int",
+          "deprecated": true,
+          "description": "Ignored by the engine — captured corpora carry it; the honoured key is sleep_ms."
+        },
+        "comment": {"type": "string"}
+      }
+    },
+    "cmd": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cmd"],
+      "properties": {
+        "cmd": {"type": "string"},
+        "args": {"type": "array", "items": {"$ref": "#/$defs/int"}},
+        "ms": {
+          "$ref": "#/$defs/int",
+          "description": "Wait length as captured corpora spell it; composed plans carry it in args."
+        },
+        "sleep_ms": {"$ref": "#/$defs/int"},
+        "comment": {"type": "string"}
+      }
+    },
+    "read": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["read", "reg"],
+      "properties": {
+        "read": {"type": "string"},
+        "reg": {"$ref": "#/$defs/byte"},
+        "offset": {"$ref": "#/$defs/byte"},
+        "length": {"type": "integer", "minimum": 1},
+        "store": {"type": "string"},
+        "sleep_ms": {"$ref": "#/$defs/int"},
+        "comment": {"type": "string"}
+      }
+    },
+    "expect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["expect", "reg", "value"],
+      "properties": {
+        "expect": {"type": "string"},
+        "reg": {"$ref": "#/$defs/byte"},
+        "offset": {"$ref": "#/$defs/byte"},
+        "value": {"$ref": "#/$defs/byte"},
+        "mask": {"$ref": "#/$defs/byte"},
+        "op": {"type": "string"},
+        "timeout_ms": {"$ref": "#/$defs/int"},
+        "poll_ms": {"$ref": "#/$defs/int"},
+        "soft": {"type": "boolean"},
+        "sleep_ms": {"$ref": "#/$defs/int"},
+        "comment": {"type": "string"}
+      }
+    },
+    "poll": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["poll", "reg", "value", "timeout_ms"],
+      "properties": {
+        "poll": {"type": "string"},
+        "reg": {"$ref": "#/$defs/byte"},
+        "offset": {"$ref": "#/$defs/byte"},
+        "value": {"$ref": "#/$defs/byte"},
+        "mask": {"$ref": "#/$defs/byte"},
+        "op": {"type": "string"},
+        "timeout_ms": {"$ref": "#/$defs/int"},
+        "poll_ms": {"$ref": "#/$defs/int"},
+        "soft": {"type": "boolean"},
+        "sleep_ms": {"$ref": "#/$defs/int"},
+        "comment": {"type": "string"}
+      }
+    },
+    "retry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["retry", "steps"],
+      "properties": {
+        "retry": {"type": "integer", "minimum": 1},
+        "steps": {"type": "array", "items": {"$ref": "#/$defs/step"}},
+        "delay_ms": {"$ref": "#/$defs/int"},
+        "on_fail": {"type": "string"},
+        "sleep_ms": {"$ref": "#/$defs/int"},
+        "comment": {"type": "string"}
+      }
+    }
+  }
+}

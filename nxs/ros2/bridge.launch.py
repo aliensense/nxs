@@ -1,36 +1,24 @@
-"""Launch the NXS ROS 2 bridge from the suite manifest.
-
-A thin, distro-agnostic wrapper (no ament package, no per-distro
-build). With a readable manifest it starts one `nxs --unit <name>
-ros2` process per unit — the ROS-idiomatic process-per-node shape, and
-the rate-correct one: a single Python interpreter caps the combined
-sample pipeline well under two 200 Hz units, while per-unit processes
-each poll, decode, and publish at the device rate. Without a manifest
-it falls back to one suite-mode process. `viz:=true` adds a
-`static_transform_publisher` per manifest unit and RViz2 with a config
-generated from the manifest — one Imu display per IMU-publishing unit,
-wired to its `/<base>/<unit>/imu` topic — so the sensors show up in
-one command.
-
-    ros2 launch "$(nxs ros2 --launch-file)"
-    ros2 launch "$(nxs ros2 --launch-file)" viz:=true stamp:=arrival
-"""
+"""Launch the NXS ROS 2 bridge from the suite manifest: one `nxs --unit <name>
+ros2` process per unit (one suite-mode process without a manifest); `viz:=true`
+adds RViz2 and a static TF per unit; `cameras:=true` adds one capture node per
+camera link the ports' records carry, publishing `/<topic_base>/<port>/<link>/
+image_raw` and `camera_info`. Usage: ros2 launch "$(nxs ros2 --launch-file)"."""
 
 from nxs.stamp_modes import STAMP_MODES, STAMP_SYNCED
 
 from launch import LaunchDescription
-from launch.actions import (DeclareLaunchArgument, ExecuteProcess,
+from launch.actions import (DeclareLaunchArgument, ExecuteProcess, TimerAction,
                             OpaqueFunction)
 from launch.substitutions import LaunchConfiguration
-from launch_ros.actions import Node
+from launch_ros.actions import ComposableNodeContainer, Node
+from launch_ros.descriptions import ComposableNode
 
 BASE_FRAME = "nxs"
 
 
 def _manifest_units():
-    """(unit name, sanitized frame, sensor specs) per manifest unit,
-    best-effort — an absent or unreadable manifest yields an empty list
-    (the launch falls back to one suite-mode bridge; RViz still runs)."""
+    """(unit name, sanitized frame, sensor specs) per manifest unit; an absent
+    or unreadable manifest yields an empty list."""
     try:
         from nxs.ros2_bridge import sanitize_ros_name
         from nxs.suite import default_config_path
@@ -59,10 +47,8 @@ def _viz_actions(context):
                 arguments=["-d", build_viz_rviz_config(imu_units, topic_base)],
                 output="log")
 
-    # One static transform per unit so RViz can place each frame; spread
-    # along Y so they read apart on the bench (real mounting is the
-    # consumer's URDF). Positional args (x y z yaw pitch roll parent
-    # child) are the form stable across Humble→Jazzy.
+    # One static transform per unit so RViz can place each frame, spread along
+    # Y (real mounting is the consumer's URDF); positional args are the stable form.
     transforms = [
         Node(package="tf2_ros", executable="static_transform_publisher",
              output="log",
@@ -71,6 +57,38 @@ def _viz_actions(context):
         for i, (_, frame, _) in enumerate(units)]
 
     return [rviz, *transforms]
+
+
+def _camera_actions(context):
+    """Deferred until launch so `cameras`, `camera_source` and `topic_base`
+    resolve: one capture node per camera link with recorded caps, a
+    GStreamer camera node each, or the Argus nodes in one component
+    container."""
+    if LaunchConfiguration("cameras").perform(context).lower() not in ("true", "1"):
+        return []
+    from nxs.ros2_cameras import (CAMERA_SOURCES, CAMERA_STAGGER_S, argus_node, camera_plan,
+                                  gscam_node)
+    topic_base = LaunchConfiguration("topic_base").perform(context)
+    source = LaunchConfiguration("camera_source").perform(context)
+    encoding = LaunchConfiguration("camera_encoding").perform(context)
+    if source not in CAMERA_SOURCES:
+        raise ValueError(f"camera_source must be one of {', '.join(CAMERA_SOURCES)}, not {source!r}")
+    plan = camera_plan()
+    if not plan:
+        return []
+    if source == "gstreamer":
+        # One source at a time: the second and later nodes start after a
+        # stagger, the way the tool starts its own viewers.
+        nodes = [Node(**gscam_node(topic, topic_base, encoding=encoding), output="screen")
+                 for topic in plan]
+        return [nodes[0]] + [TimerAction(period=i * CAMERA_STAGGER_S, actions=[node])
+                             for i, node in enumerate(nodes) if i > 0]
+    nodes = [ComposableNode(**argus_node(topic, topic_base)) for topic in plan]
+    return [ComposableNodeContainer(name="nxs_cameras", namespace="",
+                                    package="rclcpp_components",
+                                    executable="component_container_mt",
+                                    composable_node_descriptions=nodes,
+                                    output="screen")]
 
 
 def generate_launch_description():
@@ -96,4 +114,12 @@ def generate_launch_description():
                               description="leading topic namespace"),
         DeclareLaunchArgument("viz", default_value="false",
                               description="also start RViz + per-unit static TF"),
-        *bridges, OpaqueFunction(function=_viz_actions)])
+        DeclareLaunchArgument("cameras", default_value="false",
+                              description="also publish every camera link's frames"),
+        DeclareLaunchArgument("camera_source", default_value="gstreamer",
+                              description="the camera node kind: gstreamer|argus"),
+        DeclareLaunchArgument("camera_encoding", default_value="yuv422",
+                              description="the GStreamer node's image encoding: "
+                                          "yuv422|mono8|rgb8|jpeg"),
+        *bridges, OpaqueFunction(function=_viz_actions),
+        OpaqueFunction(function=_camera_actions)])

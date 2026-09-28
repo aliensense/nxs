@@ -1,26 +1,12 @@
-"""
-nxs — Declarative sensor driver compiler, client SDK, and suite tooling for NXS.
+"""nxs: sensor driver compiler, client SDK, and suite tooling for NXS. `Sample`
+here is the driver DSL's measure-loop return type; the decoded stream sample
+`open_client(...).iter_samples()` yields is `nxs.client.Sample`."""
 
-Two surfaces, one package. Authoring: write sensor drivers as Python
-classes, compile to VM bytecode. Integration: drive a device over any
-transport and consume decoded samples.
-
-    # Authoring
-    from nxs import RegisterDriver, Sample, SpiProfile
-
-    # Integration
-    from nxs import open_client
-    client = open_client("i2c", bus="/dev/i2c-2", address=0x30)
-    for sample in client.iter_samples():
-        handle(sample.values)
-
-`Sample` at this level is the driver DSL's measure-loop return type;
-the decoded stream sample `iter_samples()` yields lives at
-`nxs.client.Sample` (received, not constructed — rarely imported).
-"""
+from importlib.metadata import PackageNotFoundError, version as _installed_version
 
 from nxs.client import NxsClient
 from nxs.compiler import (
+    CameraSensor,
     CompiledDriver,
     I2cCommandDriver,
     RegisterDriver,
@@ -28,10 +14,23 @@ from nxs.compiler import (
     SensorDriver,
     StreamDriver,
 )
-from nxs.profiles import I2cProfile, SpiProfile, UartProfile
+from nxs.profiles import I2cProfile, SpiProfile
 from nxs.transports import open_client
 
+
+
+def _version() -> str:
+    """The installed wheel's version, `0.0.0+source` in a checkout."""
+    try:
+        return _installed_version("aliensense-nxs")
+    except PackageNotFoundError:
+        return "0.0.0+source"
+
+
+__version__ = _version()
+
 __all__ = [
+    "CameraSensor",
     "CompiledDriver",
     "I2cCommandDriver",
     "I2cProfile",
@@ -41,6 +40,5 @@ __all__ = [
     "SensorDriver",
     "SpiProfile",
     "StreamDriver",
-    "UartProfile",
     "open_client",
 ]

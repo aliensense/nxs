@@ -1,10 +1,5 @@
-"""Apply-discovered per-unit state, kept out of the manifest.
-
-Serials recorded on first contact (TOFU), applied firmware versions,
-and panel hashes live here — facts the tool learned, not intent the
-operator declared. The file mirrors SSH's known_hosts split: the
-manifest stays hand-owned, this file is the tool's.
-"""
+"""Apply-discovered per-unit state, kept out of the manifest: serials recorded
+on first contact (TOFU), applied firmware versions, and panel hashes."""
 import logging
 import os
 import time
@@ -30,9 +25,8 @@ class SuiteState:
         except FileNotFoundError:
             raw = {}  # normal first run
         except (OSError, yaml.YAMLError, UnicodeDecodeError) as e:
-            # Any other unreadability — permissions, bad encoding, malformed
-            # YAML — degrades to no recorded state rather than a traceback;
-            # TOFU records re-learn on the next apply.
+            # Any other unreadability degrades to no recorded state rather than a
+            # traceback; TOFU records re-learn on the next apply.
             log.warning("state file %s unreadable (%s); starting fresh", path, e)
             raw = {}
         if not isinstance(raw, dict):
@@ -48,9 +42,7 @@ class SuiteState:
         return cls(path, units)
 
     def save(self):
-        """Atomic write (tmp + rename) so a crash never truncates state.
-        A no-op unless something was recorded — a converged switch leaves
-        the file untouched."""
+        """Atomic write (tmp + rename); a no-op unless something was recorded."""
         if not self._dirty:
             return
         directory = os.path.dirname(self._path)
@@ -63,8 +55,8 @@ class SuiteState:
         self._dirty = False
 
     def unit(self, name: str) -> dict:
-        """A copy of the unit's record — writes go through `record()`,
-        which is what gates the save; a mutated copy changes nothing."""
+        """A copy of the unit's record; writes go through `record()`, which gates
+        the save."""
         return dict(self._units.get(name, {}))
 
     def record(self, name: str, **fields):

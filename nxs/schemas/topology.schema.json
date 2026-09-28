@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aliensense.github.io/nxs-docs/schemas/topology.schema.json",
+  "title": "NXS camera port set (topology.yaml)",
+  "description": "A port is one carrier CSI port: its I2C bus, its deserializer, and the GMSL links behind it. A port that names no `des_compatible` carries the one sensor on its own bus, and its link names no serializer and no deserializer window. A file is either one port or a `ports` map with a default. The api-1 spelling `cards`/`default_card` is renamed to these on load.",
+  "oneOf": [
+    {"$ref": "#/$defs/port"},
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ports"],
+      "properties": {
+        "ports": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {"pattern": "^[0-9]+$"},
+          "additionalProperties": {"$ref": "#/$defs/port"}
+        },
+        "default_port": {"type": "integer", "minimum": 0}
+      }
+    }
+  ],
+  "$defs": {
+    "int": {
+      "anyOf": [
+        {"type": "integer"},
+        {"type": "string", "pattern": "^[+-]?(0[xX][0-9a-fA-F]+|0[oO][0-7]+|0[bB][01]+|[0-9]+)$"}
+      ]
+    },
+    "unit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["alias_addr"],
+      "properties": {
+        "alias_addr": {
+          "$ref": "#/$defs/int",
+          "description": "The host address the link presents the unit at. With more than one unit behind the hub each needs its own, different from its target_addr."
+        },
+        "target_addr": {"$ref": "#/$defs/int"}
+      }
+    },
+    "link": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "compatible"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "compatible": {"type": "string"},
+        "ser_compatible": {"type": "string"},
+        "des_window": {"$ref": "#/$defs/int"},
+        "csi_vc": {"$ref": "#/$defs/int"},
+        "ser_addr": {"$ref": "#/$defs/int"},
+        "sensor_addr": {"$ref": "#/$defs/int"},
+        "tca_addr": {"$ref": "#/$defs/int"},
+        "capture_id": {"anyOf": [{"$ref": "#/$defs/int"}, {"type": "null"}]},
+        "inck_hz": {"anyOf": [{"$ref": "#/$defs/int"}, {"type": "null"}]},
+        "nxs_units": {"type": "array", "items": {"$ref": "#/$defs/unit"}},
+        "mode": {"type": "string", "minLength": 1}
+      }
+    },
+    "port": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["carrier", "i2c_bus"],
+      "if": {"required": ["des_compatible"]},
+      "then": {
+        "properties": {"links": {"additionalProperties": {
+          "required": ["ser_compatible", "des_window", "csi_vc"]}}}
+      },
+      "else": {
+        "required": ["links"],
+        "properties": {
+          "links": {"minProperties": 1, "maxProperties": 1, "additionalProperties": {
+            "propertyNames": {"not": {"enum": ["ser_compatible", "des_window", "ser_addr", "tca_addr"]}},
+            "properties": {"csi_vc": {"enum": [0, "0", "0x0"]}}}}
+        },
+        "not": {"required": ["des_addr"]}
+      },
+      "properties": {
+        "carrier": {"type": "string", "minLength": 1},
+        "i2c_bus": {"type": "string", "minLength": 1},
+        "des_compatible": {"type": "string"},
+        "des_addr": {"$ref": "#/$defs/int"},
+        "csi_lanes": {
+          "anyOf": [
+            {"type": "integer", "minimum": 1, "maximum": 4},
+            {"type": "string", "pattern": "^[1-4]$"}
+          ]
+        },
+        "sync": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "source": {"enum": ["free_run", "fsync"]},
+            "fps": {"type": "number", "exclusiveMinimum": 0}
+          }
+        },
+        "links": {
+          "type": "object",
+          "propertyNames": {"pattern": "^[0-9]+$"},
+          "additionalProperties": {"$ref": "#/$defs/link"}
+        },
+        "node_addrs": {
+          "description": "The booted capture tree's node address per virtual channel, the address the host reaches that channel's sensor at (its link's serializer maps it to the sensor's own). Read from the tree; a file states it for a rig the tree does not describe.",
+          "type": "object",
+          "propertyNames": {"pattern": "^[0-9]+$"},
+          "additionalProperties": {"$ref": "#/$defs/int"}
+        }
+      }
+    }
+  }
+}

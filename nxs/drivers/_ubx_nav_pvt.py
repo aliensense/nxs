@@ -1,13 +1,10 @@
 """Shared UBX machinery for u-blox stream drivers.
 
-One epoch message serves the whole family: the binary measure loop
-(sync → acquisition stamp → fixed 98-byte frame → NAV-PVT match →
-Fletcher checksum → commit) and the typed output table over the 92-byte
-payload are identical across receivers, as are the UBX frame assembly
-and the CFG-VALSET configuration transport. Each driver keeps its own
-probe expectations, configuration keys, rates, and NMEA variant. The
-helpers are plain Python evaluated at compile time inside the traced
-probe()/configure() — they never reach the measure loop.
+One binary measure loop (sync, acquisition stamp, 98-byte frame, NAV-PVT
+match, Fletcher check, commit), one typed output table over the 92-byte
+payload, and the UBX frame and CFG-VALSET helpers. A subclass keeps its
+own probe, config keys, rates, and NMEA variant. The helpers are plain
+Python run at compile time inside probe()/configure().
 """
 
 from nxs import StreamDriver
@@ -39,9 +36,8 @@ def ubx_frame(msg_class, msg_id, payload):
 
 
 def valset_body(kvs):
-    """CFG-VALSET payload targeting the volatile RAM layer: version(0),
-    layers=RAM(0x01), reserved(2), then little-endian key + value per
-    (key, value, width)."""
+    """CFG-VALSET payload for the RAM layer: version 0, layers 0x01,
+    reserved(2), then little-endian key + value per (key, value, width)."""
     body = bytes([0x00, 0x01, 0x00, 0x00])
     for key, val, width in kvs:
         body += key.to_bytes(4, 'little') + val.to_bytes(width, 'little')
@@ -59,21 +55,17 @@ class UbxNavPvtDriver(StreamDriver):
     def apply_nav_pvt_outputs(self):
         """Declare the NAV-PVT output table and sample size.
 
-        The frame commits to sample_buf as
-        [class, id, len_lo, len_hi, payload(92), CK_A, CK_B], so payload
-        byte P sits at sample offset 4 + P; multi-byte fields are
-        little-endian. `altitude` is hMSL (the geodetic subject's
-        datum); the ellipsoidal height ships alongside as a generic
-        field. Excluded payload fields: year..sec/valid/tAcc/nano (the
-        epoch rides `itow` and the acquisition timestamp),
-        flags/flags2/flags3 (status bits), headAcc/headVeh, and
-        magDec/magAcc.
+        The frame commits as [class, id, len(2), payload(92), CK_A, CK_B],
+        so payload byte P sits at offset 4 + P, little-endian. `altitude`
+        is hMSL; the ellipsoidal height ships as `alt_ellipsoid`. Not
+        published: year..sec, valid, tAcc, nano (the epoch rides `itow`),
+        flags, flags2, flags3, headAcc, headVeh, magDec, magAcc.
         """
         lla = 1e-7 * _DEG_TO_RAD     # 1e-7 deg -> rad (lat/lon)
         hdg = 1e-5 * _DEG_TO_RAD     # 1e-5 deg -> rad (heading)
         mm = 0.001                    # mm -> m, mm/s -> m/s
-        # 16 outputs = MAX_OUTPUTS (constants/driver_image.yaml): adding
-        # a field here overflows the descriptor table for both drivers.
+        # 16 outputs is the descriptor table's limit; a 17th field overflows
+        # it for both drivers.
         self.set_output([
             {'name': 'itow', 'type': 'uint32', 'byte_order': 'little',
              'at': 4,                                                # pl 0

@@ -1,0 +1,8 @@
+# yaml-language-server: $schema=../schemas/unit-driver.schema.json
+# AS5047D driver for NXS VM.
+# Parameter capabilities; order fixes the wire's param
+# indices, so entries never reorder.
+meta:
+  driver: as5047d
+params:
+  - {name: sample_rate, values: [10, 50, 100, 250, 500, 1000], default: 500, unit: Hz}

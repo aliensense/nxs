@@ -1,31 +1,22 @@
-"""Calibration solvers — pure Python, no numpy.
-
-The device stores and applies one affine per vector bucket, and these
-produce the coefficients from acquisition data. Every solver self-checks
-its fit and raises `CalSolveError` on a result that would fail the
-falsifiable bar, so a verb can never upload a plausible-but-bad solution.
-
-All solves run in the sensor frame — the mounting orientation is a
-separate record field composed on top by the appliers.
-"""
+"""Host-side accelerometer calibration solver in the sensor frame, pure Python.
+Six poses determine the six parameters exactly and two unseen check poses in
+opposite octants check it; a result past a bound raises `CalSolveError`."""
 import math
 from dataclasses import dataclass
 from typing import List, Sequence, Tuple
 
 STANDARD_GRAVITY = 9.80665
 
-# Fit-acceptance gates. Residuals are relative to the reference magnitude
-# (gravity / local field), so the same bounds serve both solvers.
-ACCEL_MAX_RESIDUAL = 0.05    # 5% of g on any captured pose
-# Scale bounds on M's diagonal. A residual gate alone cannot catch a
-# degenerate scale: a fit can reproduce every captured pose inside 5% while
-# carrying a nonsense gain, because the poses only constrain the directions
-# they were captured in. ArduPilot bounds its accel diagonal the same way
-# (`AccelCalibrator`, 0.8..1.2) for the same reason.
+# Bounds on the recovered parameters: six poses fit six parameters exactly,
+# so a moved pose lands here, not in a residual (ArduPilot bounds the same).
 ACCEL_MIN_SCALE = 0.8
 ACCEL_MAX_SCALE = 1.2
-MAG_MAX_SPREAD = 0.10        # 10% RMS spread of |B| after calibration
-MIN_FIELD_FRACTION = 0.05    # reject a fit whose radius collapsed
+ACCEL_MAX_OFFSET = 0.10      # of g, on any axis
+# |a| error allowed on an unseen check pose; two check directions cannot
+# validate six parameters, so a push across a pose's other axes can pass.
+ACCEL_CHECK_TOLERANCE = 0.03  # of g
+GN_ITERATIONS = 50
+GN_STEP_TOL = 1e-9
 
 
 class CalSolveError(RuntimeError):
@@ -34,12 +25,26 @@ class CalSolveError(RuntimeError):
 
 @dataclass
 class VectorSolution:
-    """One bucket's solved affine plus its fit diagnostics."""
-    m: Tuple[float, ...]     # row-major 3x3
-    b: Tuple[float, ...]
-    rms_residual: float      # relative to the reference magnitude
-    max_residual: float
-    radius: float            # recovered reference magnitude (accel: g)
+    """One bucket's fitted per-axis parameters, with the record form derived."""
+    scale: Tuple[float, ...]   # per-axis gain
+    offset: Tuple[float, ...]  # per-axis zero-g offset, measured units
+
+    @property
+    def m(self) -> Tuple[float, ...]:
+        """Row-major 3x3 for the record: the scales on the diagonal."""
+        rows = [0.0] * 9
+        for k in range(3):
+            rows[k * 3 + k] = self.scale[k]
+        return tuple(rows)
+
+    @property
+    def b(self) -> Tuple[float, ...]:
+        """Bias for the record: `-scale * offset` per axis."""
+        return tuple(-s * o for s, o in zip(self.scale, self.offset))
+
+    def correct(self, v: Sequence[float]) -> Tuple[float, ...]:
+        """Apply the fit to one measured vector: `scale * (v - offset)`."""
+        return tuple(s * (x - o) for s, x, o in zip(self.scale, v, self.offset))
 
 
 def solve_linear(a: List[List[float]], b: List[float]) -> List[float]:
@@ -62,85 +67,68 @@ def solve_linear(a: List[List[float]], b: List[float]) -> List[float]:
     return x
 
 
-def eig_sym3(a: Sequence[Sequence[float]]):
-    """Eigen-decompose a symmetric 3x3 by cyclic Jacobi rotations.
-
-    Returns (eigenvalues, eigenvectors) with eigenvectors as columns:
-    A = V·diag(w)·Vᵀ.
-    """
-    a = [list(row) for row in a]
-    v = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
-    for _ in range(64):
-        p, q = max(((0, 1), (0, 2), (1, 2)), key=lambda t: abs(a[t[0]][t[1]]))
-        if abs(a[p][q]) < 1e-15:
-            break
-        theta = 0.5 * math.atan2(2.0 * a[p][q], a[q][q] - a[p][p])
-        c = math.cos(theta)
-        s = math.sin(theta)
-        for k in range(3):
-            akp = c * a[k][p] - s * a[k][q]
-            akq = s * a[k][p] + c * a[k][q]
-            a[k][p], a[k][q] = akp, akq
-        for k in range(3):
-            apk = c * a[p][k] - s * a[q][k]
-            aqk = s * a[p][k] + c * a[q][k]
-            a[p][k], a[q][k] = apk, aqk
-        for k in range(3):
-            vkp = c * v[k][p] - s * v[k][q]
-            vkq = s * v[k][p] + c * v[k][q]
-            v[k][p], v[k][q] = vkp, vkq
-    return [a[0][0], a[1][1], a[2][2]], v
-
-
-def _apply(m: Sequence[float], b: Sequence[float],
-           v: Sequence[float]) -> List[float]:
-    return [m[i * 3] * v[0] + m[i * 3 + 1] * v[1] + m[i * 3 + 2] * v[2] + b[i]
-            for i in range(3)]
-
-
-def solve_accel(captures: Sequence[Tuple[Sequence[float], Sequence[float]]],
+def solve_accel(poses: Sequence[Sequence[float]],
                 gravity: float = STANDARD_GRAVITY) -> VectorSolution:
-    """12-param fit from still poses: reference = M·measured + b.
+    """6-param fit from still poses: |diag(s)·(v − o)| = g. `poses` holds each
+    pose's mean vector; the set must span all three axes (each up and down).
+    Gauss-Newton from the identity; scales and offsets are bounded."""
+    if len(poses) < 6:
+        raise CalSolveError(f"need at least 6 poses, got {len(poses)}")
+    if any(math.hypot(*v) < 1e-9 for v in poses):
+        raise CalSolveError("a pose reads zero — nothing uploaded")
+    o = [0.0, 0.0, 0.0]
+    s = [1.0, 1.0, 1.0]
+    for _ in range(GN_ITERATIONS):
+        jtj = [[0.0] * 6 for _ in range(6)]
+        jtr = [0.0] * 6
+        for v in poses:
+            c = [s[k] * (v[k] - o[k]) for k in range(3)]
+            norm = math.hypot(*c)
+            r = norm - gravity
+            j = [0.0] * 6
+            for k in range(3):
+                j[k] = -c[k] * s[k] / norm
+                j[3 + k] = c[k] * (v[k] - o[k]) / norm
+            for p in range(6):
+                jtr[p] += j[p] * r
+                for q in range(6):
+                    jtj[p][q] += j[p] * j[q]
+        try:
+            step = solve_linear(jtj, [-x for x in jtr])
+        except CalSolveError:
+            raise CalSolveError("poses do not span all three axes — "
+                                "nothing uploaded") from None
+        for k in range(3):
+            o[k] += step[k]
+            s[k] += step[3 + k]
+        if max(abs(x) for x in step) < GN_STEP_TOL:
+            break
+    else:
+        raise CalSolveError(f"accel fit did not converge in {GN_ITERATIONS} "
+                            "iterations — nothing uploaded")
 
-    ``captures`` pairs each pose's mean measured vector with its known
-    gravity reference (±g on the dominant sensor axis). Solves each row of
-    [M | b] as an independent 4-unknown least-squares over all poses, then
-    verifies every pose reproduces its reference within the gate.
-    """
-    if len(captures) < 6:
-        raise CalSolveError(f"need at least 6 poses, got {len(captures)}")
-    rows = []
-    bias = []
-    for j in range(3):
-        xtx = [[0.0] * 4 for _ in range(4)]
-        xty = [0.0] * 4
-        for measured, reference in captures:
-            x = [measured[0], measured[1], measured[2], 1.0]
-            for p in range(4):
-                xty[p] += x[p] * reference[j]
-                for q in range(4):
-                    xtx[p][q] += x[p] * x[q]
-        sol = solve_linear(xtx, xty)
-        rows.extend(sol[:3])
-        bias.append(sol[3])
-
-    residuals = [max(abs(a - r) for a, r in
-                     zip(_apply(rows, bias, measured), reference))
-                 for measured, reference in captures]
-    rms = math.sqrt(sum(r * r for r in residuals) / len(residuals)) / gravity
-    worst = max(residuals) / gravity
-    if worst > ACCEL_MAX_RESIDUAL:
-        raise CalSolveError(
-            f"accel fit residual {worst * 100:.1f}% of g exceeds "
-            f"{ACCEL_MAX_RESIDUAL * 100:.0f}% — poses moved or mislabeled; "
-            "nothing uploaded")
+    max_offset = ACCEL_MAX_OFFSET * gravity
     for axis in range(3):
-        scale = rows[axis * 3 + axis]
-        if not ACCEL_MIN_SCALE <= scale <= ACCEL_MAX_SCALE:
+        if not ACCEL_MIN_SCALE <= s[axis] <= ACCEL_MAX_SCALE:
             raise CalSolveError(
-                f"accel fit scale {scale:.3f} on axis {axis} outside "
-                f"{ACCEL_MIN_SCALE}..{ACCEL_MAX_SCALE} — a degenerate fit the "
-                "residual gate cannot see; nothing uploaded")
-    return VectorSolution(m=tuple(rows), b=tuple(bias), rms_residual=rms,
-                          max_residual=worst, radius=gravity)
+                f"accel fit scale {s[axis]:.3f} on axis {axis} outside "
+                f"{ACCEL_MIN_SCALE}..{ACCEL_MAX_SCALE} — a moved pose; "
+                "nothing uploaded")
+        if abs(o[axis]) > max_offset:
+            raise CalSolveError(
+                f"accel fit offset {o[axis]:.2f} on axis {axis} exceeds "
+                f"±{max_offset:.2f} — a moved pose; nothing uploaded")
+    return VectorSolution(scale=tuple(s), offset=tuple(o))
 
+
+def verify_accel(sol: VectorSolution, pose: Sequence[float],
+                 gravity: float = STANDARD_GRAVITY) -> float:
+    """Relative |a| error of a still pose the fit did not use, as a
+    fraction of g; raises past `ACCEL_CHECK_TOLERANCE`."""
+    err = abs(math.hypot(*sol.correct(pose)) / gravity - 1.0)
+    if err > ACCEL_CHECK_TOLERANCE:
+        raise CalSolveError(
+            f"check pose reads {err * 100:.1f}% off g (bound "
+            f"{ACCEL_CHECK_TOLERANCE * 100:.0f}%) — a pose moved during "
+            "capture; nothing uploaded")
+    return err

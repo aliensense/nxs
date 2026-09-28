@@ -1,0 +1,25 @@
+NXS Runtime Library License
+
+Copyright 2026 Aliensense. All rights reserved except as granted below.
+
+The executor library of this package, nxs/_lib/libnxs.so (the "Library"),
+is licensed, not sold. Aliensense grants you a non-exclusive,
+non-transferable license to:
+
+1. install and run the Library, through the nxs tool or through a program
+   of your own written against its public headers, on hosts that operate
+   NXS hardware, in as many copies as your deployment needs;
+2. pass this package on, unmodified, with the NXS hardware it serves.
+
+The public headers under nxs/_lib/include are licensed under the Apache
+License, Version 2.0, and a program you write against them is yours.
+
+Any other use, copy, modification, decompilation, disassembly, reverse
+engineering or redistribution of the Library, or of a work derived from
+it, requires written permission from Aliensense.
+
+THE LIBRARY IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE, AND NON-INFRINGEMENT. IN NO EVENT SHALL ALIENSENSE BE
+LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM THE LIBRARY
+OR ITS USE.

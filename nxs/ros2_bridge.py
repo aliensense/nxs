@@ -1,28 +1,13 @@
-"""Descriptor-driven ROS 2 bridge — the engine behind `nxs ros2`.
-
-The device serves per-field descriptors (name, unit, semantic, scale,
-offset); `plan_publications` groups them onto standard ROS 2 messages
-by semantic — the same `FieldSemantics` routing the device uses for its
-own SI subjects, reframed as sensor_msgs — so any driver appears in ROS
-with zero per-sensor config. Fillers are pure functions from a
-`Publication` plus decoded sample values to a dotted-path dict;
-`Ros2Bridge` is the only rclpy surface (imported lazily, so the tool
-runs without ROS everywhere else). `run_bridge` fans in any number of
-units: one reader thread per transport feeds a queue, and the thread
-that owns the node drains it.
-"""
+"""Descriptor-driven ROS 2 bridge, the engine behind `nxs ros2`: `plan_publications`
+groups device-served field descriptors onto standard ROS 2 messages by semantic,
+fillers map decoded values onto them, and `Ros2Bridge` is the only rclpy surface."""
 
 import atexit
 import fcntl
 import hashlib
-import importlib
 import logging
-import math
 import os
 import queue
-
-from nxs.client import PUSH_INTERVAL_S, SupportsTimeSync, estimate_and_push
-import re
 import sys
 import tempfile
 import threading
@@ -32,492 +17,52 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import yaml
 
-from nxs._generated_constants import FieldSemantics, GpsTime
-
-log = logging.getLogger(__name__)
-
-Sem = FieldSemantics.FieldSemantic
-
-# Frozen sensor_msgs wire constants, hardcoded so the planning core never
-# imports ROS packages (the rclpy smoke test cross-asserts them against
-# the real message classes).
-NAVSAT_STATUS_NO_FIX = -1
-NAVSAT_STATUS_FIX = 0
-NAVSAT_SERVICE_ALL = 0b1111  # GPS|GLONASS|COMPASS|GALILEO — the wire carries no constellation identity
-COVARIANCE_TYPE_UNKNOWN = 0
-COVARIANCE_TYPE_DIAGONAL_KNOWN = 2
-
-# Variance for a missing accuracy estimate — the device's own sentinel
-# for "unknown" on its geodetic subject (host interface, SI projection).
-UNKNOWN_VARIANCE = 1.0e6
-
-ACCEL_AXES = (Sem.ACCEL_X, Sem.ACCEL_Y, Sem.ACCEL_Z)
-GYRO_AXES = (Sem.GYRO_X, Sem.GYRO_Y, Sem.GYRO_Z)
-MAG_AXES = (Sem.MAG_X, Sem.MAG_Y, Sem.MAG_Z)
-GEO_POSITION = (Sem.LATITUDE, Sem.LONGITUDE, Sem.ALTITUDE)
-GEO_VELOCITY = (Sem.VEL_NORTH, Sem.VEL_EAST, Sem.VEL_DOWN)
+from nxs.client import PUSH_INTERVAL_S, SupportsTimeSync, estimate_and_push
+from nxs._generated_constants import GpsTime
+from nxs.ros2_semantics import (
+    ACCEL_AXES, COVARIANCE_TYPE_DIAGONAL_KNOWN, COVARIANCE_TYPE_UNKNOWN,
+    FIX_TYPES_WITH_FIX, FIX_TYPES_WITH_TIME, GEO_POSITION, GEO_VELOCITY,
+    GYRO_AXES, HOST_CLOCK_FLOOR_UNIX_S, MAG_AXES, NAVSAT_SERVICE_ALL,
+    NAVSAT_STATUS_FIX, NAVSAT_STATUS_NO_FIX, Publication, Sem,
+    UNKNOWN_VARIANCE, UnitPlan, epoch_binding, fields_by_semantic, fill_imu,
+    fill_mag, fill_mapped, fill_navsat, fill_pressure, fill_publication,
+    fill_scalar, fill_temperature, fill_text, fill_twist, join_topic,
+    load_map, navsat_status_from_fix_type, plan_publications,
+    resolve_msg_type, sanitize_ros_name, sensor_plans_imu, set_nested_attr,
+    stamp_from_us, utc_from_itow)
 
 # Re-exported so bridge consumers keep one import site; the names live in
 # a leaf module the CLI and launch surfaces can read without the bridge.
 from nxs.stamp_modes import (STAMP_ARRIVAL, STAMP_DEVICE, STAMP_ITOW,
                              STAMP_MODES, STAMP_SYNCED)
 
-
-def resolve_msg_type(type_string: str):
-    """Resolve a ROS 2 message type string to the actual Python class.
-
-    Example: "sensor_msgs/msg/Imu" → sensor_msgs.msg.Imu
-    """
-    parts = type_string.replace("/", ".")
-    module_path, _, class_name = parts.rpartition(".")
-    module = importlib.import_module(module_path)
-    return getattr(module, class_name)
-
-
-def set_nested_attr(obj, path: str, value):
-    """Set a nested attribute using dot notation.
-
-    Example: set_nested_attr(msg, "linear_acceleration.x", 9.81)
-    """
-    parts = path.split(".")
-    for part in parts[:-1]:
-        obj = getattr(obj, part)
-    setattr(obj, parts[-1], value)
-
-
-@dataclass(frozen=True)
-class Publication:
-    """One planned ROS publisher: which message, on which relative topic,
-    fed by which sample fields (`bindings` maps a filler role to a field
-    name; `extras` carries the --map mapping/constants payload)."""
-    key: str
-    kind: str
-    msg_type: str
-    topic: str
-    bindings: Dict[str, str]
-    extras: dict = field(default_factory=dict)
-
-
-@dataclass
-class UnitPlan:
-    """One bridged unit: its manifest name (None for an ad-hoc device),
-    the frame_id its messages carry, its planned publications, and the
-    epoch-capable binding (`--stamp itow`'s field pair) when present."""
-    name: Optional[str]
-    frame_id: str
-    publications: List[Publication]
-    epoch: Optional[Tuple[str, str]] = None
-
-
-def fields_by_semantic(fields: List[dict]) -> Dict[int, dict]:
-    """First field claiming each non-generic semantic (strings excluded) —
-    the one resolver behind publication planning and epoch binding."""
-    by_sem: Dict[int, dict] = {}
-    for f in fields:
-        sem = int(f.get('semantic', Sem.GENERIC))
-        if sem != Sem.GENERIC and sem not in by_sem \
-                and f.get('type') != 'string':
-            by_sem[sem] = f
-
-    return by_sem
-
-
-def epoch_binding(fields: List[dict]) -> Optional[Tuple[str, str]]:
-    """(time-of-week, fix-type) field names when the descriptors carry
-    both registry semantics — the epoch-capable contract `--stamp itow`
-    keys on. Resolved once at plan time so stamping never guesses names."""
-    by_sem = fields_by_semantic(fields)
-    tow = by_sem.get(Sem.TIME_OF_WEEK)
-    fix = by_sem.get(Sem.FIX_TYPE)
-    if tow is None or fix is None:
-        return None
-
-    return tow['name'], fix['name']
-
-
-def plan_publications(fields: List[dict]) -> List[Publication]:
-    """Group device-served descriptors into ROS publications by semantic.
-
-    Vector groups (accel, gyro, mag) and the geodetic position/velocity
-    triples form their standard message only when every member is
-    present; otherwise the members fall back to per-field topics. The
-    first field carrying a semantic claims it — a duplicate demotes to
-    its own per-field topic. Every field lands in at least one
-    publication; nothing is dropped.
-    """
-    by_sem = fields_by_semantic(fields)
-
-    consumed = set()
-    pubs = []
-
-    def claim(sems) -> List[str]:
-        names = [by_sem[s]['name'] for s in sems]
-        consumed.update(names)
-        return names
-
-    accel_ok = all(s in by_sem for s in ACCEL_AXES)
-    gyro_ok = all(s in by_sem for s in GYRO_AXES)
-    if accel_ok or gyro_ok:
-        bindings = {}
-        if accel_ok:
-            bindings.update(zip(('accel_x', 'accel_y', 'accel_z'),
-                                claim(ACCEL_AXES)))
-        if gyro_ok:
-            bindings.update(zip(('gyro_x', 'gyro_y', 'gyro_z'),
-                                claim(GYRO_AXES)))
-        pubs.append(Publication('imu', 'imu', 'sensor_msgs/msg/Imu',
-                                'imu', bindings))
-
-    if all(s in by_sem for s in MAG_AXES):
-        bindings = dict(zip(('x', 'y', 'z'), claim(MAG_AXES)))
-        pubs.append(Publication('mag', 'mag',
-                                'sensor_msgs/msg/MagneticField',
-                                'mag', bindings))
-
-    if Sem.TEMPERATURE in by_sem:
-        name = claim((Sem.TEMPERATURE,))[0]
-        pubs.append(Publication('temperature', 'temperature',
-                                'sensor_msgs/msg/Temperature',
-                                'temperature', {'value': name}))
-
-    if Sem.PRESSURE in by_sem:
-        name = claim((Sem.PRESSURE,))[0]
-        pubs.append(Publication('pressure', 'pressure',
-                                'sensor_msgs/msg/FluidPressure',
-                                'pressure', {'value': name}))
-
-    fix = by_sem.get(Sem.FIX_TYPE)
-    fix_field = fix['name'] if fix is not None else None
-
-    if all(s in by_sem for s in GEO_POSITION):
-        bindings = dict(zip(('lat', 'lon', 'alt'), claim(GEO_POSITION)))
-        if Sem.POS_H_ACC in by_sem:
-            bindings['h_acc'] = claim((Sem.POS_H_ACC,))[0]
-        if Sem.POS_V_ACC in by_sem:
-            bindings['v_acc'] = claim((Sem.POS_V_ACC,))[0]
-        if fix_field:
-            bindings['fix_type'] = fix_field
-            consumed.add(fix_field)
-        pubs.append(Publication('fix', 'fix', 'sensor_msgs/msg/NavSatFix',
-                                'fix', bindings))
-
-    if all(s in by_sem for s in GEO_VELOCITY):
-        bindings = dict(zip(('north', 'east', 'down'), claim(GEO_VELOCITY)))
-        if fix_field:
-            bindings['fix_type'] = fix_field
-            consumed.add(fix_field)
-        pubs.append(Publication('vel', 'vel',
-                                'geometry_msgs/msg/TwistStamped',
-                                'vel', bindings))
-
-    standard_topics = {p.topic for p in pubs}
-    for f in fields:
-        name = f['name']
-        if name in consumed:
-            continue
-        topic = name
-        if topic in standard_topics:
-            # A field named like a standard topic would publish a second
-            # message type on it; keep the plan deterministic instead.
-            topic = f"field_{name}"
-            log.warning("field %r collides with a standard topic; "
-                        "publishing on %r", name, topic)
-        if f.get('type') == 'string':
-            pubs.append(Publication(f"field:{name}", 'text',
-                                    'std_msgs/msg/String', topic,
-                                    {'value': name}))
-        else:
-            pubs.append(Publication(f"field:{name}", 'scalar',
-                                    'std_msgs/msg/Float64', topic,
-                                    {'value': name}))
-    return pubs
-
-
-# u-blox NAV-PVT fix types carrying a GNSS-derived position: 2D, 3D,
-# GNSS+dead-reckoning. Not listed: 0 no fix, 1 DR-only (unbounded
-# drift), 5 time-only.
-FIX_TYPES_WITH_FIX = (2, 3, 4)
-
-# Fix types whose GPS time is solved: the positions above plus 5
-# time-only. Time validity is a weaker bar than position validity — a
-# time-only fix stamps from iTOW while NavSatFix reports NO_FIX.
-FIX_TYPES_WITH_TIME = (2, 3, 4, 5)
-
-
-def navsat_status_from_fix_type(fix_type: int) -> int:
-    """Map the driver's `fix_type` quality field onto a
-    NavSatStatus.status value. GNSS-derived positions pass as
-    NAVSAT_STATUS_FIX; everything else — including vocabulary this
-    bridge doesn't know — gates as NO_FIX (fail-closed: only positions
-    the bridge can vouch for publish; a driver serving no fix_type at
-    all is trusted instead). Any value below NAVSAT_STATUS_FIX
-    publishes a NO_FIX NavSatFix with NaN position and suppresses the
-    velocity twist.
-    """
-    return NAVSAT_STATUS_FIX if fix_type in FIX_TYPES_WITH_FIX \
-        else NAVSAT_STATUS_NO_FIX
-
-
-# Below this the host clock is implausible (cold boot, no NTP) and the
-# nearest-week resolver would confidently pick a wrong week — refuse
-# instead, as RTKLIB clamps and gpsd warns. 2020-01-01 UTC.
-HOST_CLOCK_FLOOR_UNIX_S = 1_577_836_800
-
-
-def utc_from_itow(itow_s: float, now_unix_s: float) -> Optional[float]:
-    """UTC seconds for a GPS time-of-week, or None when the host clock
-    is too implausible to resolve the week. The week number is resolved
-    against the host clock (nearest of the adjacent weeks, so a rollover
-    boundary can't misplace the epoch; the host only has to be within
-    ±3.5 days), GPS→UTC via the maintained leap constant. A distinct
-    timescale from the host-projected device stamps — mixing the two in
-    one consumer needs care."""
-    if now_unix_s < HOST_CLOCK_FLOOR_UNIX_S:
-        return None
-    now_gps = now_unix_s - GpsTime.GPS_EPOCH_UNIX_S + GpsTime.GPS_UTC_LEAP_S
-    gps = float(itow_s) + GpsTime.GPS_WEEK_S * round((now_gps - float(itow_s))
-                                                     / GpsTime.GPS_WEEK_S)
-    return gps + GpsTime.GPS_EPOCH_UNIX_S - GpsTime.GPS_UTC_LEAP_S
-
-
-def stamp_from_us(us: int) -> Tuple[int, int]:
-    """(sec, nanosec) for a device microsecond timestamp."""
-    return int(us // 1_000_000), int(us % 1_000_000) * 1000
-
-
-def fill_imu(pub: Publication, values: Dict[str, object]) -> Optional[dict]:
-    out = {'orientation_covariance': [-1.0] + [0.0] * 8}
-    for group, target in (('accel', 'linear_acceleration'),
-                          ('gyro', 'angular_velocity')):
-        keys = [f"{group}_{ax}" for ax in 'xyz']
-        if keys[0] in pub.bindings:
-            vals = [values.get(pub.bindings[k]) for k in keys]
-            if any(v is None for v in vals):
-                return None
-            for ax, v in zip('xyz', vals):
-                out[f"{target}.{ax}"] = float(v)
-            out[f"{target}_covariance"] = [0.0] * 9
-        else:
-            out[f"{target}_covariance"] = [-1.0] + [0.0] * 8
-    return out
-
-
-def fill_mag(pub: Publication, values: Dict[str, object]) -> Optional[dict]:
-    vals = [values.get(pub.bindings[ax]) for ax in 'xyz']
-    if any(v is None for v in vals):
-        return None
-    out = {f"magnetic_field.{ax}": float(v) for ax, v in zip('xyz', vals)}
-    out['magnetic_field_covariance'] = [0.0] * 9
-    return out
-
-
-def fill_temperature(pub: Publication,
-                     values: Dict[str, object]) -> Optional[dict]:
-    v = values.get(pub.bindings['value'])
-    if v is None:
-        return None
-    # Wire temperature is kelvin; sensor_msgs/Temperature carries °C.
-    return {'temperature': float(v) - 273.15, 'variance': 0.0}
-
-
-def fill_pressure(pub: Publication,
-                  values: Dict[str, object]) -> Optional[dict]:
-    v = values.get(pub.bindings['value'])
-    if v is None:
-        return None
-    return {'fluid_pressure': float(v), 'variance': 0.0}
-
-
-def fill_navsat(pub: Publication,
-                values: Dict[str, object]) -> Optional[dict]:
-    b = pub.bindings
-    pos = [values.get(b[k]) for k in ('lat', 'lon', 'alt')]
-    if any(v is None for v in pos):
-        return None
-
-    status = NAVSAT_STATUS_FIX
-    if 'fix_type' in b:
-        ft = values.get(b['fix_type'])
-        if ft is None:
-            return None
-        status = navsat_status_from_fix_type(int(ft))
-
-    out = {'status.status': status, 'status.service': NAVSAT_SERVICE_ALL}
-    if status < NAVSAT_STATUS_FIX:
-        # No fix: never a plausible-looking zero position.
-        out.update({'latitude': math.nan, 'longitude': math.nan,
-                    'altitude': math.nan,
-                    'position_covariance': [0.0] * 9,
-                    'position_covariance_type': COVARIANCE_TYPE_UNKNOWN})
-        return out
-
-    lat, lon, alt = (float(v) for v in pos)
-    # Wire position is radians; NavSatFix wants degrees. Altitude is the
-    # device's MSL value (the ellipsoidal height, when the driver serves
-    # one, rides its own per-field topic).
-    out.update({'latitude': math.degrees(lat),
-                'longitude': math.degrees(lon),
-                'altitude': alt})
-
-    h = values.get(b['h_acc']) if 'h_acc' in b else None
-    v = values.get(b['v_acc']) if 'v_acc' in b else None
-    if h is None and v is None:
-        out['position_covariance'] = [0.0] * 9
-        out['position_covariance_type'] = COVARIANCE_TYPE_UNKNOWN
-    else:
-        hv = float(h) ** 2 if h is not None else UNKNOWN_VARIANCE
-        vv = float(v) ** 2 if v is not None else UNKNOWN_VARIANCE
-        out['position_covariance'] = [hv, 0.0, 0.0,
-                                      0.0, hv, 0.0,
-                                      0.0, 0.0, vv]
-        out['position_covariance_type'] = COVARIANCE_TYPE_DIAGONAL_KNOWN
-    return out
-
-
-def fill_twist(pub: Publication,
-               values: Dict[str, object]) -> Optional[dict]:
-    b = pub.bindings
-    if 'fix_type' in b:
-        ft = values.get(b['fix_type'])
-        if ft is None or navsat_status_from_fix_type(int(ft)) \
-                < NAVSAT_STATUS_FIX:
-            return None
-    ned = [values.get(b[k]) for k in ('north', 'east', 'down')]
-    if any(v is None for v in ned):
-        return None
-    n, e, d = (float(v) for v in ned)
-    # Wire velocity is NED; ROS linear velocity is ENU (REP-103).
-    return {'twist.linear.x': e, 'twist.linear.y': n, 'twist.linear.z': -d}
-
-
-def fill_scalar(pub: Publication,
-                values: Dict[str, object]) -> Optional[dict]:
-    v = values.get(pub.bindings['value'])
-    if v is None:
-        return None
-    return {'data': float(v)}
-
-
-def fill_text(pub: Publication,
-              values: Dict[str, object]) -> Optional[dict]:
-    v = values.get(pub.bindings['value'])
-    if v is None:
-        return None
-    return {'data': str(v).rstrip('\r\n')}
-
-
-def fill_mapped(pub: Publication,
-                values: Dict[str, object]) -> Optional[dict]:
-    mapping = pub.extras.get('mapping', {})
-    out = {}
-    for msg_field, sensor_field in mapping.items():
-        if sensor_field in values:
-            v = values[sensor_field]
-            out[msg_field] = v if isinstance(v, str) else float(v)
-    if mapping and not out:
-        # No mapped field in this sample: suppress rather than publish
-        # a default-valued (all-zeros) message.
-        return None
-    for path, value in pub.extras.get('constants', {}).items():
-        out[path] = [float(x) for x in value] if isinstance(value, list) \
-            else value
-    return out
-
-
-_FILLERS: Dict[str, Callable[[Publication, Dict[str, object]],
-                             Optional[dict]]] = {
-    'imu': fill_imu,
-    'mag': fill_mag,
-    'temperature': fill_temperature,
-    'pressure': fill_pressure,
-    'fix': fill_navsat,
-    'vel': fill_twist,
-    'scalar': fill_scalar,
-    'text': fill_text,
-    'mapped': fill_mapped,
-}
-
-
-def fill_publication(pub: Publication,
-                     values: Dict[str, object]) -> Optional[dict]:
-    """Dotted-path attribute dict for one publication from one sample's
-    decoded values, or None to suppress this cycle."""
-    return _FILLERS[pub.kind](pub, values)
-
-
-def load_map(path: str) -> List[Publication]:
-    """Parse a --map YAML — a list of {message, topic, mapping,
-    constants} blocks — into publications. The explicit map replaces the
-    auto plan entirely."""
-    with open(path) as fh:
-        doc = yaml.safe_load(fh)
-    if not isinstance(doc, list):
-        raise SystemExit(f"nxs ros2: --map {path}: expected a list of "
-                         f"{{message, topic, mapping}} blocks")
-    pubs = []
-    for i, blk in enumerate(doc):
-        if not isinstance(blk, dict) or 'message' not in blk \
-                or 'topic' not in blk:
-            raise SystemExit(f"nxs ros2: --map {path}: block {i} needs "
-                             f"'message' and 'topic'")
-        mapping = blk.get('mapping')
-        if not isinstance(mapping, dict) or not mapping:
-            # Without a mapping every sample would publish a
-            # default-valued message; refuse the config up front.
-            raise SystemExit(f"nxs ros2: --map {path}: block {i} needs "
-                             f"a non-empty 'mapping'")
-        pubs.append(Publication(
-            key=f"mapped:{i}", kind='mapped', msg_type=str(blk['message']),
-            topic=str(blk['topic']), bindings={},
-            extras={'mapping': mapping,
-                    'constants': blk.get('constants') or {}}))
-    return pubs
-
-
-def sanitize_ros_name(name: str) -> str:
-    """A valid ROS 2 name token from an arbitrary label. ROS node,
-    namespace, and topic tokens are `[A-Za-z_][A-Za-z0-9_]*`; suite unit
-    names are dashed roles (`imu-mast`, `unit-i2c-10-30`) that rclpy
-    rejects verbatim. Illegal characters collapse to `_` and a leading
-    digit gains an `_` prefix, so `unit-i2c-10-30` → `unit_i2c_10_30`.
-    Idempotent."""
-    token = re.sub(r'[^A-Za-z0-9_]', '_', name)
-    if token and token[0].isdigit():
-        token = '_' + token
-    return token or '_'
-
-
-def join_topic(base: str, unit_name: Optional[str], rel: str) -> str:
-    """Topic name `<base>/<unit>/<rel>` (suite) or `<base>/<rel>`
-    (ad-hoc) — relative, which ROS resolves under the node namespace to
-    `/<base>/...`. Every token is sanitized to a valid ROS name."""
-    parts = (sanitize_ros_name(p) for p in (base, unit_name, rel) if p)
-    return "/".join(parts)
-
-
-def sensor_plans_imu(driver: str,
-                     config: Optional[Dict[str, object]] = None) -> bool:
-    """True when the named shipped driver's compiled output plans an
-    `imu` publication — the launch keeps RViz Imu displays to the units
-    that publish one. Resolution or compile failure (a driver outside
-    the wheel) returns True: an idle display over a missing one."""
-    try:
-        from nxs.descriptor import load_driver
-        img = load_driver(driver)().compile(dict(config or {}))
-        return any(p.topic == 'imu'
-                   for p in plan_publications(img.output_fields))
-    except Exception:
-        return True
+#: The names `nxs.ros2_bridge` has always answered to, wherever they now live.
+__all__ = [
+    "ACCEL_AXES", "COVARIANCE_TYPE_DIAGONAL_KNOWN", "COVARIANCE_TYPE_UNKNOWN",
+    "FIX_TYPES_WITH_FIX", "FIX_TYPES_WITH_TIME", "GEO_POSITION",
+    "GEO_VELOCITY", "GYRO_AXES", "GpsTime", "HOST_CLOCK_FLOOR_UNIX_S",
+    "MAG_AXES", "NAVSAT_SERVICE_ALL", "NAVSAT_STATUS_FIX",
+    "NAVSAT_STATUS_NO_FIX", "Publication", "READ_RETRY_BACKOFF_S",
+    "Ros2Bridge", "STAMP_ARRIVAL", "STAMP_DEVICE", "STAMP_ITOW",
+    "STAMP_MODES", "STAMP_SYNCED", "Sem", "UNKNOWN_VARIANCE", "UnitPlan",
+    "acquire_run_lock", "build_viz_rviz_config", "epoch_binding",
+    "fields_by_semantic", "fill_imu", "fill_mag", "fill_mapped",
+    "fill_navsat", "fill_pressure", "fill_publication", "fill_scalar",
+    "fill_temperature", "fill_text", "fill_twist", "format_plan",
+    "join_topic", "load_map", "navsat_status_from_fix_type",
+    "plan_publications", "resolve_msg_type", "run_bridge",
+    "sanitize_ros_name", "sensor_plans_imu", "set_nested_attr",
+    "stamp_from_us", "utc_from_itow",
+]
+
+log = logging.getLogger(__name__)
 
 
 def build_viz_rviz_config(units: List[Tuple[str, str]],
                           topic_base: str) -> str:
-    """Write a temporary RViz config for the launch's `viz:=true` path:
-    the shipped base (Grid + TF) plus one `rviz_imu_plugin/Imu` display
-    per given unit, wired to `/<base>/<frame>/imu`. Returns the file's
-    path. Unit names only exist in the manifest, so the shipped file
-    cannot carry the displays statically; the launch passes the units
-    whose driver plans an imu topic (`sensor_plans_imu`)."""
+    """Write a temporary RViz config for `viz:=true`: the shipped base plus one
+    `rviz_imu_plugin/Imu` display per given unit at `/<base>/<frame>/imu`.
+    Returns the file's path."""
     base_path = os.path.join(os.path.dirname(__file__), "ros2",
                              "nxs_bridge.rviz")
     with open(base_path) as f:
@@ -569,8 +114,8 @@ def format_plan(plans: List[UnitPlan], topic_base: str) -> str:
     lines = []
     for row, plan in rows:
         if row is None:
-            # The sanitized name is what the runtime uses for the node,
-            # namespace, and frame_id — preview the real ROS surface.
+            # The sanitized name is what the runtime uses for the node, namespace,
+            # and frame_id: preview the real ROS surface.
             epoch = "  [epoch-capable]" if plan.epoch else ""
             lines.append(f"{sanitize_ros_name(plan.frame_id)}:{epoch}")
         else:
@@ -581,9 +126,8 @@ def format_plan(plans: List[UnitPlan], topic_base: str) -> str:
 
 
 class _RclpyRuntime:
-    """The one place rclpy is imported. Owns rclpy init/shutdown once per
-    process and a node per unit — publishers land on their unit's node,
-    so `ros2 node list` shows each unit as its own sensor node."""
+    """The one place rclpy is imported: owns rclpy init/shutdown once per
+    process and a node per unit, so each unit shows as its own node."""
 
     def __init__(self):
         import rclpy
@@ -625,25 +169,17 @@ class _Channel:
     msg_cls: type
     publisher: object
     has_header: bool
-    # Publish-path caches: one reused message instance per channel (a
-    # fresh construction per cycle dominates the publish cost), and the
-    # dotted paths resolved once to (parent, leaf) pairs — stable
-    # because the message object is.
+    # Publish-path caches: one reused message instance per channel, and
+    # the dotted paths resolved once to (parent, leaf) pairs.
     msg: object = None
     setters: Dict[str, tuple] = field(default_factory=dict)
     last_vals: Dict[str, object] = field(default_factory=dict)
 
 
 class Ros2Bridge:
-    """Publishes decoded samples for a set of unit plans.
-
-    The runtime seam (`runtime`) defaults to the real rclpy wrapper —
-    constructing without a sourced ROS 2 environment raises ImportError
-    for the CLI to translate. `resolver` turns a message type string
-    into a class; a message package that fails to resolve drops that
-    publication with an error, and a bridge with zero publishable
-    topics refuses to start.
-    """
+    """Publishes decoded samples for a set of unit plans. `runtime` defaults to
+    the rclpy wrapper (ImportError without ROS 2); `resolver` turns a message
+    type string into a class, and a bridge with no publishable topic refuses."""
 
     def __init__(self, units: List[UnitPlan], *, topic_base: str = "nxs",
                  stamp_mode: str = STAMP_SYNCED,
@@ -717,9 +253,8 @@ class Ros2Bridge:
                 msg.header.stamp.sec = stamp[0]
                 msg.header.stamp.nanosec = stamp[1]
             for path, value in out.items():
-                # Skip unchanged values on the reused message: constant
-                # fields (covariance arrays) cost a numpy-backed convert
-                # per assignment, which dominates the publish path.
+                # Skip unchanged values on the reused message: constant fields
+                # cost a numpy-backed convert per assignment.
                 if ch.last_vals.get(path) == value:
                     continue
                 ch.last_vals[path] = value
@@ -788,8 +323,8 @@ class Ros2Bridge:
         self._warn_stamp_fallback(unit_idx, reason, "arrival")
 
     def _warn_stamp_fallback(self, unit_idx: int, reason: str, to: str):
-        """One warning per unit per fallback kind — a mode that degrades
-        two ways reports both."""
+        """One warning per unit per fallback kind; a mode that degrades two ways
+        reports both."""
         warned = self._stamp_warned.get(to)
         if warned is None:
             warned = [False] * len(self._units)
@@ -805,20 +340,9 @@ _held_run_locks: Dict[str, int] = {}
 
 
 def acquire_run_lock(tokens):
-    """Take the single-instance lock for a streaming bridge run.
-
-    One streaming bridge per unit set per host: concurrent instances
-    duplicate every ROS node name and contend on the device buses. The
-    lock is an exclusive `flock` on a file keyed by the resolved target
-    set, so the kernel releases it whenever the process ends — no stale
-    lockfiles after a crash. Returns the held file descriptor; the
-    caller keeps it for the process lifetime; re-acquiring the same
-    key in the same process returns the held lock (one process is
-    one instance). Raises SystemExit with the holder's pid when
-    another process already serves these units.
-    `--plan` runs take no lock — descriptor reads coexist with a live
-    bridge.
-    """
+    """Take the single-instance lock for a streaming bridge run: an exclusive
+    `flock` on a file keyed by the resolved target set, released by the kernel
+    when the process ends. Returns the held fd; SystemExit names another holder."""
     key = hashlib.sha1("\n".join(sorted(tokens)).encode()).hexdigest()[:12]
     if key in _held_run_locks:
         return _held_run_locks[key]
@@ -850,33 +374,19 @@ SYNC_PING_INTERVAL_S = 1.0
 def run_bridge(clients: list, bridge: Ros2Bridge,
                count: Optional[int] = None,
                queue_size: int = 1024) -> int:
-    """Fan samples from every client into the bridge until `count`
-    samples have been bridged, every source ends (finite test fakes),
-    or the caller interrupts. A sample counts when it is dequeued and
-    offered to the fillers — like `stream --count`, and whether or not
-    any message publishes (fillers may suppress). One reader thread per
-    client feeds a bounded queue; the calling thread does all the
-    publishing, and re-pings each client's time sync on a fixed cadence
-    (a no-op for transports whose observations ride the sample poll).
-    The caller arms the streams beforehand and closes the clients
-    afterwards; stopping a client's stream is what unblocks its reader.
-    """
-    # Three reader threads and the publisher share one interpreter; the
-    # default 5 ms GIL switch interval quantizes every handoff to ~5 ms
-    # and caps the per-unit pipeline near 130 Hz regardless of per-op
-    # cost. A sub-millisecond interval lets the IO-bound threads
-    # interleave at sample cadence.
+    """Fan samples from every client into the bridge until `count` samples are
+    bridged, every source ends, or the caller interrupts. One reader thread per
+    client feeds a bounded queue; the calling thread publishes and re-pings sync."""
+    # The default 5 ms GIL switch interval quantizes every handoff between
+    # the reader threads and the publisher; a sub-millisecond one interleaves them.
     prev_switch = sys.getswitchinterval()
     sys.setswitchinterval(0.0005)
     q: queue.Queue = queue.Queue(maxsize=queue_size)
     stop = threading.Event()
 
     def read(idx: int, client):
-        # A reader outlives transient transport faults: a unit that
-        # reboots mid-poll (reflash, power-cycle) errors one transaction,
-        # the iterator disarms itself, and the retry re-arms the stream
-        # once the unit answers again. A clean iterator end (a finite
-        # test fake, or a stopped stream) ends the reader instead.
+        # A reader outlives transient transport faults: an error disarms the
+        # iterator and the retry re-arms the stream; a clean end ends the reader.
         while not stop.is_set():
             try:
                 for sample in client.iter_samples(timeout=0.5):
@@ -907,10 +417,8 @@ def run_bridge(clients: list, bridge: Ros2Bridge,
     bound_shown = [False] * len(clients)
     last_ping = time.monotonic()
     last_push = time.monotonic()
-    # A degrading time discipline is invisible in the samples themselves —
-    # they keep flowing, stamped from an estimator that is quietly
-    # extrapolating past its last fit. Warn once per unit per fault so a
-    # recording that will be wrong says so while it is still running.
+    # A degrading time discipline is invisible in the samples themselves;
+    # warn once per unit per fault while the recording is still running.
     ping_warned = [False] * len(clients)
     push_warned = [False] * len(clients)
     try:
@@ -923,10 +431,8 @@ def run_bridge(clients: list, bridge: Ros2Bridge,
                         client.time_sync_ping()
                         ping_warned[i] = False
                     except Exception as e:
-                        # The silent-unit warning only fires when SAMPLES
-                        # stop; an RPC path that dies while the sample
-                        # subject keeps flowing would never trip it, and the
-                        # stamps drift at the device's uncorrected rate.
+                        # The silent-unit warning only fires when samples stop; an RPC
+                        # path that dies while samples keep flowing would never trip it.
                         if not ping_warned[i]:
                             ping_warned[i] = True
                             log.warning("%s: time-sync ping failed (%s) — "
@@ -943,10 +449,8 @@ def run_bridge(clients: list, bridge: Ros2Bridge,
                         estimate_and_push(client, pings=0)
                         push_warned[i] = False
                     except Exception as e:
-                        # "Staleness is bounded" only holds if a later push
-                        # lands. Against a standing refusal the device's
-                        # validity window lapses and discipline is simply
-                        # gone, so say it once rather than never.
+                        # Against a standing refusal the device's validity window lapses
+                        # and discipline is gone, so say it once.
                         if not push_warned[i]:
                             push_warned[i] = True
                             log.warning("%s: time-sync push failed (%s) — "
@@ -968,10 +472,8 @@ def run_bridge(clients: list, bridge: Ros2Bridge,
             samples += 1
             last_seen[idx] = time.monotonic()
             warned[idx] = False
-            # One-shot sync banner, deferred until the estimator has a
-            # bound: transports without a time surface (I2C) observe on
-            # the sample polls, so the launch-time banner has nothing to
-            # print and the first bound arrives with the first samples.
+            # One-shot sync banner, deferred until the estimator has a bound;
+            # transports without a time surface observe on the sample polls.
             if not bound_shown[idx]:
                 if bound := clients[idx].get_time_sync().bound_us():
                     bound_shown[idx] = True

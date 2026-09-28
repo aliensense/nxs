@@ -1,32 +1,6 @@
-"""
-Declarative SPI frame schemas for the NXS VM.
-
-A driver that talks to a sensor with non-standard SPI framing (CRC,
-bank-switching, pipelined reads) declares its framing as data. The
-compiler reads the schema and generates the bytecode sequence
-(``OP_MEMCPY_IMM`` + ``OP_REG_XFER``) for every register read/write.
-The VM stays universal — it never knows whether a frame is a plain
-16-bit SPI transaction or a 32-bit CRC-wrapped one.
-
-Concrete examples:
-
-    class CrcFramedImu(RegisterDriver):
-        FRAME = SpiFrame(
-            width=32,
-            fields=[('rw',1), ('addr',5), ('rs',2), ('data',16), ('crc',8)],
-            crc=Crc(width=8, poly=0x1D, init=0xFF, xor_out=0xFF,
-                    covers=('rw','addr','rs','data'),
-                    feedback_style='input-lsb'),
-            read_pipeline=1,
-        )
-
-    class PlainSpiImu(RegisterDriver):
-        pass   # no FRAME → default: plain 16-bit SPI [rw|addr:7, data:8]
-
-Fields are declared MSB-first: the first field occupies the high bits
-of the frame, the last occupies the low bits. The schema must be
-byte-aligned (``width`` a multiple of 8).
-"""
+"""Declarative SPI frame schemas. A driver declares its framing (CRC, reserved
+bits, pipelined reads) as a `SpiFrame`; the compiler emits the exact on-wire
+bytes per access. Fields are MSB-first and `width` is a multiple of 8."""
 
 from __future__ import annotations
 
@@ -36,32 +10,9 @@ from typing import Callable, List, Optional, Tuple
 
 @dataclass
 class Crc:
-    """CRC spec for an in-frame integrity byte.
-
-    Standard left-shift CRC with configurable polynomial. The
-    polynomial is written without its leading ``x^width`` term
-    (e.g. ``0x31`` for Sensirion's ``x^8 + x^5 + x^4 + 1``).
-
-    Two shift-register variants exist in the wild, differing in where
-    the input bit interacts with the register:
-
-    - ``feedback_style='standard'`` (default, Sensirion / SMBus PEC /
-      most textbook CRCs): feedback = ``MSB XOR input``; register is
-      then left-shifted and XOR'd with the polynomial if feedback == 1.
-
-    - ``feedback_style='input-lsb'`` (industrial SPI parts whose
-      datasheet worked examples disagree with the textbook form): feedback = ``MSB`` only; register is left-
-      shifted, XOR'd with polynomial if feedback == 1, then the input
-      bit is XOR'd into the LSB.
-
-    The two produce identical results only when the polynomial has
-    non-zero taps solely at bit 0 — so in practice they disagree for
-    almost every real CRC. Set the style explicitly when the
-    datasheet disagrees with the default.
-
-    For exotic custom algorithms, pass a ``compute_fn(data_bits,
-    input_width_bits) -> int`` instead.
-    """
+    """CRC spec for an in-frame integrity byte: `poly` without its x^width term;
+    `feedback_style` 'standard' (feedback = MSB XOR input) or 'input-lsb'
+    (feedback = MSB, input XOR'd into the LSB); or a custom `compute_fn`."""
 
     width: int
     poly: int = 0
@@ -113,48 +64,21 @@ class SpiField:
 
 @dataclass
 class SpiFrame:
-    """Declarative SPI frame description.
-
-    Attributes:
-        width: Total frame width in bits. Must be a multiple of 8.
-        fields: Ordered list of named fields, MSB-first. Sum of
-            ``bits`` must equal ``width``. One field should be named
-            ``'crc'`` if ``crc`` is set.
-        crc: CRC specification, or ``None`` if no in-frame CRC.
-        read_pipeline: Number of transactions between a read request
-            and the cycle that returns its data. ``0`` for
-            conventional SPI (data returns in-place); ``1`` for
-            two-frame-handshake parts (data returns next transaction).
-        inter_frame_sleep_ms: Settle delay (ms) the compiler inserts
-            between consecutive frames in a burst read. ``0`` for
-            parts whose MISO is ready within one SPI frame time
-            (plain-SPI register reads, ROM constants); sampled-register
-            reads need the part's response-staging time between the
-            request frame and the response-clocking frame.
-        inter_frame_sleep_us: Sub-millisecond variant of the same
-            settle, for parts whose staging is tied to a fast internal
-            update tick (an 8 kHz datapath stages within its 125 us
-            period — a whole-millisecond gap would cut the achievable
-            burst rate ~8x). Adds to ``inter_frame_sleep_ms``.
-        status_ok: ``(field_name, expected_value)`` for a per-frame
-            status field (a return-status / error-flag code). Declaring
-            it — like declaring ``crc`` — makes the compiler emit
-            on-device verification of every harvested response in the
-            measure loop; a frame whose status differs from the expected
-            value drops the tick. The field must sit within one byte.
-    """
+    """Declarative SPI frame: named fields MSB-first summing to `width` bits (a
+    multiple of 8). Declaring `crc` or `status_ok` makes the compiler verify
+    every harvested response on-device; a failing frame drops the tick."""
 
     width: int
     fields: List[SpiField]
-    crc: Optional[Crc] = None
-    read_pipeline: int = 0
-    inter_frame_sleep_ms: int = 0
-    inter_frame_sleep_us: int = 0
-    status_ok: Optional[Tuple[str, int]] = None
+    crc: Optional[Crc] = None                    # needs a field named 'crc'
+    read_pipeline: int = 0                       # frames between a read request and its data
+    inter_frame_sleep_ms: int = 0                # settle between burst frames
+    inter_frame_sleep_us: int = 0                # sub-ms settle, added to the ms value
+    status_ok: Optional[Tuple[str, int]] = None  # (field, expected); field within one byte
 
     def __post_init__(self):
-        # Allow the author to write `[('rw', 1), ...]` as a shorthand
-        # — convert tuples to SpiField instances on construction.
+        # Tuples like `('rw', 1)` are shorthand; convert them to SpiField on
+        # construction.
         self.fields = [
             f if isinstance(f, SpiField) else SpiField(*f) for f in self.fields
         ]
@@ -168,10 +92,8 @@ class SpiFrame:
         if self.crc is not None:
             if not any(f.name == 'crc' for f in self.fields):
                 raise ValueError("CRC spec given but no 'crc' field in frame")
-            # A typo or empty `covers` must fail loudly at construction: an
-            # unrecognized name would otherwise silently drop from the CRC —
-            # a wrong window in both compose() and the on-device check — and
-            # an empty set has no bytes to protect.
+            # An unknown or empty `covers` fails at construction: a typo would
+            # silently drop from the CRC window in both compose() and on-device.
             field_names = {f.name for f in self.fields}
             unknown = [n for n in self.crc.covers if n not in field_names]
             if unknown:
@@ -219,12 +141,8 @@ class SpiFrame:
     # ── Building and parsing frames ────────────────────────────
 
     def compose(self, **values) -> bytes:
-        """Build a frame from field values and return MSB-first bytes.
-
-        Unspecified fields default to 0. If the frame has a CRC, it is
-        computed over the declared ``covers`` fields and placed in the
-        ``crc`` field automatically.
-        """
+        """Build a frame from field values, MSB-first bytes. Unspecified fields
+        are 0; the CRC is computed over `covers` and placed in `crc`."""
         frame = 0
         for f in self.fields:
             if f.name == 'crc' and self.crc is not None:
@@ -261,10 +179,7 @@ class SpiFrame:
         return (frame >> off) & ((1 << width) - 1)
 
     def data_byte_offset(self) -> int:
-        """Byte offset of the ``data`` field's MSB within the frame
-        bytes (MSB-first). Convenience for compilers that need to pull
-        the data slice out of a response.
-        """
+        """Byte index (MSB-first) of the ``data`` field's MSB within the frame."""
         off_bits = self._field_offset('data')
         width_bits = self._field_bits('data')
         # MSB of data is at (off_bits + width_bits - 1). Convert to byte
@@ -276,18 +191,12 @@ class SpiFrame:
         return self._field_bits('data') // 8
 
     # ── RX-verification geometry (compiler helpers) ────────────
-    #
-    # The on-device checker is byte-granular: OP_CRC8 runs over whole
-    # bytes and the status compare loads one byte. These helpers map
-    # the bit-level field declarations onto byte windows, raising
-    # ValueError for frames the engine cannot check (the compiler
-    # converts to CompileError with the driver named).
+    # The on-device checker is byte-granular; these map bit-level fields onto
+    # byte windows and raise ValueError for frames it cannot check.
 
     def crc_byte_offset(self) -> int:
-        """Byte index (MSB-first) of the frame's CRC field.
-
-        The CRC field itself must be whole bytes on a byte boundary.
-        """
+        """Byte index (MSB-first) of the CRC field, which must be whole bytes on
+        a byte boundary."""
         off = self._field_offset('crc')
         bits = self._field_bits('crc')
         if bits % 8 != 0 or off % 8 != 0:
@@ -297,12 +206,8 @@ class SpiFrame:
         return (self.width - off - bits) // 8
 
     def crc_cover_window(self) -> Tuple[int, int]:
-        """(byte_offset, byte_length) of the CRC-covered span.
-
-        The covered fields must be contiguous in declaration order and
-        the union must start and end on byte boundaries — OP_CRC8 is a
-        whole-byte engine.
-        """
+        """(byte_offset, byte_length) of the CRC-covered span: contiguous fields
+        in declaration order, starting and ending on byte boundaries."""
         covered = [f for f in self.fields if f.name in self.crc.covers]
         names = [f.name for f in self.fields]
         idx = [names.index(f.name) for f in covered]
@@ -319,11 +224,8 @@ class SpiFrame:
         return (self.width - hi) // 8, (hi - lo) // 8
 
     def status_byte(self) -> Tuple[int, int, int]:
-        """(byte_offset, mask, expected) for the ``status_ok`` check.
-
-        Byte-granular projection of the declared status field: the
-        check is ``rx[byte_offset] & mask == expected``.
-        """
+        """(byte_offset, mask, expected) for the ``status_ok`` check:
+        ``rx[byte_offset] & mask == expected``."""
         name, expect = self.status_ok
         off = self._field_offset(name)
         bits = self._field_bits(name)
@@ -331,53 +233,3 @@ class SpiFrame:
         mask = ((1 << bits) - 1) << shift
         return (self.width - 1 - (off + bits - 1)) // 8, mask, expect << shift
 
-
-# ── I²C framing ────────────────────────────────────────────────
-
-@dataclass
-class I2cFrame:
-    """Declarative I²C frame description for command-response
-    protocols like Sensirion SHT/SGP/SCD/SPS and Melexis IR-temp
-    parts.
-
-    Every response word is laid out as:
-
-        [ data_bytes bytes of data | crc_bytes bytes of CRC ]
-
-    repeated ``num_words`` times per read (num_words is set per
-    transaction, not per-frame). The CRC covers only the preceding
-    ``data_bytes`` — it does NOT include the device address or any
-    prior words. That's a Sensirion-specific convention; SMBus PEC
-    uses a different layout covered separately.
-
-    Unlike ``SpiFrame``, there's no bit-level packing — every field
-    is byte-aligned.
-
-    Attributes:
-        data_bytes: Bytes of data per chunk. Sensirion parts all use 2.
-        crc_bytes: Bytes of CRC per chunk. Always 1 for Sensirion.
-        crc: CRC spec; ``covers`` is implicit (the preceding
-            ``data_bytes``).
-    """
-
-    data_bytes: int = 2
-    crc_bytes: int = 1
-    crc: Optional[Crc] = None
-
-    @property
-    def chunk_bytes(self) -> int:
-        """Total bytes per chunk on the wire (data + CRC)."""
-        return self.data_bytes + self.crc_bytes
-
-    def total_bytes(self, num_words: int) -> int:
-        """Bytes a transaction of `num_words` chunks occupies."""
-        return num_words * self.chunk_bytes
-
-    def data_bytes_offset(self, word_index: int) -> int:
-        """Byte offset of the data portion of word `word_index` within
-        a raw response buffer."""
-        return word_index * self.chunk_bytes
-
-    def packed_data_bytes(self, num_words: int) -> int:
-        """Size in bytes of the *packed* data (CRCs stripped)."""
-        return num_words * self.data_bytes

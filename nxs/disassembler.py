@@ -1,18 +1,12 @@
-"""
-Bytecode disassembler for NXS VM programs.
-
-Reads compiled bytecode and prints human-readable instruction listing.
-"""
+"""Bytecode disassembler for NXS VM programs: prints a readable listing."""
 
 import struct
 from nxs.opcodes import Op, INSTRUCTION_SIZE
 
 
 def disassemble(bytecode: bytes, *, print_fn=print) -> list[str]:
-    """Disassemble bytecode into human-readable lines.
-
-    Returns list of formatted strings. Also prints via print_fn.
-    """
+    """Disassemble bytecode into readable lines. Returns the list and prints
+    each line via `print_fn`."""
     lines = []
     pc = 0
     while pc < len(bytecode):
@@ -27,9 +21,8 @@ def disassemble(bytecode: bytes, *, print_fn=print) -> list[str]:
             pc += 1
             continue
 
-        # Variable-length opcodes: MEMCPY_IMM has `len` inline bytes
-        # after the 3-byte header. Peek at byte[pc+2] to find the
-        # full instruction size.
+        # MEMCPY_IMM is variable-length: `len` inline bytes follow the 3-byte
+        # header, so byte[pc+2] gives the full instruction size.
         if opcode == Op.MEMCPY_IMM and pc + 3 <= len(bytecode):
             size = 3 + bytecode[pc + 2]
 
@@ -77,6 +70,10 @@ _FORMATTERS = {
     Op.ERROR: lambda a, i: f"code={i[1]}",
     Op.LOAD_IMM: lambda a, i: f"r{i[1]} = 0x{struct.unpack_from('<L', i, 2)[0]:08X}",
     Op.MOV: lambda a, i: f"r{i[1]} = r{i[2]}",
+    Op.PARAM_LOAD: lambda a, i: f"r{i[1]} = param[{i[2]}]",
+    Op.PARAM_STORE: lambda a, i: f"param[{i[1]}] = r{i[2]}",
+    Op.MUL_REG: lambda a, i: f"r{i[3]} = r{i[1]} * r{i[2]}",
+    Op.DIVU_REG: lambda a, i: f"r{i[3]} = r{i[1]} / r{i[2]}",
     Op.CMP_EQ: _fmt_alu,
     Op.AND: _fmt_alu,
     Op.OR: _fmt_alu,

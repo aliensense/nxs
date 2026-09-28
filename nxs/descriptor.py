@@ -1,6 +1,4 @@
-"""
-Sensor descriptor utilities — driver loading, sample parsing, config loading.
-"""
+"""Sensor descriptor utilities: driver loading, sample parsing, config loading."""
 
 import importlib
 import logging
@@ -12,7 +10,7 @@ from nxs._generated_constants import Calibration as CalConstants
 from nxs._generated_constants import FieldSemantics
 from nxs.compiler import SensorDriver
 
-# Identity 3x3, row-major — the no-op affine for one vector bucket.
+# Identity 3x3, row-major: the no-op affine for one vector bucket.
 IDENTITY_M = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
 
 log = logging.getLogger("nxs.descriptor")
@@ -25,8 +23,7 @@ FNV_PRIME = 0x01000193
 
 
 def fnv1a32(name: str) -> int:
-    """FNV-1a 32-bit hash of a driver name. Must match the firmware's
-    `cal::fnv1a32` so both appliers derive one verdict."""
+    """FNV-1a 32-bit hash of a driver name; the same hash the device computes."""
     h = 0x811C9DC5
     for byte in name.encode():
         h ^= byte
@@ -35,14 +32,9 @@ def fnv1a32(name: str) -> int:
 
 
 def driver_tag(name: Optional[str], bus: int = 0, address: int = 0) -> int:
-    """The calibration record's sensor-identity tag: driver name plus the
-    attachment point it is bound to.
-
-    The name alone cannot separate two identical parts on one panel — both
-    would hash the same and the guard could not refuse a swap between them.
-    Mirrors the firmware's `cal::driver_tag`, continuing the same FNV-1a walk
-    over the bus kind and the latched address. `None` is the unguarded 0.
-    """
+    """The calibration record's sensor-identity tag: the FNV-1a walk over the
+    driver name, then the bus kind and the latched address, as the device
+    computes it. None gives the unguarded 0."""
     if name is None or name in ("", "-"):
         return 0
     h = fnv1a32(name)
@@ -62,7 +54,7 @@ _TYPE_INFO = {
     'uint32':  {'size': 4, 'struct_le': '<I', 'struct_be': '>I'},
     'float32': {'size': 4, 'struct_le': '<f', 'struct_be': '>f'},
     'float64': {'size': 8, 'struct_le': '<d', 'struct_be': '>d'},
-    'string':  {'size': 0},  # variable — uses 'count' field
+    'string':  {'size': 0},  # variable; uses 'count' field
 }
 
 
@@ -75,21 +67,14 @@ def field_size(field: dict) -> int:
 
 
 def is_decodable(fields: List[dict]) -> bool:
-    """True if every field's type is one `parse_sample` can handle. A
-    device may serve a field-type code newer than this tool knows; such
-    a set isn't decodable here (the local driver file may still be), so
-    callers fall back rather than crash."""
+    """True if every field's type is one `parse_sample` can handle; a device may
+    serve a newer field-type code, and callers fall back."""
     return all(f.get('type', 'int16') in _TYPE_INFO for f in fields)
 
 
 def sample_width(fields: List[dict]):
-    """Sample extent derived from the descriptors — the furthest field
-    end (offsets may gap; a field without one packs after the previous)
-    — or None if a field's width is indeterminate: a string with
-    unknown count (0/absent), which by convention means 'consume the
-    rest of the buffer'. Callers use None to mean 'no fixed total
-    derivable' rather than silently undercounting a variable-width
-    field as 0 bytes."""
+    """Sample extent from the descriptors, the furthest field end, or None when
+    a string field has no count (it consumes the rest of the buffer)."""
     end = 0
     offset = 0
     for f in fields:
@@ -102,19 +87,8 @@ def sample_width(fields: List[dict]):
 
 
 def load_driver(name: str) -> Type[SensorDriver]:
-    """Load a driver class by name from nxs.drivers.
-
-    Returns the SensorDriver subclass *defined in* the loaded module
-    (skipping base classes like RegisterDriver / I2cCommandDriver /
-    StreamDriver that the driver imports for inheritance). For
-    modules with multiple driver classes, returns the alphabetically
-    first one — which is unique in current shipped drivers.
-
-    Usage:
-        cls = load_driver("iam20680")
-        drv = cls()
-        result = drv.compile(config)
-    """
+    """Load the SensorDriver subclass defined in ``nxs.drivers.<name>`` (base
+    classes it imports are skipped; the alphabetically first when several)."""
     module = importlib.import_module(f"nxs.drivers.{name}")
     for attr_name in sorted(dir(module)):
         obj = getattr(module, attr_name)
@@ -129,16 +103,9 @@ def load_driver(name: str) -> Type[SensorDriver]:
 
 
 def effective_scale_fields(output_fields: List[dict], params: list) -> List[dict]:
-    """Fold each field's live-param scaling into its scale.
-
-    A field that names a `scale_param` (or carries a `scale_param_index`)
-    has a *base* scale; its effective scale is `base * param.current`. This
-    is the host mirror of the firmware's `effective_scale`: a device serves
-    descriptors with the param already folded in (the I²C window and
-    GetOutputInfo both expose the effective scale), so a host holding the
-    raw NXS descriptors must fold the same way to decode identical SI.
-    Returns new field dicts; fields with no linked param are copied as-is.
-    """
+    """Fold each field's live-param scaling into its scale: a field naming a
+    `scale_param` (or `scale_param_index`) gets `base * param.current`, the
+    same fold a device applies before serving descriptors."""
     by_name = {p.name: p for p in params}
     out = []
     for f in output_fields:
@@ -158,23 +125,9 @@ def effective_scale_fields(output_fields: List[dict], params: list) -> List[dict
 
 def apply_calibration(values: Dict[str, Any], output_fields: List[dict],
                       calibration, active_tag: int = 0) -> Dict[str, Any]:
-    """Apply the device's per-vector affine calibration to decoded values.
-
-    The host twin of the firmware's SI-tier stage: groups the decoded
-    fields by semantic bucket and applies ``R·(M·v + b)`` per vector plus
-    the encoder zero-offset on the angle scalar, so an I2C/RawSample
-    consumer gets the same physical values the Cyphal SI subjects carry.
-    ``calibration`` is a ``CalibrationRecord``-shaped object;
-    ``driver_name`` drives the tag guard exactly like the firmware (a
-    tagged bucket solved for another driver contributes only the mounting
-    rotation). Fields with no vector semantic pass through untouched.
-
-    A record whose orientation code postdates this tool (the rotation
-    vocabulary is append-only) disables the whole post-pass: the mount
-    composes into every bucket, so no part of the record can be applied
-    correctly, and raw values are honest where wrong-rotation values are
-    not. Warned once per unknown code.
-    """
+    """Apply the device's per-vector affine calibration ``R·(M·v + b)`` and the
+    encoder zero-offset to decoded values, as the device's SI stage does.
+    An unknown orientation code disables the pass (warned once per code)."""
     rot = CalConstants.Rotation.MATRIX.get(calibration.orientation)
     if rot is None:
         if calibration.orientation not in _WARNED_ROTATIONS:
@@ -204,9 +157,8 @@ def apply_calibration(values: Dict[str, Any], output_fields: List[dict],
 
     for vec, slots in groups.items():
         if set(slots) != {0, 1, 2}:
-            # A rotation or bias applied to a partial vector would mix the
-            # present components with fabricated zeros — an incomplete
-            # vector passes through raw, mirroring the firmware applier.
+            # A rotation or bias applied to a partial vector would mix real
+            # components with zeros; an incomplete vector passes through raw.
             continue
         active = (calibration.bucket_guard(vec, active_hash)
                   != CalConstants.BucketGuard.STALE)
@@ -233,16 +185,9 @@ def apply_calibration(values: Dict[str, Any], output_fields: List[dict],
 def parse_sample(raw: bytes, output_fields: List[dict],
                  calibration=None,
                  active_tag: int = 0) -> Dict[str, Any]:
-    """Parse a raw sample using the output field descriptors.
-
-    Returns a dict of {field_name: value}. Numeric fields are scaled
-    floats. String fields are decoded ASCII strings (0xFF trimmed). The
-    field `scale` is taken as-is: device-served descriptors already carry
-    the effective (param-folded) scale; for raw NXS descriptors, fold
-    first with `effective_scale_fields`. A ``calibration`` record applies
-    the per-vector affine post-pass (`apply_calibration`); None keeps
-    the descriptor-tier decode unchanged.
-    """
+    """Parse a raw sample into {field_name: value}: numeric fields scaled
+    floats, strings ASCII with 0xFF/0x00 tail trimmed. ``scale`` is taken as-is;
+    a ``calibration`` record applies `apply_calibration`."""
     result = {}
     offset = 0
     for field in output_fields:
@@ -253,15 +198,12 @@ def parse_sample(raw: bytes, output_fields: List[dict],
         offset = int(field.get('byte_off', offset))
 
         if ftype == 'string':
-            # count == 0 (or absent) means "unknown" (e.g. firmware
-            # predating the count field) — consume the rest of the buffer.
-            # max(0, …) guards a byte_off past the sample end: a negative
-            # count would walk offset backwards and corrupt later fields.
+            # count == 0 (or absent) means unknown: consume the rest of the buffer.
+            # max(0, ...) guards a byte_off past the sample end.
             count = field.get('count') or max(0, len(raw) - offset)
             chunk = raw[offset:offset + count]
-            # Strip 0xFF (uninitialized) and 0x00 (null) padding from the
-            # tail only — filtering all interior occurrences would silently
-            # drop legitimate payload bytes in binary-text protocols.
+            # Strip 0xFF and 0x00 padding from the tail only; interior bytes
+            # are payload.
             text = chunk.rstrip(b'\xff\x00')
             result[field['name']] = text.decode('ascii', errors='replace')
             offset += count
@@ -289,10 +231,8 @@ def parse_sample(raw: bytes, output_fields: List[dict],
 
 
 def parse_sample_raw(raw: bytes, output_fields: List[dict]) -> Dict[str, Any]:
-    """Parse a raw sample, returning unscaled values.
-
-    Numeric fields return integers. String fields return bytes.
-    """
+    """Parse a raw sample into unscaled values: integers for numeric fields,
+    bytes for strings."""
     result = {}
     offset = 0
     for field in output_fields:
@@ -322,9 +262,8 @@ def parse_sample_raw(raw: bytes, output_fields: List[dict]) -> Dict[str, Any]:
 
 
 def sample_size_from_fields(output_fields: List[dict]) -> int:
-    """Sample extent in bytes from output field descriptors — the furthest
-    field end. Fields carry explicit byte offsets (gaps are legal); one
-    without an offset packs after the previous field."""
+    """Sample extent in bytes from output field descriptors: the furthest field
+    end. A field without an explicit byte offset packs after the previous."""
     end = 0
     offset = 0
     for field in output_fields:
@@ -335,3 +274,120 @@ def sample_size_from_fields(output_fields: List[dict]) -> int:
         offset += width
         end = max(end, offset)
     return end
+
+
+def driver_descriptor(name: str, drivers_dir: Optional[str] = None) -> dict:
+    """The personality's YAML fact sheet (meta + params) by name: the personality store
+    first, then the built-in package. No driver code is imported."""
+    import importlib.util
+    import os
+
+    import yaml
+
+    from nxs.suite import personality_file
+
+    # A personality is a .py + .yaml pair: the store's descriptor counts only
+    # beside a store driver, so `tune` offers what gets compiled.
+    store_py = personality_file(name, "py", drivers_dir)
+    if store_py is not None:
+        # The store's code wins, so its descriptor must answer for it; the
+        # packaged one describes other parameters.
+        beside = os.path.splitext(store_py)[0] + ".yaml"
+        if not os.path.exists(beside):
+            raise FileNotFoundError(
+                f"no parameter descriptor beside {store_py} — a personality is a "
+                f".py and a .yaml; install both")
+        return _load_descriptor_file(beside)
+    spec = importlib.util.find_spec(f"nxs.drivers.{name}")
+    if spec and spec.origin:
+        packaged = os.path.splitext(spec.origin)[0] + ".yaml"
+        if os.path.exists(packaged):
+            return _load_descriptor_file(packaged)
+    raise FileNotFoundError(f"no descriptor for driver {name!r}")
+
+
+def _load_descriptor_file(path: str) -> dict:
+    """A driver descriptor read and validated against the unit-driver schema;
+    a malformed file fails here, naming the file."""
+    import yaml
+
+    from nxs import schemas
+
+    with open(path, encoding="utf-8") as fh:
+        doc = yaml.safe_load(fh) or {}
+    problems = schemas.findings(doc, schemas.UNIT_DRIVER, where=path)
+    # A law the schema cannot say: parameter names are the wire's indices,
+    # so a duplicate would compile as one parameter while tune offered two.
+    seen = set()
+    params = doc.get("params") if isinstance(doc, dict) else None
+    for entry in params if isinstance(params, list) else []:
+        name = entry.get("name") if isinstance(entry, dict) else None
+        if name in seen:
+            problems.append(f"{path}.params: duplicate parameter {name!r}")
+        seen.add(name)
+        if isinstance(entry, dict):
+            problems.extend(f"{path}.params[{name}]: {p}" for p in _param_laws(entry))
+    if problems:
+        raise ValueError("; ".join(problems))
+    return doc
+
+
+def _param_laws(entry: dict) -> list:
+    """The value laws the compiler applies to a parameter, judged on the
+    descriptor alone: an enum default is one of its values, a range is
+    `[min, max]` with the default inside it."""
+    values = entry.get("values")
+    default = entry.get("default")
+    if not isinstance(values, list) or isinstance(default, bool) or not isinstance(default, int):
+        return []                          # shape problems: the schema's
+    if entry.get("type", "enum") == "range":
+        if len(values) != 2 or not all(isinstance(v, int) for v in values):
+            return []
+        lo, hi = values
+        if lo > hi:
+            return [f"range [{lo}, {hi}] is reversed (min must not exceed max)"]
+        if not lo <= default <= hi:
+            return [f"default {default} is outside its range [{lo}, {hi}]"]
+        return []
+    if default not in values:
+        return [f"default {default} is not one of its values {values}"]
+    return []
+
+
+def driver_params(cls) -> list:
+    """The params table for a driver class: the YAML sibling of the class's
+    defining file, else the built-in descriptor matching the class name."""
+    import importlib.util
+    import os
+    import sys
+
+    import yaml
+
+    candidates = []
+    for klass in cls.__mro__:
+        module = sys.modules.get(klass.__module__)
+        src = getattr(module, "__file__", None)
+        if not src:
+            # A class whose module is not registered (a host-local
+            # driver loaded by path) still knows its own source file.
+            try:
+                import inspect
+                src = inspect.getsourcefile(klass)
+            except (TypeError, OSError):
+                src = None
+        if src:
+            candidates.append(os.path.splitext(src)[0] + ".yaml")
+        spec = None
+        try:
+            spec = importlib.util.find_spec(
+                f"nxs.drivers.{klass.__name__.lower()}")
+        except (ImportError, ValueError):
+            pass
+        if spec and spec.origin:
+            candidates.append(os.path.splitext(spec.origin)[0] + ".yaml")
+    for path in candidates:
+        if os.path.exists(path):
+            return _load_descriptor_file(path).get("params") or []
+    raise FileNotFoundError(
+        f"no parameter descriptor for {cls.__name__} (looked beside "
+        f"{', '.join(dict.fromkeys(candidates)) or 'nothing resolvable'})")

@@ -1,0 +1,848 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aliensense.github.io/nxs-docs/schemas/cam-descriptor.schema.json",
+  "title": "NXS camera chip descriptor (<chip>.yaml)",
+  "description": "One chip's facts inside a descriptor pack: identity, registers, modes (sensors), windows and pipes (deserializers), limits, and the declarative status probes. The laws and knobs come from the law family meta.chip names, or from a paired physics module; this schema pins the shape the loader reads.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "meta",
+    "registers"
+  ],
+  "properties": {
+    "default_mode": {
+      "type": "string"
+    },
+    "meta": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "compatible",
+        "role"
+      ],
+      "properties": {
+        "compatible": {
+          "type": "string",
+          "pattern": "^[a-z0-9_\\-]+,[a-z0-9_\\-]+$"
+        },
+        "role": {
+          "enum": [
+            "SEN",
+            "SER",
+            "DES"
+          ]
+        },
+        "i2c_addr": {
+          "$ref": "#/$defs/int"
+        },
+        "provenance": {
+          "type": "string"
+        },
+        "chromacity": {
+          "enum": [
+            "color",
+            "mono"
+          ],
+          "description": "The part variant's colour filter: colour (Bayer) or monochrome; the readout registers that differ per variant follow it. Colour when absent."
+        },
+        "device_id_reg": {
+          "$ref": "#/$defs/int"
+        },
+        "device_id": {
+          "$ref": "#/$defs/int"
+        },
+        "device_id_width": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2,
+          "description": "Bytes of the identity register (MSB first); 1 when absent."
+        },
+        "kind": {
+          "enum": [
+            "camera"
+          ],
+          "description": "The personality kind this descriptor is; camera when absent."
+        },
+        "chip": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "description": "The law family (nxs.cam.chips) whose laws and knobs this sensor descriptor binds; generic when absent. The .py beside a sensor descriptor is the behaviour class the unit runs, never a law module."
+        },
+        "reg_bits": {
+          "enum": [
+            8,
+            16
+          ],
+          "default": 16,
+          "description": "Register address width on the sensor's I2C bus; 16 when absent."
+        },
+        "val_bits": {
+          "enum": [
+            8,
+            16
+          ],
+          "default": 8,
+          "description": "Register value width on the sensor's I2C bus; 8 when absent."
+        }
+      }
+    },
+    "registers": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "addr"
+        ],
+        "properties": {
+          "addr": {
+            "$ref": "#/$defs/int"
+          },
+          "width": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 4
+          },
+          "order": {
+            "enum": [
+              "le",
+              "be"
+            ]
+          }
+        }
+      }
+    },
+    "modes": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/mode"
+      }
+    },
+    "catalog": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "width": {
+            "type": "integer"
+          },
+          "height": {
+            "type": "integer"
+          },
+          "note": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "properties": {
+        "gain_max": {
+          "$ref": "#/$defs/int",
+          "description": "The largest raw gain register value the gain knob accepts."
+        }
+      }
+    },
+    "trigger": {
+      "type": "object"
+    },
+    "sync": {
+      "type": "object",
+      "properties": {
+        "takes_trigger": {
+          "type": "boolean",
+          "description": "Whether the sensor takes the hub's frame-sync pulse (the fsync overlay converts it); false or absent free-runs under a port trigger."
+        },
+        "text": {
+          "type": "string",
+          "description": "How the sensor syncs, or why it does not, for the sync plan."
+        }
+      }
+    },
+    "test_pattern": {
+      "type": "object"
+    },
+    "program": {
+      "type": "object",
+      "description": "What the family's programs compose with: the settles (ms after the write) of each standby-wrapped program, the timing program's fixed writes, and the live-knob declarations. A program whose set is absent is not offered.",
+      "additionalProperties": false,
+      "properties": {
+        "timing_start": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "standby_ms": {
+              "type": "integer"
+            },
+            "repairs": {
+              "type": "object",
+              "description": "Register name -> value rewritten before the timing registers (idempotent repairs of init-blob values).",
+              "additionalProperties": {
+                "$ref": "#/$defs/int"
+              }
+            },
+            "syncsel": {
+              "type": "string",
+              "description": "The sync.syncsel role the timing program asserts."
+            },
+            "release_ms": {
+              "type": "integer"
+            },
+            "start_ms": {
+              "type": "integer"
+            }
+          }
+        },
+        "trigger_switch": {
+          "$ref": "#/$defs/sleep_set"
+        },
+        "fast_trigger": {
+          "$ref": "#/$defs/sleep_set"
+        },
+        "sync_switch": {
+          "$ref": "#/$defs/sleep_set"
+        },
+        "restart": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "standby_ms": {
+              "type": "integer"
+            },
+            "stop_ms": {
+              "type": "integer"
+            },
+            "release_ms": {
+              "type": "integer"
+            },
+            "start_ms": {
+              "type": "integer"
+            }
+          }
+        },
+        "start": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "release_ms": {
+              "type": "integer"
+            },
+            "start_ms": {
+              "type": "integer"
+            }
+          }
+        },
+        "stop_ms": {
+          "type": "integer"
+        },
+        "hmax_live": {
+          "type": "boolean",
+          "description": "HMAX may be rewritten on a running sensor under REGHOLD (the hmax knob); absent, the line length is a mode fact."
+        },
+        "adbit": {
+          "type": "object",
+          "description": "ADBIT code per output bit depth (bit depth -> code) for the ADBIT_MONOSEL register; the timing program writes the mode's depth with meta.chromacity.",
+          "additionalProperties": {
+            "type": [
+              "integer",
+              "string"
+            ]
+          }
+        },
+        "init_inck_hz": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The INCK the init table's clock-dependent rows are set for; a link declaring another inck_hz is refused."
+        },
+        "blklevel": {
+          "type": "object",
+          "description": "The black-level register value per output bit depth (bit depth -> value, the datasheet's recommended setting); the timing program writes the mode's depth's.",
+          "additionalProperties": {
+            "type": [
+              "integer",
+              "string"
+            ]
+          }
+        },
+        "alive_reg": {
+          "type": "string",
+          "description": "The register a table-only part answers on for the alive poll; meta.device_id_reg when absent."
+        }
+      }
+    },
+    "controls": {
+      "type": "object",
+      "description": "A table-only part's controls: direct register writes clamped to min..max, one knob each; gain carries num/den (register steps per dB) for the kernel table. The `standby` control is the stream gate the flows start and stop the stream with, and no knob; it states its `standby` and `streaming` values.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "reg",
+          "min",
+          "max"
+        ],
+        "properties": {
+          "reg": {
+            "type": "string"
+          },
+          "min": {
+            "$ref": "#/$defs/int"
+          },
+          "max": {
+            "$ref": "#/$defs/int"
+          },
+          "num": {
+            "$ref": "#/$defs/int"
+          },
+          "den": {
+            "$ref": "#/$defs/int"
+          }
+        }
+      },
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9_]*$"
+      },
+      "properties": {
+        "standby": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "max",
+            "min",
+            "reg",
+            "standby",
+            "streaming"
+          ],
+          "properties": {
+            "reg": {
+              "type": "string"
+            },
+            "min": {
+              "$ref": "#/$defs/int"
+            },
+            "max": {
+              "$ref": "#/$defs/int"
+            },
+            "num": {
+              "$ref": "#/$defs/int"
+            },
+            "den": {
+              "$ref": "#/$defs/int"
+            },
+            "standby": {
+              "$ref": "#/$defs/int",
+              "description": "The stream gate's register value with the stream stopped."
+            },
+            "streaming": {
+              "$ref": "#/$defs/int",
+              "description": "The stream gate's register value with the stream running."
+            }
+          },
+          "description": "The stream gate: the `standby` control states the register's value in standby and its value while streaming, and the flows start and stop the stream with it."
+        }
+      }
+    },
+    "status": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/probe"
+      }
+    },
+    "runtime_forbidden": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/int"
+      }
+    },
+    "bank_offset": {
+      "$ref": "#/$defs/int"
+    },
+    "bank_blob_lanes": {
+      "type": "integer"
+    },
+    "windows": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/int"
+      }
+    },
+    "pipes": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "arm",
+          "vlock",
+          "bank"
+        ],
+        "properties": {
+          "arm": {
+            "type": "string"
+          },
+          "vlock": {
+            "type": "string"
+          },
+          "bank": {
+            "type": "integer"
+          }
+        }
+      }
+    },
+    "capture": {
+      "type": "object",
+      "description": "The host capture table this sensor contributes (one capture-side mode per table entry, in order) and the per-sensor capture facts.",
+      "additionalProperties": false,
+      "required": [
+        "mclk_khz",
+        "pix_clk_hz",
+        "gain",
+        "hdr_ratio",
+        "exposure",
+        "framerate",
+        "table"
+      ],
+      "properties": {
+        "mclk_khz": {
+          "type": "integer"
+        },
+        "pix_clk_hz": {
+          "type": "integer"
+        },
+        "lane_polarity": {
+          "type": "integer"
+        },
+        "tuning": {
+          "type": "object",
+          "description": "The vendor's ISP override the host folds into the capture stack's tuning for this sensor's modes: where it is published and its digest.",
+          "additionalProperties": false,
+          "required": ["override_url", "sha256"],
+          "properties": {
+            "override_url": {"type": "string", "format": "uri"},
+            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          }
+        },
+        "clock_noncontinuous": {
+          "type": "boolean",
+          "description": "The sensor gates its clock lane between bursts, the fact the `clock-noncontinuous` endpoint property states in the Linux video-interfaces binding. Continuous when absent."
+        },
+        "gain": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "factor",
+            "min",
+            "max",
+            "step",
+            "default"
+          ],
+          "properties": {
+            "factor": {
+              "type": "integer"
+            },
+            "min": {
+              "type": "integer"
+            },
+            "max": {
+              "type": "integer"
+            },
+            "step": {
+              "type": "integer"
+            },
+            "default": {
+              "type": "integer"
+            }
+          }
+        },
+        "hdr_ratio": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "min",
+            "max"
+          ],
+          "properties": {
+            "min": {
+              "type": "integer"
+            },
+            "max": {
+              "type": "integer"
+            }
+          }
+        },
+        "exposure": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "factor",
+            "max_us",
+            "step",
+            "default_us"
+          ],
+          "properties": {
+            "factor": {
+              "type": "integer"
+            },
+            "max_us": {
+              "type": "integer"
+            },
+            "step": {
+              "type": "integer"
+            },
+            "default_us": {
+              "type": "integer"
+            }
+          }
+        },
+        "framerate": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "factor",
+            "min_fps",
+            "step"
+          ],
+          "properties": {
+            "factor": {
+              "type": "integer"
+            },
+            "min_fps": {
+              "type": "number"
+            },
+            "step": {
+              "type": "integer"
+            }
+          }
+        },
+        "table": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "width",
+              "height",
+              "bit_depth",
+              "pixel_phase",
+              "min_exp_us"
+            ],
+            "description": "One capture-side mode. A row that states no line length or top rate takes them from the unit-program mode of its geometry and depth (the line length from the mode's HMAX in the table's pixel clock, the top rate from the shipped ceiling, else the laws'); a stated value stands.",
+            "properties": {
+              "width": {
+                "type": "integer"
+              },
+              "height": {
+                "type": "integer"
+              },
+              "bit_depth": {
+                "type": "integer",
+                "enum": [
+                  8,
+                  10,
+                  12,
+                  14,
+                  16
+                ]
+              },
+              "pixel_phase": {
+                "type": "string",
+                "enum": [
+                  "rggb",
+                  "grbg",
+                  "gbrg",
+                  "bggr"
+                ]
+              },
+              "line_length": {
+                "type": "integer",
+                "description": "Pixel clocks per line; absent, the unit-program mode's HMAX in the table's pixel clock."
+              },
+              "max_fps": {
+                "type": "number",
+                "description": "The top rate; absent, the unit-program mode's shipped ceiling, else its laws'."
+              },
+              "min_exp_us": {
+                "type": "integer"
+              },
+              "embedded_lines": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Embedded-data lines the VI sees in this row's stream; absent: none."
+              }
+            }
+          }
+        }
+      }
+    },
+    "limits_source": {
+      "type": "object",
+      "description": "Where each limit came from: datasheet, driver, measured (on a bench, shipped as a fact), or experimental (measured, experimental overlay only).",
+      "additionalProperties": {
+        "enum": [
+          "datasheet",
+          "driver",
+          "measured",
+          "experimental"
+        ]
+      }
+    },
+    "shipped": {
+      "type": "object",
+      "description": "The operating points each mode ships: per (port, csi lanes) the free-run range, the line the port runs and, for a port shipped under frame sync, its trigger frame. A mode without a point for the port's port is experimental there.",
+      "additionalProperties": {
+        "type": "array",
+        "minItems": 1,
+        "items": {
+          "$ref": "#/$defs/shipped_point"
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "meta": {
+            "properties": {
+              "role": {
+                "const": "SEN"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "default_mode",
+          "modes"
+        ]
+      }
+    }
+  ],
+  "$defs": {
+    "int": {
+      "anyOf": [
+        {
+          "type": "integer"
+        },
+        {
+          "type": "string",
+          "pattern": "^[+-]?(0[xX][0-9a-fA-F]+|0[oO][0-7]+|0[bB][01]+|[0-9]+)$"
+        }
+      ]
+    },
+    "sleep_set": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "standby_ms": {
+          "type": "integer"
+        },
+        "release_ms": {
+          "type": "integer"
+        },
+        "start_ms": {
+          "type": "integer"
+        }
+      }
+    },
+    "mode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "geometry",
+        "mipi"
+      ],
+      "properties": {
+        "geometry": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "width",
+            "height",
+            "bit_depth",
+            "lanes",
+            "rate_mbps"
+          ],
+          "properties": {
+            "width": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "height": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "bit_depth": {
+              "type": "integer",
+              "minimum": 8,
+              "maximum": 16
+            },
+            "lanes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4
+            },
+            "rate_mbps": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "timing": {
+          "type": "object"
+        },
+        "sony": {
+          "type": "object"
+        },
+        "mipi": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "data_type"
+          ],
+          "properties": {
+            "data_type": {
+              "type": "string",
+              "pattern": "^RAW(8|10|12|14|16)$"
+            },
+            "trigger_input": {
+              "type": "string"
+            },
+            "embedded_lines": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "sensor_mode": {
+          "description": "Ignored: the host derives a mode's capture index from the table it generates. Accepted so a sealed personality that carries it still reads.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "blobs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "final_blob": {
+          "type": "string"
+        },
+        "solo_blob": {
+          "type": "string",
+          "description": "The captured full-chain program the mode's unit program is pinned against (one blob per link)."
+        },
+        "final_blob_primary": {
+          "type": "string",
+          "description": "The final blob variant the captured dual program uses on its primary link."
+        },
+        "host_only": {
+          "type": "boolean",
+          "description": "The unit program does not offer this mode: the host tool judges it by its laws only. Set for a mode served by a pack-internal capture until that capture is split, and for a mode without a program yet."
+        },
+        "serializer_csi": {
+          "type": "boolean",
+          "description": "The personality writes the serializer's CSI block for this mode after its tables; the host composes none."
+        },
+        "table": {
+          "type": "string",
+          "description": "The register table (beside the descriptor) the unit program writes after the shared init for this mode; the behaviour class loads it by this name."
+        }
+      }
+    },
+    "probe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "reg"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9_]*$"
+        },
+        "reg": {
+          "type": "string"
+        },
+        "decode": {
+          "type": "object"
+        },
+        "format": {
+          "enum": [
+            "int",
+            "hex"
+          ]
+        },
+        "desc": {
+          "type": "string"
+        },
+        "expect": {
+          "$ref": "#/$defs/int"
+        },
+        "mask": {
+          "$ref": "#/$defs/int"
+        },
+        "warn_nonzero": {
+          "type": "boolean"
+        }
+      }
+    },
+    "shipped_point": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cameras",
+        "csi_lanes",
+        "fps",
+        "hmax"
+      ],
+      "properties": {
+        "cameras": {
+          "enum": [
+            1,
+            2
+          ],
+          "description": "How many cameras the point was proven with: one, or the pair."
+        },
+        "csi_lanes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4
+        },
+        "fps": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "floor",
+            "ceiling"
+          ],
+          "properties": {
+            "floor": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "ceiling": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            }
+          }
+        },
+        "hmax": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The line length the port runs at: the mode's timing.hmax, or the longer line a pair needs on the port's lanes (never shorter than the mode's); the port composes at it."
+        },
+        "trigger_vmax": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The fast-trigger frame the port syncs at; present only for a port that ships under frame sync, and the frame the synced pair then runs."
+        }
+      }
+    }
+  }
+}

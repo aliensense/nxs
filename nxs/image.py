@@ -1,27 +1,11 @@
-"""
-NXS driver-image binary format — serializer and deserializer.
-
-The NXS format stores everything needed to run a sensor driver on NXS:
-bytecode, parameter descriptors (capabilities), patch map (for runtime
-parameter changes), output field descriptors (for sample parsing), and
-a probe block so NXS can auto-detect the sensor's I²C address against
-its WHO_AM_I register instead of guessing.
-
-Binary layout:
-  Header (9B) → Name → Bytecode → Probe → Params → Output fields
-
-The 9-byte header is magic(4) major(1) minor(1) name_len(1) num_params(1)
-num_outputs(1). `major` is the incompatible-change counter; `minor` is the
-minimum NXS minor this image needs — the max `since_minor` over the opcodes
-it emits. Firmware runs the image iff major == NXS_MAJOR and minor <= the
-firmware's NXS_MINOR.
-
-All multi-byte integers are little-endian. Strings are length-prefixed
-ASCII (no null terminator).
-"""
+"""NXS personality-image binary format: serializer and deserializer. Layout:
+13-byte header (magic, major, minor, kind, flags, name_len, num_params,
+num_outputs, probe_len), name, bytecode section (plain, or nonce + ciphertext
+when sealed), probe block, params, output fields, bus_config trailer,
+descriptor trailer. Integers little-endian."""
 
 import struct
-from typing import List
+from typing import List, Optional, Tuple
 
 from nxs.compiler import (CompiledDriver, CompileError, ParamDescriptor,
                           PatchEntry, field_width, resolve_field_offsets)
@@ -30,15 +14,39 @@ from nxs.opcodes import Op, INSTRUCTION_SIZE, OPCODE_SINCE_MINOR
 
 _ParamKind = NxsDriverImage.ParamKind
 _BusKind = NxsDriverImage.BusKind
+ImageKind = NxsDriverImage.ImageKind
+TrailerRecord = NxsDriverImage.TrailerRecord
 
 NXS_MAGIC = b"NXS\x00"
 NXS_MAJOR = NxsDriverImage.NXS_MAJOR
 NXS_MINOR = NxsDriverImage.NXS_MINOR
 
-# Field type encoding (matches descriptor.py _TYPE_INFO keys). This is
-# the canonical numeric table: firmware stores and forwards these codes
-# verbatim (DriverImage field_type, the firmware output-info record, the I2C register
-# window), so every decoder must map through FIELD_TYPE_NAMES.
+# Header: magic, major, required minor, kind, flags, name_len, num_params,
+# num_outputs, probe_len (bytes of the probe program, the offset where
+# configure begins).
+_HEADER = struct.Struct("<4sBBBBBBBH")
+HEADER_SIZE = _HEADER.size
+# The v1.0 layout's header, recognised only to name the rebuild command.
+_FORMAT1_HEADER_SIZE = 9
+
+IMAGE_FLAG_SEALED = NxsDriverImage.IMAGE_FLAG_SEALED
+IMAGE_FLAG_AUTO = NxsDriverImage.IMAGE_FLAG_AUTO
+SEAL_NONCE_SIZE = NxsDriverImage.SEAL_NONCE_SIZE
+MAX_TRAILER_SIZE = NxsDriverImage.MAX_TRAILER_SIZE
+_TRAILER_RECORD_HEADER = struct.Struct("<BH")
+
+IMAGE_KIND_NAMES = {ImageKind.DRIVER: 'driver', ImageKind.CAMERA: 'camera',
+                    ImageKind.HUB: 'hub'}
+#: The NXS minor that introduced a kind; an image of that kind never asks
+#: for less, whatever its opcodes need.
+IMAGE_KIND_SINCE_MINOR = {ImageKind.HUB: 3}
+
+# The hint every format refusal carries; a caller that knows the
+# personality substitutes its name.
+REBUILD_HINT = "rebuild it: nxs upload <name>"
+
+# Field type codes; firmware stores and forwards them verbatim, so every decoder
+# must map through FIELD_TYPE_NAMES.
 _FIELD_TYPE_MAP = {
     'int8': 0, 'uint8': 1, 'int16': 2, 'uint16': 3,
     'int32': 4, 'uint32': 5, 'float32': 6, 'float64': 7,
@@ -56,6 +64,7 @@ MAX_PARAMS = NxsDriverImage.MAX_PARAMS
 MAX_PARAM_VALUES = NxsDriverImage.MAX_PARAM_VALUES
 MAX_PATCH_SITES = NxsDriverImage.MAX_PATCH_SITES
 VM_MAX_PROGRAM_SIZE = NxsDriverImage.VM_MAX_PROGRAM_SIZE
+VM_HOST_PROGRAM_SIZE = NxsDriverImage.VM_HOST_PROGRAM_SIZE
 MAX_DRIVER_IMAGE_SIZE = NxsDriverImage.MAX_DRIVER_IMAGE_SIZE
 
 _BUS_KIND_NAMES = {
@@ -65,9 +74,7 @@ _BUS_KIND_NAMES = {
 }
 _BUS_KIND_NAME_TO_INT = {v: k for k, v in _BUS_KIND_NAMES.items()}
 
-# Register-access switch codes — mirror the AutoInc / Pec enums in
-# constants/driver_image.yaml (same SSOT the firmware reads), so the
-# wire codes can't drift between host and device.
+# Register-access switch codes shared with the firmware.
 _AutoInc = NxsDriverImage.AutoInc
 _Pec = NxsDriverImage.Pec
 _AUTO_INC_TO_INT = {'implicit': _AutoInc.IMPLICIT, 'msb': _AutoInc.MSB,
@@ -75,6 +82,8 @@ _AUTO_INC_TO_INT = {'implicit': _AutoInc.IMPLICIT, 'msb': _AutoInc.MSB,
 _AUTO_INC_NAMES = {v: k for k, v in _AUTO_INC_TO_INT.items()}
 _PEC_TO_INT = {'none': _Pec.NONE, 'crc8': _Pec.CRC8}
 _PEC_NAMES = {v: k for k, v in _PEC_TO_INT.items()}
+_BYTE_ORDER_TO_INT = {'big': 0, 'little': 1}
+_BYTE_ORDER_NAMES = {v: k for k, v in _BYTE_ORDER_TO_INT.items()}
 
 
 def _code_name(names: dict, code: int, what: str) -> str:
@@ -94,10 +103,8 @@ def _code_int(mapping: dict, name: str, what: str) -> int:
 
 
 def _required_minor(bytecode: bytes) -> int:
-    """Minimum NXS minor an image needs: the max `since_minor` over the
-    opcodes it emits. Walks the bytecode instruction-by-instruction —
-    mirroring the disassembler's MEMCPY_IMM variable-length step — so an
-    opcode's operand or inline-data bytes are never misread as opcodes."""
+    """Minimum NXS minor an image needs: the max `since_minor` over its opcodes.
+    Walks instruction by instruction (MEMCPY_IMM is variable-length)."""
     required = 0
     pc = 0
     n = len(bytecode)
@@ -112,48 +119,67 @@ def _required_minor(bytecode: bytes) -> int:
 
 
 def serialize(compiled: CompiledDriver) -> bytes:
-    """Serialize a CompiledDriver into the NXS binary format.
-
-    Enforces the shared descriptor caps (`MAX_PARAMS`, `MAX_PARAM_VALUES` —
-    SSOT `constants/driver_image.yaml`) at build time, so an over-cap driver
-    raises a `CompileError` here instead of compiling to an image the firmware
-    rejects at load with `TOO_MANY_PARAMS` / `PARAM_TOO_MANY_VALUES`. The
-    output-field count (`MAX_OUTPUTS`) is capped earlier, in the compiler's
-    `validate_field_layout`.
-    """
+    """Serialize a CompiledDriver into the NXS binary format. Raises CompileError
+    when a descriptor cap (`MAX_PARAMS`, `MAX_PARAM_VALUES`, `MAX_PATCH_SITES`,
+    `MAX_TRAILER_SIZE`) or the program / image size limit is exceeded. A sealed
+    section passes through as it was read: this tool never encrypts."""
     if len(compiled.params) > MAX_PARAMS:
         raise CompileError(
             f"{compiled.name}: {len(compiled.params)} params exceeds the "
             f"{MAX_PARAMS}-param image limit")
-    if len(compiled.bytecode) > VM_MAX_PROGRAM_SIZE:
+    # A hub image runs on the host executor and takes its program budget;
+    # a pod's slot holds the rest.
+    host = compiled.kind == ImageKind.HUB
+    program_cap = VM_HOST_PROGRAM_SIZE if host else VM_MAX_PROGRAM_SIZE
+    if len(compiled.bytecode) > program_cap:
         raise CompileError(
             f"{compiled.name}: {len(compiled.bytecode)} B of bytecode "
-            f"exceeds the {VM_MAX_PROGRAM_SIZE} B VM program limit")
+            f"exceeds the {program_cap} B VM program limit")
+    if compiled.kind not in IMAGE_KIND_NAMES:
+        raise ValueError(f"{compiled.name}: unknown image kind {compiled.kind!r}")
 
     buf = bytearray()
     name_bytes = compiled.name.encode('ascii')
 
-    # Header (9 bytes): magic, major, required-minor, name_len, num_params,
-    # num_outputs. The minor is computed from the emitted opcodes so an
-    # image transparently demands the firmware that can run it.
-    buf += NXS_MAGIC
-    buf += struct.pack("<BBBBB",
-                       NXS_MAJOR,
-                       _required_minor(compiled.bytecode),
-                       len(name_bytes),
-                       len(compiled.params),
-                       len(compiled.output_fields))
+    # A sealed section cannot be walked for its opcodes, so its required
+    # minor is the one carried in from the read.
+    if compiled.sealed:
+        if compiled.required_minor is None:
+            raise ValueError(
+                f"{compiled.name}: a sealed image needs its required minor")
+        if len(compiled.seal_nonce) != SEAL_NONCE_SIZE:
+            raise ValueError(
+                f"{compiled.name}: a sealed image carries a "
+                f"{SEAL_NONCE_SIZE}-byte nonce, got {len(compiled.seal_nonce)}")
+        required_minor = int(compiled.required_minor)
+    else:
+        # A reader older than the kind itself must refuse the image as
+        # NEEDS_NEWER_MINOR rather than meet an unknown kind past the gate.
+        required_minor = max(_required_minor(compiled.bytecode),
+                             IMAGE_KIND_SINCE_MINOR.get(compiled.kind, 0))
+
+    probe_len = int(compiled.probe_len)
+    if not 0 <= probe_len <= len(compiled.bytecode):
+        raise CompileError(
+            f"{compiled.name}: probe length {probe_len} lies outside the "
+            f"{len(compiled.bytecode)} B program")
+
+    buf += _HEADER.pack(NXS_MAGIC, NXS_MAJOR, required_minor,
+                        int(compiled.kind), int(compiled.flags) & 0xFF,
+                        len(name_bytes), len(compiled.params),
+                        len(compiled.output_fields), probe_len)
 
     # Driver name
     buf += name_bytes
 
-    # Bytecode section
+    # Bytecode section: the nonce precedes the length only when sealed.
+    if compiled.sealed:
+        buf += compiled.seal_nonce
     buf += struct.pack("<H", len(compiled.bytecode))
     buf += compiled.bytecode
 
-    # Probe block — WHO_AM_I anchor + candidate I²C addresses. Empty
-    # when the driver doesn't expose these class attributes (e.g.,
-    # StreamDriver, or authors using the legacy template).
+    # Probe block: WHO_AM_I anchor + candidate I²C addresses; empty for a
+    # stream driver.
     wai_reg = getattr(compiled, 'who_am_i_reg', 0) or 0
     wai_values = list(getattr(compiled, 'who_am_i_values', []) or [])[:16]
     i2c_addrs = list(getattr(compiled, 'i2c_addrs', []) or [])[:8]
@@ -166,26 +192,23 @@ def serialize(compiled: CompiledDriver) -> bytes:
     for param in compiled.params:
         _write_param(buf, param, compiled.patch_map)
 
-    # Output field descriptors. A field's optional `scale_param` is
-    # resolved to a param index here, where the final param order is
-    # known — the firmware multiplies the base scale by that param's live
-    # current_value to form the effective SI scale. Byte offsets are
-    # resolved (sequential where not explicit) before writing, so every
-    # image carries an explicit position per field.
+    # Output fields. A `scale_param` name resolves to its param index here;
+    # the firmware multiplies the base scale by that param's live value.
     param_index = {p.name: i for i, p in enumerate(compiled.params)}
     for field in resolve_field_offsets(compiled.output_fields):
         _write_output_field(buf, field, param_index)
 
-    # Optional bus_config trailer. Driver omits this entirely when
-    # `bus_config` is None / absent — firmware then keeps DTS defaults.
-    bus_config = getattr(compiled, 'bus_config', None)
-    if bus_config is not None:
-        _write_bus_config(buf, bus_config)
+    # The bus_config trailer's count byte is always present (0 = none, the
+    # firmware keeps DTS defaults), so the descriptor trailer after it has a
+    # fixed start.
+    _write_bus_config(buf, getattr(compiled, 'bus_config', None) or [])
 
-    # The image cap is a storage contract (store slots fill the NVS
-    # partition exactly); the enforced invariant is the aggregate
-    # header + metadata + bytecode, not a per-part split.
-    if len(buf) > MAX_DRIVER_IMAGE_SIZE:
+    # Descriptor trailer: host-owned records the firmware stores opaquely.
+    buf += trailer_bytes(compiled.trailer, compiled.name)
+
+    # The cap is the aggregate header + metadata + bytecode (store slots fill
+    # the NVS partition exactly).
+    if not host and len(buf) > MAX_DRIVER_IMAGE_SIZE:
         raise CompileError(
             f"{compiled.name}: {len(buf)} B image exceeds the "
             f"{MAX_DRIVER_IMAGE_SIZE} B image limit "
@@ -195,36 +218,126 @@ def serialize(compiled: CompiledDriver) -> bytes:
     return bytes(buf)
 
 
-def peek_format(data: bytes) -> tuple:
-    """Image-format (major, required-minor) from an NXS header — cheap
-    staleness check before an upload. Requires the full 9-byte header
-    (magic, major, minor, name/param/output counts), so a truncated
-    artifact is rejected here instead of on-device."""
-    if len(data) < 9 or data[:4] != NXS_MAGIC:
-        raise ValueError(f"Not an NXS image header: {data[:9]!r}")
+def trailer_bytes(records, name: str = "image") -> bytes:
+    """The descriptor trailer on the wire: a count byte, then one
+    `type u8, len u16, bytes` record per `(type, bytes)` entry. Raises
+    CompileError past `MAX_TRAILER_SIZE` (count byte included)."""
+    records = list(records or [])
+    if len(records) > 0xFF:
+        raise CompileError(
+            f"{name}: {len(records)} trailer records exceed the 255-record "
+            f"count byte")
+    buf = bytearray(struct.pack("<B", len(records)))
+    for rec_type, payload in records:
+        rec_type = int(rec_type)
+        payload = bytes(payload)
+        if not 1 <= rec_type <= 0xFF:
+            raise ValueError(
+                f"{name}: trailer record type {rec_type} is outside 1..255 "
+                f"(0 is reserved)")
+        if len(payload) > 0xFFFF:
+            raise CompileError(
+                f"{name}: trailer record type {rec_type} carries "
+                f"{len(payload)} B, past the 16-bit length")
+        buf += _TRAILER_RECORD_HEADER.pack(rec_type, len(payload))
+        buf += payload
+    if len(buf) > MAX_TRAILER_SIZE:
+        raise CompileError(
+            f"{name}: {len(buf)} B descriptor trailer exceeds the "
+            f"{MAX_TRAILER_SIZE} B limit (count byte included)")
+    return bytes(buf)
 
-    return data[4], data[5]
+
+def trailer_size(data: bytes) -> Optional[int]:
+    """Total byte count of the descriptor trailer whose first bytes are
+    `data`, or None while `data` ends inside a record header or count byte.
+    A prefix that already reads past `MAX_TRAILER_SIZE` raises ValueError."""
+    if not data:
+        return None
+    count = data[0]
+    pos = 1
+    for _ in range(count):
+        if pos + _TRAILER_RECORD_HEADER.size > len(data):
+            return None
+        _rec_type, length = _TRAILER_RECORD_HEADER.unpack_from(data, pos)
+        pos += _TRAILER_RECORD_HEADER.size + length
+        if pos > MAX_TRAILER_SIZE:
+            raise ValueError(
+                f"descriptor trailer declares {pos}+ B, past the "
+                f"{MAX_TRAILER_SIZE} B limit")
+    return pos
+
+
+def parse_trailer(data: bytes) -> List[Tuple[int, bytes]]:
+    """The `(type, bytes)` records of a complete descriptor trailer (the form
+    `trailer_bytes` writes and the unit serves). Raises ValueError on a
+    truncated trailer."""
+    size = trailer_size(data)
+    if size is None or size > len(data):
+        raise ValueError("descriptor trailer truncated")
+    records = []
+    pos = 1
+    for _ in range(data[0]):
+        rec_type, length = _TRAILER_RECORD_HEADER.unpack_from(data, pos)
+        pos += _TRAILER_RECORD_HEADER.size
+        records.append((rec_type, bytes(data[pos:pos + length])))
+        pos += length
+    return records
+
+
+def format_refusal(major: int, minor: int) -> Optional[str]:
+    """The one-line reason this tool refuses an image of format
+    `major.minor`, or None when it reads that format."""
+    if major == NXS_MAJOR and minor <= NXS_MINOR:
+        return None
+    layout = " (the v1.0 image layout)" if major < NXS_MAJOR else ""
+    return (f"image format {major}.{minor}{layout}, this tool builds "
+            f"{NXS_MAJOR}.{NXS_MINOR} — {REBUILD_HINT}")
+
+
+def peek_format(data: bytes) -> tuple:
+    """`(major, minor, kind, flags)` from an NXS header. A v1.0 header (major
+    below this tool's) answers kind DRIVER and no flags, the only values that
+    layout could carry; a truncated artifact is rejected here."""
+    if len(data) < _FORMAT1_HEADER_SIZE or data[:4] != NXS_MAGIC:
+        raise ValueError(f"Not an NXS image header: {data[:HEADER_SIZE]!r}")
+    major, minor = data[4], data[5]
+    if major < NXS_MAJOR:
+        return major, minor, ImageKind.DRIVER, 0
+    if len(data) < HEADER_SIZE:
+        raise ValueError(f"Not an NXS image header: {data[:HEADER_SIZE]!r}")
+    return major, minor, data[6], data[7]
 
 
 def deserialize(data: bytes) -> CompiledDriver:
-    """Deserialize an NXS binary image into a CompiledDriver."""
+    """Deserialize an NXS binary image into a CompiledDriver. A sealed
+    bytecode section stays opaque: `bytecode` holds the ciphertext and
+    `sealed` is True. An image cut short anywhere is a ValueError."""
+    try:
+        return _deserialize(data)
+    except (struct.error, IndexError) as exc:
+        raise ValueError(f"image truncated ({exc})") from None
+
+
+def _deserialize(data: bytes) -> CompiledDriver:
     pos = 0
 
     # Header
-    magic = data[pos:pos + 4]
-    if magic != NXS_MAGIC:
-        raise ValueError(f"Bad magic: {magic!r}")
-    pos += 4
-
-    major, _minor, name_len, num_params, num_outputs = struct.unpack_from(
-        "<BBBBB", data, pos)
-    pos += 5
-    # Major gates wire-layout compatibility — a foreign major can't be
-    # parsed at all. Minor is the image's required firmware minor; the
-    # host can inspect any same-major image, so it isn't gated here (the
-    # firmware parser enforces required-minor <= its NXS_MINOR at load).
+    if data[:4] != NXS_MAGIC:
+        raise ValueError(f"Bad magic: {data[:4]!r}")
+    if len(data) < HEADER_SIZE:
+        raise ValueError("image header truncated")
+    (_magic, major, minor, kind, flags, name_len, num_params,
+     num_outputs, probe_len) = _HEADER.unpack_from(data, pos)
+    pos += HEADER_SIZE
+    # Major gates the wire layout. Minor is the image's required firmware minor,
+    # enforced at load by the firmware, so any same-major image is inspectable.
     if major != NXS_MAJOR:
-        raise ValueError(f"Unsupported major version: {major}")
+        refusal = format_refusal(major, minor)
+        raise ValueError(refusal if major < NXS_MAJOR
+                         else f"Unsupported major version: {major}")
+    if kind not in IMAGE_KIND_NAMES:
+        raise ValueError(f"image declares unknown kind {kind}")
     if num_outputs > MAX_OUTPUTS:
         raise ValueError(
             f"image declares {num_outputs} output fields (max {MAX_OUTPUTS})")
@@ -233,11 +346,20 @@ def deserialize(data: bytes) -> CompiledDriver:
     name = data[pos:pos + name_len].decode('ascii')
     pos += name_len
 
-    # Bytecode
+    # Bytecode: plain, or the CTR nonce then the ciphertext when sealed.
+    seal_nonce = b""
+    if flags & IMAGE_FLAG_SEALED:
+        seal_nonce = bytes(data[pos:pos + SEAL_NONCE_SIZE])
+        pos += SEAL_NONCE_SIZE
+        if len(seal_nonce) != SEAL_NONCE_SIZE:
+            raise ValueError("sealed image truncated inside its nonce")
     bytecode_len = struct.unpack_from("<H", data, pos)[0]
     pos += 2
     bytecode = data[pos:pos + bytecode_len]
     pos += bytecode_len
+    if probe_len > bytecode_len:
+        raise ValueError(
+            f"image declares a {probe_len} B probe in a {bytecode_len} B program")
 
     # Probe block
     wai_reg = data[pos]; pos += 1
@@ -260,8 +382,10 @@ def deserialize(data: bytes) -> CompiledDriver:
         field, pos = _read_output_field(data, pos)
         output_fields.append(field)
 
-    # Optional bus_config trailer.
+    # bus_config trailer (count byte always present), then the descriptor
+    # trailer.
     bus_config, pos = _read_bus_config(data, pos)
+    trailer, pos = _read_trailer(data, pos)
 
     cd = CompiledDriver(
         bytecode=bytecode,
@@ -276,14 +400,30 @@ def deserialize(data: bytes) -> CompiledDriver:
         output_fields=output_fields,
         params=params,
         patch_map=patch_map,
+        kind=kind,
+        flags=flags,
+        seal_nonce=seal_nonce,
+        required_minor=minor,
+        trailer=trailer,
+        probe_len=probe_len,
     )
-    # Probe fields — set as attributes rather than ctor args so older
-    # CompiledDriver shapes (and fresh compile() outputs) coexist.
+    # Probe fields are set as attributes rather than ctor args.
     cd.who_am_i_reg = wai_reg
     cd.who_am_i_values = who_am_i_values
     cd.i2c_addrs = i2c_addrs
     cd.bus_config = bus_config
     return cd
+
+
+def _read_trailer(data: bytes, pos: int):
+    """Read the descriptor trailer at `pos`. Returns `(records, new_pos)`;
+    a truncated trailer raises ValueError."""
+    if pos >= len(data):
+        raise ValueError("descriptor trailer missing (image truncated)")
+    size = trailer_size(data[pos:])
+    if size is None or pos + size > len(data):
+        raise ValueError("descriptor trailer truncated")
+    return parse_trailer(data[pos:pos + size]), pos + size
 
 
 def _write_param(buf: bytearray, param: ParamDescriptor,
@@ -304,11 +444,8 @@ def _write_param(buf: bytearray, param: ParamDescriptor,
     buf += struct.pack("<B", kind)
     buf += struct.pack("<II", int(param.default), int(param.current))
 
-    # Collect this param's patch sites, ordered by offset for a deterministic
-    # wire layout. A param may patch more than one register (e.g. a filter
-    # cutoff written to an X register and a Y/Z register), each its own site.
-    # Live params apply without a reload — the value lives in current_value,
-    # never a bytecode operand — so they never carry a patch.
+    # This param's patch sites, ordered by offset for a deterministic wire
+    # layout. Live params carry no patch: the value lives in current_value.
     sites = ([] if param.kind == "live"
              else sorted((p for p in patch_map if p.param_name == param.name),
                          key=lambda p: p.offset))
@@ -328,15 +465,14 @@ def _write_param(buf: bytearray, param: ParamDescriptor,
 
     for patch in sites:
         # Patch operands are unsigned and at most 4 bytes; an out-of-range value
-        # would otherwise crash in struct.pack rather than report cleanly.
+        # would otherwise crash in struct.pack.
         for v in patch.value_map.values():
             if not 0 <= int(v) <= 0xFFFFFFFF:
                 raise ValueError(
                     f"param {param.name!r}: patch value {v} is outside the "
                     f"uint32 range")
-        # The patch width is declared at the write site (write=1, set_baud=4,
-        # stage=explicit); the firmware writes exactly that many bytes. Every
-        # value must fit, and the width must match a supported store.
+        # The patch width is declared at the write site; the firmware writes
+        # exactly that many bytes, so every value must fit.
         if patch.size not in (1, 2, 4):
             raise ValueError(
                 f"param {param.name!r}: patch size {patch.size} must be 1, 2, or 4")
@@ -419,7 +555,7 @@ def _read_param(data: bytes, pos: int):
         for _ in range(num_values):
             v = struct.unpack_from("<I", data, pos)[0]; pos += 4
             values.append(v)
-        # Patch bytes — enum reload params only; site-major, width per site.
+        # Patch bytes: enum reload params only; site-major, width per site.
         if param_type == "enum":
             for si in range(num_sites):
                 for v in values:
@@ -452,11 +588,8 @@ def _read_param(data: bytes, pos: int):
 
 def _write_output_field(buf: bytearray, field: dict, param_index=None):
     """Write an output field descriptor. After scale/offset comes a
-    `scale_param_index` byte (0xFF = none): the declared-param index whose
-    live value multiplies the base scale on-device. String fields then
-    carry a trailing `<H` count so the deserializer can recover
-    `sample_size` — numeric types' size is implied by `ftype`, but a
-    string's payload width is driver-defined (`MAX_READ_SIZE`-style)."""
+    `scale_param_index` byte (0xFF = none), then `byte_off`; string fields
+    carry a trailing `<H` count so the deserializer recovers `sample_size`."""
     name_bytes = field['name'].encode('ascii')
     buf += struct.pack("<B", len(name_bytes))
     buf += name_bytes
@@ -474,9 +607,8 @@ def _write_output_field(buf: bytearray, field: dict, param_index=None):
                        float(field.get('scale', 1.0)),
                        float(field.get('offset', 0.0)))
 
-    # scale_param_index: resolve a `scale_param` name through param_index
-    # (the compile path), fall back to a pre-resolved `scale_param_index`
-    # (the deserialize→re-serialize path), else 0xFF for "no live param".
+    # scale_param_index: a `scale_param` name resolves through param_index, a
+    # pre-resolved `scale_param_index` passes through, else 0xFF.
     scale_param = field.get('scale_param')
     if scale_param is not None and param_index is not None:
         scale_param_index = param_index.get(scale_param, 0xFF)
@@ -530,14 +662,12 @@ def _read_output_field(data: bytes, pos: int):
 def _write_bus_config(buf: bytearray, bus_config) -> None:
     """Write the per-bus bus_config trailer: a count byte then one
     register-access / UART profile block per supported bus. A falsy
-    bus_config writes nothing (firmware keeps DTS defaults)."""
-    if not bus_config:
-        return
-    if len(bus_config) > MAX_BUS_PROFILES:
+    bus_config writes a zero count (firmware keeps DTS defaults)."""
+    if len(bus_config or []) > MAX_BUS_PROFILES:
         raise CompileError(
             f"bus_config has {len(bus_config)} profiles (max {MAX_BUS_PROFILES})")
-    buf += struct.pack("<B", len(bus_config))
-    for prof in bus_config:
+    buf += struct.pack("<B", len(bus_config or []))
+    for prof in bus_config or []:
         kind = prof['kind']
         if isinstance(kind, str):
             kind = _BUS_KIND_NAME_TO_INT.get(kind)
@@ -553,10 +683,19 @@ def _write_bus_config(buf: bytearray, bus_config) -> None:
                 int(prof.get('dummy_bytes', 0)),
                 _code_int(_AUTO_INC_TO_INT, prof.get('auto_inc', 'implicit'), 'auto_inc'))
         elif kind == BUS_KIND_I2C:
+            addr_bytes = int(prof.get('addr_bytes', 1))
+            data_width = int(prof.get('data_width', 1))
+            if addr_bytes not in (1, 2):
+                raise ValueError(f"invalid bus_config addr_bytes: {addr_bytes}")
+            if data_width not in (1, 2, 4):
+                raise ValueError(f"invalid bus_config data_width: {data_width}")
             buf += struct.pack(
-                "<BB",
+                "<BBBBB",
                 _code_int(_AUTO_INC_TO_INT, prof.get('auto_inc', 'implicit'), 'auto_inc'),
-                _code_int(_PEC_TO_INT, prof.get('pec', 'none'), 'pec'))
+                _code_int(_PEC_TO_INT, prof.get('pec', 'none'), 'pec'),
+                addr_bytes,
+                data_width,
+                _code_int(_BYTE_ORDER_TO_INT, prof.get('byte_order', 'big'), 'byte_order'))
         elif kind == BUS_KIND_UART:
             buf += struct.pack("<BBB",
                                int(prof.get('uart_parity',    0)),
@@ -565,10 +704,10 @@ def _write_bus_config(buf: bytearray, bus_config) -> None:
 
 
 def _read_bus_config(data: bytes, pos: int):
-    """Read the per-bus bus_config trailer. Returns `(list_or_None, new_pos)`.
-    Absent trailer → (None, pos)."""
+    """Read the per-bus bus_config trailer. Returns `(list_or_None, new_pos)`;
+    a zero count reads as None (the firmware keeps DTS defaults)."""
     if pos >= len(data):
-        return None, pos
+        raise ValueError("bus_config trailer missing (image truncated)")
     num = data[pos]
     pos += 1
     if num > MAX_BUS_PROFILES:
@@ -595,11 +734,18 @@ def _read_bus_config(data: bytes, pos: int):
             bc['auto_inc']      = _code_name(_AUTO_INC_NAMES, data[pos + 4], 'auto_inc')
             pos += 5
         elif kind == BUS_KIND_I2C:
-            if pos + 2 > len(data):
+            if pos + 5 > len(data):
                 raise ValueError("bus_config i2c body truncated")
             bc['auto_inc'] = _code_name(_AUTO_INC_NAMES, data[pos], 'auto_inc')
             bc['pec']      = _code_name(_PEC_NAMES, data[pos + 1], 'pec')
-            pos += 2
+            if data[pos + 2] not in (1, 2):
+                raise ValueError(f"invalid bus_config addr_bytes: {data[pos + 2]}")
+            if data[pos + 3] not in (1, 2, 4):
+                raise ValueError(f"invalid bus_config data_width: {data[pos + 3]}")
+            bc['addr_bytes'] = data[pos + 2]
+            bc['data_width'] = data[pos + 3]
+            bc['byte_order'] = _code_name(_BYTE_ORDER_NAMES, data[pos + 4], 'byte_order')
+            pos += 5
         elif kind == BUS_KIND_UART:
             if pos + 3 > len(data):
                 raise ValueError("bus_config uart body truncated")
