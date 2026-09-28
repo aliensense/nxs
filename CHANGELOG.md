@@ -6,6 +6,7 @@ All notable changes to NXS: the `nxs` tool and daemon, the `libnxs` runtime libr
 
 ### Added
 
+- The guides on the documentation site read as getting-started pages: the NVIDIA Jetson deployment guide, Getting started with the NXS unit, Multi-sensor dashboard on ROS 2, Custom sensor personality and Custom camera personality, each with a version driven from an AI agent, and a landing page that lists them. The hotfix refusal on JetPack 7.2.1 names the deployment guide.
 - Camera personalities. The unit on a camera's pod stores the image sensor's program as a sealed image and runs it on the pod's bus. It serves the sensor's modes, controls and capture facts back to the host as records, so the host carries no sensor source.
 - The camera personalities of the two shipped Sony heads, a global-shutter and a rolling-shutter one, at 1920x1080 RAW10 on 2 CSI lanes. The global-shutter head runs at 20 to 74 fps alone and as a frame-synced pair; the rolling-shutter head runs alone at 20 to 59 fps.
 - `nxs <port> <link> upload <name>` puts a camera personality in the pod's store. A unit holds one camera personality: an upload replaces it, and `--slot` puts it in another slot.

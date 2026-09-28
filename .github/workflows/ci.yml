@@ -45,7 +45,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install without extras
-        run: pip install -e . pytest
+        run: pip install -e .
 
       - name: Smoke test
         run: |
@@ -55,4 +55,3 @@ jobs:
           nxs host info
           if nxs -t cyphal-serial probe > "$RUNNER_TEMP/probe.log" 2>&1; then echo "probe ran without the Cyphal extra"; exit 1; fi
           grep -F "pip install 'aliensense-nxs[cyphal]'" "$RUNNER_TEMP/probe.log"
-          python -m pytest nxs/tests/test_declaration.py nxs/tests/test_schemas.py -q

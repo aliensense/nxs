@@ -162,7 +162,7 @@ def cmd_ros2(args, opener=open_client, argv=None, cfg=None):
         for client in clients:
             client.close()
         raise SystemExit(
-            "nxs ros2 needs: pip install aliensense-nxs[ros2], inside a sourced ROS 2 "
+            "nxs ros2 needs: pip install 'aliensense-nxs[ros2]', inside a sourced ROS 2 "
             "environment (source /opt/ros/<distro>/setup.bash)") from None
 
     for plan in plans:

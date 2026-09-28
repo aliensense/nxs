@@ -490,6 +490,6 @@ def cmd_mcp(args) -> int:
     try:
         import mcp  # noqa: F401
     except ImportError:
-        raise SystemExit("nxs mcp needs: pip install aliensense-nxs[mcp]")
+        raise SystemExit("nxs mcp needs: pip install 'aliensense-nxs[mcp]'")
     build_server().run(transport="stdio")
     return 0

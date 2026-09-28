@@ -83,8 +83,8 @@ python3 -m build --wheel
 ```
 
 The wheel lands in `dist/`. A standalone checkout carries the vendored
-DSDL and builds as-is; inside the firmware repository, run
-`../scripts/vendor-dsdl.sh` first so the bundle is current.
+DSDL and builds as-is; in a source checkout, run `../scripts/vendor-dsdl.sh`
+first so the bundle is current.
 
 **2. Copy to the Jetson and install:**
 
@@ -206,12 +206,10 @@ from the firmware's `dsdl/aliensense` types and the full `uavcan` namespace of
 OpenCyphal's `public_regulated_data_types`, which yakut and yukon need beside
 the vendor types (`uavcan.node`, `uavcan.file`, and their dependencies).
 
-A standalone checkout carries the bundle in `nxs/dsdl/` already. Inside
-the firmware repository it is git-ignored codegen output:
-`../scripts/vendor-dsdl.sh` assembles it and the release pipeline runs that
-before building the wheel. Run it by hand before building the cyphal
-container or running the cyphal tests from a fresh firmware-repo checkout:
+A standalone checkout carries the bundle in `nxs/dsdl/` already, assembled
+by the release pipeline before building the wheel. Run that step by hand before building the cyphal
+container or running the cyphal tests from a fresh source checkout:
 
 ```
-scripts/vendor-dsdl.sh        # needs `west update`, or PRDT=/path
+../scripts/vendor-dsdl.sh        # needs `west update`, or PRDT=/path
 ```

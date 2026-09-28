@@ -26,8 +26,7 @@ A mikroBUS part is a unit personality: run `/nxs-generate-sensor-personality` in
 Whichever exists in the checkout:
 
 ```
-docs/released/specs/nxs-camera-personalities.md     # inside the firmware repository
-docs/nxs-camera-personalities.md           # standalone SDK checkout / release bundle
+find docs -name nxs-camera-personalities.md    # prints the file to read, wherever the docs tree keeps it
 ```
 
 §3 is the descriptor, §3.1 what makes a sensor a full citizen, §4 the behaviour class and the law families, §7 the validation gates. The DSL verbs a camera class uses are §4.14 of `nxs-personality-authoring.md` beside it. The references win over this skill where they disagree. The compiler is a black box: `nxs upload … -o` is the feedback loop.

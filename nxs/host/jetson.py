@@ -79,7 +79,7 @@ HOTFIX_L4T_MAJOR = "39"
 HOTFIX_FILES = ("usr/sbin/nvcfg2nito",
                 "usr/lib/aarch64-linux-gnu/nvidia/libnvm_cam_tuning_l4t_cfg2nito.so",
                 "var/nvidia/nvcam/settings/template.nito")
-HOTFIX_STEP = "install NVIDIA's camera hotfix (guide 1, step 3)"
+HOTFIX_STEP = "install NVIDIA's camera hotfix (NVIDIA Jetson deployment guide, step 3)"
 
 
 def l4t_release(release_file: str = RELEASE_FILE) -> Optional[str]:

@@ -56,8 +56,7 @@ the exact APIs, patterns, and constraints — whichever of these exists in
 your checkout:
 
 ```
-docs/released/specs/nxs-personality-authoring.md    # inside the firmware repository
-docs/nxs-personality-authoring.md          # standalone SDK checkout / release bundle
+find docs -name nxs-personality-authoring.md    # prints the file to read, wherever the docs tree keeps it
 ```
 
 That guide is the single source of truth for what a personality can do

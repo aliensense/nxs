@@ -374,7 +374,7 @@ def main(argv=None) -> int:
         # The ports are up; the bridge has no ROS 2 to publish on. Hold
         # them rather than exit into a restart loop that rebuilds them.
         log.error("no ROS 2 environment for the unit bridge (nxs ros2 needs: pip install "
-                  "aliensense-nxs[ros2], inside a sourced ROS 2 environment); "
+                  "'aliensense-nxs[ros2]', inside a sourced ROS 2 environment); "
                   "holding the ports for SIGHUP")
         return _hold_for_reload(cfg)
     # The data plane is the existing suite->ROS2 bridge, run in-process;
