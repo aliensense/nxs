@@ -8,11 +8,17 @@ import math
 
 SYNC_OPTIONS = ["free_run", "fsync"]
 
+#: The rates the panel marks `· shipped` (requirements nxs-tune §4); with
+#: the mode's ceiling, the fps knob's detents wherever its menu offers them.
+FPS_DETENTS = (30, 60)
+#: A step toward a detent that lands this close to it pulls onto it.
+DETENT_PULL_FPS = 2
+
 class Field:
     """One panel knob: a name and its stepped options."""
 
     def __init__(self, name, options, index, render=str, unit=None, bounds=None,
-                 pinned=None):
+                 pinned=None, detents=()):
         self.name = name
         self.options = options
         #: (lo, hi) for a range parameter: any integer inside is a lawful
@@ -21,6 +27,9 @@ class Field:
         #: An option that stays offered whatever the scope: the value the
         #: manifest declares, shown even when no pack offers it.
         self.pinned = pinned
+        #: The detents among the options: the panel marks them, and a step
+        #: pulls onto one it lands close to.
+        self.detents = tuple(detents)
         self.index = max(0, index)
         self.render = render
         self.unit = unit
@@ -31,6 +40,12 @@ class Field:
 
     def step(self, delta):
         self.index = (self.index + delta) % len(self.options)
+        # Only a detent ahead pulls: one behind the step would hold the
+        # cursor on the detent it just left (30 -> 31 -> 30).
+        ahead = [d for d in self.detents
+                 if (d - self.value) * delta > 0 and abs(d - self.value) <= DETENT_PULL_FPS]
+        if ahead:
+            self.index = self.options.index(min(ahead, key=lambda d: abs(d - self.value)))
 
 class Section:
     """One part on a strip: the camera, or one sensor of a unit."""
@@ -257,24 +272,18 @@ def _modes_for(pack, topology, token):
             for link in topology.links}
 
 def _shared_presets(pack, topology):
-    """The geometries every link's sensor offers on the port (the
-    shipped ones; every unit-program mode under --experimental), in the
-    first link's order: token -> (mode of the first link, lowest free-run
-    ceiling, highest floor) over the links' lawful ranges."""
-    from nxs import experimental
-    from nxs.cam import shipped
+    """The geometries every link's sensor offers on the port (its
+    unit-program modes), in the first link's order: token -> (mode of the
+    first link, lowest free-run ceiling, highest floor) over the links'
+    lawful ranges."""
     from nxs.cam import timing as cam_timing
 
-    port = shipped.cameras(topology.links)
-    lanes = int(topology.csi_lanes)
     offered = []
     for link in topology.links:
         sen = pack.descriptor(link.sensor_compatible)
         mod = pack.chip_module(link.sensor_compatible.split(",")[-1])
-        names = (sen.program_modes() if experimental.enabled()
-                 else shipped.shipped_modes(sen, port, lanes))
         table = {}
-        for name in names:
+        for name in sen.program_modes():
             mode = sen.modes[name]
             geo = mode.get("geometry") or {}
             token = f"{geo.get('width')}x{geo.get('height')}"
@@ -297,21 +306,20 @@ def _shared_presets(pack, topology):
     return presets
 
 def _fps_menu(pack, topology, token, sync, floor, free_ceiling):
-    """The rates the law of `sync` composes for `token`: every integer up to the
-    ceiling that the timing law (free run) or the trigger laws (fsync) admit.
-    Empty when the sync has no lawful rate; the mode then gets no knob."""
+    """The rates the law of `sync` composes for `token`: every integer from the
+    floor to the ceiling that the timing law admits (free run), or the whole
+    rates the trigger laws leave in the mode's range (fsync). Empty when the
+    sync has no lawful rate; the mode then gets no knob."""
     from nxs.cam import timing as cam_timing
 
     if sync == "fsync":
         try:
-            ceiling = cam_timing.synced_ceiling(pack, topology, _modes_for(pack, topology, token))
+            return cam_timing.synced_rates(pack, topology, _modes_for(pack, topology, token))
         except Exception:
-            ceiling = None
-    else:
-        ceiling = free_ceiling
-    if not ceiling:
+            return []
+    if not free_ceiling:
         return []
-    return [f for f in range(floor, int(ceiling) + 1)
+    return [f for f in range(floor, int(free_ceiling) + 1)
             if _camera_refusal(pack, topology, token, float(f), sync) is None]
 
 def _nearest(options, wanted):
@@ -363,6 +371,11 @@ def _camera_fields(topology, port):
             menus[key] = _fps_menu(pack, topology, token, sync, max(floor, 1),
                                    presets[token][1])
         return menus[key]
+
+    def detents(token, sync):
+        """The detent rates the menu offers, and its ceiling."""
+        rates = menu(token, sync)
+        return tuple(sorted({r for r in FPS_DETENTS if r in rates} | {max(rates)}))
 
     def label(token):
         mode = presets[token][0]
@@ -417,7 +430,8 @@ def _camera_fields(topology, port):
         wanted = memory["fps"] if memory["fps"] is not None else (
             declared if declared is not None else min(30, max(options)))
         value = wanted if wanted in options else _nearest(options, wanted)
-        field = Field("fps", options, options.index(value), unit="fps")
+        field = Field("fps", options, options.index(value), unit="fps",
+                      detents=detents(token, sync))
         if old is None:
             fields.insert(1, field)
             return f"fps knob back for {where}: {value:g} fps", False
@@ -431,7 +445,8 @@ def _camera_fields(topology, port):
     if initial:
         wanted = declared if declared is not None else min(30, max(initial))
         value = wanted if wanted in initial else _nearest(initial, wanted)
-        fields.insert(1, Field("fps", initial, initial.index(value), unit="fps"))
+        fields.insert(1, Field("fps", initial, initial.index(value), unit="fps",
+                               detents=detents(cur, declared_sync)))
     fields.rebuild = rebuild
     return fields
 

@@ -43,10 +43,42 @@ def resolve_capture_hints(hints: Optional[Dict[str, Any]],
         "sensor_mode": int(hints["sensor_mode"]),
         "framerate": hints.get("framerate"),
     }
-    for key in ("exposure_us", "exposure_min_us", "exposure_max_us"):
+    for key in ("exposure_us", "exposure_min_us", "exposure_max_us", "gain_db"):
         if hints.get(key) is not None:
             resolved[key] = float(hints[key])
+    for key in ("ae_role", "ae_peer"):
+        if hints.get(key):
+            resolved[key] = str(hints[key])
     return resolved
+
+
+def source_props(hints: Dict[str, Any], host=None, exposure_ns: Optional[int] = None,
+                 gain: Optional[int] = None, port: Optional[str] = None) -> str:
+    """The capture source's properties for a link's caps, the same for
+    every consumer (a viewer, `capture`, `nxs.cam.frames`, the ROS 2
+    camera node). A developer's `exposure_ns` and `gain` lock the loop at
+    them; else a synced pair's link runs its part (`ae_role`: the pair's
+    one exposure and gain, no ISP digital gain, noise reduction or edge
+    enhancement), a follower's session starting at the leader's gain the
+    follower heartbeat of `port` names, so the driver's write at the
+    session's start leaves the leader's gain on the follower head; else a
+    pinned `exposure_us` fixes the exposure and the loop drives gain; else
+    the row's range bounds the loop to the frame; else the source runs as
+    it opens."""
+    host = host or host_layer.current()
+    if exposure_ns is not None and gain is not None:
+        return host.locked_props(exposure_ns, gain)
+    role = hints.get("ae_role")
+    if role:
+        gain_db = hints.get("gain_db")
+        if role == "follower":
+            gain_db = port_state.follow_gain_db(port) if port else None
+        return host.pair_props(role, hints.get("exposure_us"), gain_db)
+    if hints.get("exposure_us") is not None:
+        return host.exposure_props(hints["exposure_us"])
+    if hints.get("exposure_max_us") is not None:
+        return host.ae_props(hints.get("exposure_min_us"), hints["exposure_max_us"])
+    return ""
 
 
 def _display_candidates():
@@ -104,7 +136,8 @@ def _gone(pattern: str, timeout_s: float = VIEWER_STOP_GRACE_S, run=subprocess) 
 
 def stop_viewers(topology: Topology, links: List[LinkSpec], run=subprocess) -> List[str]:
     """Stop the viewers for the selected links: SIGTERM, a grace for the
-    capture session to close, then SIGKILL."""
+    capture session to close, then SIGKILL. Names each link whose viewer
+    ran; `pkill` matching nothing is a link without one."""
     host = host_layer.current()
     stopped = []
     for link in links:
@@ -112,7 +145,8 @@ def stop_viewers(topology: Topology, links: List[LinkSpec], run=subprocess) -> L
         if capture_id is None:
             continue
         match = host.viewer_match(capture_id)
-        run.run(["pkill", "-f", match], capture_output=True)
+        if run.run(["pkill", "-f", match], capture_output=True).returncode != 0:
+            continue
         forced = ""
         if not _gone(match, run=run):
             run.run(["pkill", "-9", "-f", match], capture_output=True)
@@ -168,8 +202,8 @@ def launch_viewers(
     """Start viewers with the CSI-gate choreography; ``gate(enable)`` toggles the
     CSI output gate, ``hints`` override the port record's caps, ``hud`` picks
     the overlay viewer over the plain client. With both ``exposure`` (ns) and
-    ``gain`` given the ISP's adaptation is locked at them; otherwise the
-    capture stack runs its own 3A. Returns the viewers alive."""
+    ``gain`` given the ISP's adaptation is locked at them; otherwise each
+    link's caps set its source (`source_props`). Returns the viewers alive."""
     host = host_layer.current()
     env = find_display()
     if not env:
@@ -213,22 +247,10 @@ def launch_viewers(
         fr = resolved["framerate"]
         sensor_mode = resolved["sensor_mode"]
         crop_bottom = int(link_hints.get("crop_bottom", 0) or 0)
-        # A named exposure and gain lock the ISP-side adaptation at them
-        # (the developer's fixed picture); without both the ISP runs its
-        # own 3A on the sensor's frames. Under a trigger the port's caps
-        # carry the exposure the pulse sets: pinned, so the loop drives
-        # gain alone with a true model instead of hunting on an exposure
-        # the sensor ignores.
+        # A named exposure and gain lock the ISP-side adaptation at them (the
+        # developer's fixed picture); else the caps decide (`source_props`).
         locked = exposure is not None and gain is not None
-        pinned = link_hints.get("exposure_us")
-        if locked:
-            props = host.locked_props(exposure, gain)
-        elif pinned is not None and exposure is None and gain is None:
-            props = host.exposure_props(pinned)
-        elif resolved.get("exposure_max_us") is not None:
-            props = host.ae_props(resolved.get("exposure_min_us"), resolved["exposure_max_us"])
-        else:
-            props = ""
+        props = source_props(resolved, host, exposure, gain, port)
         caps = host.caps(w_, h_, fr)
         g = geometry(n)
         if hud:
@@ -236,7 +258,7 @@ def launch_viewers(
             text = hud_app.hud_text(
                 port, link.name, capture_id, w_, h_,
                 str(link_hints.get("data_type", "")), sensor_mode, sync,
-                locked=locked,
+                ae=hud_app.ae_token(resolved, locked),
                 sensor=str(link_hints.get("sensor") or link.sensor_compatible or ""),
                 link_sync=str((sync.get("links") or {}).get(link.name, "")))
             cmd = [sys.executable, "-m", "nxs.cam.hud",
@@ -255,14 +277,17 @@ def launch_viewers(
         return subprocess.Popen(cmd, env=env, stdout=log,
                                 stderr=subprocess.STDOUT)
 
-    def last_line(capture_id: int) -> str:
+    def reason_line(capture_id: int) -> str:
+        """The line a viewer's log names its failure on: the last that
+        carries `ERROR`, else the last. The capture stack's shutdown lines
+        follow the error, and a byte that is not UTF-8 reads as a mark."""
         try:
-            lines = [l.strip() for l in
-                     Path(viewer_log(capture_id)).read_text().splitlines()
-                     if l.strip()]
-            return lines[-1] if lines else ""
+            text = Path(viewer_log(capture_id)).read_text(errors="replace")
         except OSError:
             return ""
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        errors = [l for l in lines if "ERROR" in l]
+        return (errors or lines or [""])[-1]
 
     # Capture first, gate second; all-or-nothing with retries behind a fresh
     # daemon. Slots go by link name (A left of B), not by capture id.
@@ -277,19 +302,34 @@ def launch_viewers(
     else:
         host.restart_capture_daemon()
     for attempt in range(3):
+        started: Dict[int, subprocess.Popen] = {}
         gate(False)
-        procs[ordered[0]] = client(ordered[0], 0)
+        procs[ordered[0]] = started[ordered[0]] = client(ordered[0], 0)
         time.sleep(2.5)
-        gate(True)
+        try:
+            gate(True)
+        except BaseException:
+            # A gate that does not open leaves no viewer on a closed output.
+            procs[ordered[0]].terminate()
+            raise
         time.sleep(5)
         if procs[ordered[0]].poll() is None:
             for n, capture_id in enumerate(ordered[1:], start=1):
-                procs[capture_id] = client(capture_id, n)
+                procs[capture_id] = started[capture_id] = client(capture_id, n)
             time.sleep(8)
             if all(p.poll() is None for p in procs.values()):
                 break
         if attempt == 2:
             break
+        # The next attempt rewrites each log: the reason a viewer exited is
+        # read now and said here, not left in a file the restart truncates.
+        again = "behind a fresh capture daemon" if not shared else "on the running capture daemon"
+        for capture_id, proc in sorted(started.items()):
+            if proc.poll() is not None:
+                tail = reason_line(capture_id)
+                print(f"viewer for capture id {capture_id} exited"
+                      + (f" ({tail})" if tail else "")
+                      + f"; starting the viewers again {again}")
         for p in procs.values():
             if p.poll() is None:
                 p.terminate()
@@ -302,7 +342,7 @@ def launch_viewers(
         if proc.poll() is None:
             alive += 1
         else:
-            tail = last_line(capture_id)
+            tail = reason_line(capture_id)
             print(f"viewer for capture id {capture_id} died — "
                   f"log: {viewer_log(capture_id)}"
                   + (f" ({tail})" if tail else ""))

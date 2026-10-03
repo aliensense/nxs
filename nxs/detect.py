@@ -6,12 +6,12 @@ personality the tool knows is uploaded in turn, and the one whose sensor
 answers its probe stays running from RAM. `nxs generate` calls it for a
 unit found without a personality, and seeds the manifest with the answer."""
 
-import time
 from typing import Callable, List, Optional, Tuple
 
 from nxs._generated_constants import RunnerStates
-from nxs.client import ACTIVE_SLOT, await_driver_up
+from nxs.client import ACTIVE_SLOT
 from nxs.image import serialize
+from nxs.time_sync import cycle_driver, run_driver
 
 
 def candidates() -> List[Tuple[str, type, dict]]:
@@ -48,18 +48,6 @@ def identity_note(cls) -> str:
     return f" ({', '.join(parts)})" if parts else ""
 
 
-def _await_loaded(t, timeout_s: float = 2.0) -> None:
-    """Block until the runner has left a terminal state after a LOAD, so the
-    next RUN is judged on its own probe; a stuck device is left to
-    `await_driver_up`."""
-    state = RunnerStates.RunnerState
-    deadline = time.monotonic() + timeout_s
-    while t.read_runner_state() in (state.MEASURING, state.PROBE_FAILED):
-        if time.monotonic() >= deadline:
-            return
-        time.sleep(0.05)
-
-
 def _restore_slot(t, before: int, report: Callable[[str], None]) -> None:
     """Leave the unit as the trials found it: the slot that was active
     reloads; a RAM-only personality cannot come back, so the last trial is
@@ -69,8 +57,7 @@ def _restore_slot(t, before: int, report: Callable[[str], None]) -> None:
         t.vm_reset()
         return
     for _ in range(count):
-        t.cycle()
-        await_driver_up(t)
+        cycle_driver(t)
         if t.read_active_slot() == before:
             return
     report(f"slot {before} did not come back after cycling the store "
@@ -91,9 +78,7 @@ def detect(t, report: Callable[[str], None] = lambda line: None) -> Optional[str
             report(f"{label}: skipped ({type(e).__name__}: {e})")
             continue
         t.upload_image(img)
-        _await_loaded(t)
-        t.vm_run()
-        if await_driver_up(t) != state.MEASURING:
+        if run_driver(t) != state.MEASURING:
             report(f"{label}: no answer")
             continue
         report(f"{name} answers{identity_note(cls)}")

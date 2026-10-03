@@ -12,9 +12,11 @@ types, `IDENTITY` and `PROGRAM` extend that vocabulary above the
 firmware's reserved `INSTANCE_CAL` and below `VENDOR_BASE`):
 
 `IDENTITY` (6): i2c_addr u8, reg_bits u8, val_bits u8, flags u8 (bit0
-takes_trigger), device_id_reg u16 (0xFFFF none), device_id_width u8,
-device_id u16, alive_reg u16 (0xFFFF none), default mode index u8, then
-the descriptor name and the compatible string, each as len u8 + bytes.
+takes_trigger, bit1 pulse_width_is_exposure: under fast trigger the
+pulse's low time is the exposure), device_id_reg u16 (0xFFFF none),
+device_id_width u8, device_id u16, alive_reg u16 (0xFFFF none), default
+mode index u8, then the descriptor name and the compatible string, each
+as len u8 + bytes.
 
 `MODES` (1): mode_param_index u8 (the index of the image's `mode` enum
 param in its parameter table, what `PARAM_SELECT` stages; 0xFF when the
@@ -95,12 +97,8 @@ still, the black-level block: the BLKLEVEL register (addr u16, width u8,
 order u8), a count u8, then (bit depth u8, value u32) per output depth
 (`program.blklevel`).
 
-`SHIPPED` (9): the points a mode ships. A count u8, then per point: mode
-index u8 (the MODES order), cameras u8 (1 or 2), csi_lanes u8, fps floor
-x1000 u32, fps ceiling x1000 u32, hmax u16 (the line length the port runs
-at), trigger_vmax u32 (the fast-trigger frame the pair syncs at, 0 for a
-point that ships free-running only). How a point was proven rides no
-image.
+`SHIPPED` (9) is retired (`RETIRED_RECORDS`): no compiler writes it, the
+decoder skips it whatever it carries, and its number stays reserved.
 
 `STATUS` (10): the status probes `status` reads and the frame oracle
 judges. A count u8, then per probe: name len u8 + bytes, addr u16, width
@@ -118,16 +116,16 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from nxs.cam.descriptors import Descriptor
 from nxs.personality.records_fields import (
     ACTIONS, ACTION_PARAM, FRAME_LENGTH_PARAM, FRAME_PERIOD_PARAM, IDENTITY,
-    LINE_TIME_PARAM, MAX_TRAILER_SIZE, MODE_PARAM, PROGRAM, RUN_PARAMS,
+    LINE_TIME_PARAM, MAX_TRAILER_SIZE, MODE_PARAM, PROGRAM, RETIRED_RECORDS, RUN_PARAMS,
     TRIGGERS, TrailerRecord, RecordError, _ALIVE_REGISTER, _CONTROL_REGISTERS,
     _FAMILY_NAMES, _RETIRED_TIMING, trailer_crc, _read_text, _register,
     _unit_modes)
 from nxs.personality.records_sensor import (
     ParamMap, RunParam, check_params, mode_values, trigger_values,
     _decode_controls, _decode_identity, _decode_modes, _decode_run_params,
-    _decode_shipped, _decode_status, _decode_triggers, _encode_controls,
-    _encode_identity, _encode_modes, _encode_run_params, _encode_shipped,
-    _encode_status, _encode_triggers, _mode_entry)
+    _decode_status, _decode_triggers, _encode_controls, _encode_identity,
+    _encode_modes, _encode_run_params, _encode_status, _encode_triggers,
+    _mode_entry)
 from nxs.personality.records_family import (
     _decode_capture, _decode_generic, _decode_laws, _decode_program,
     _decode_sony, _encode_capture, _encode_laws, _encode_program)
@@ -136,7 +134,7 @@ from nxs.personality.records_family import (
 __all__ = [
     "ACTIONS", "ACTION_PARAM", "FRAME_LENGTH_PARAM", "FRAME_PERIOD_PARAM",
     "IDENTITY", "LINE_TIME_PARAM", "MAX_TRAILER_SIZE", "MODE_PARAM", "PROGRAM",
-    "RUN_PARAMS", "TRIGGERS", "TrailerRecord", "ParamMap", "RecordError",
+    "RETIRED_RECORDS", "RUN_PARAMS", "TRIGGERS", "TrailerRecord", "ParamMap", "RecordError",
     "RunParam", "check_params", "decode_trailer", "descriptor_from_trailer",
     "encode_trailer", "mode_values", "param_map", "trailer_crc",
     "trigger_values", "_read_text",
@@ -177,9 +175,6 @@ def encode_trailer(descriptor: Descriptor, params=None, pack=None) -> List[Tuple
                (PROGRAM, _encode_program(descriptor))]
     if descriptor.raw("capture"):
         records.append((TrailerRecord.CAPTURE, _encode_capture(descriptor, pack)))
-    shipped = _encode_shipped(descriptor, modes)
-    if shipped is not None:
-        records.append((TrailerRecord.SHIPPED, shipped))
     status = _encode_status(descriptor)
     if status is not None:
         records.append((TrailerRecord.STATUS, status))
@@ -209,10 +204,11 @@ def decode_trailer(records: Sequence[Tuple[int, bytes]]) -> Dict[str, Any]:
     control rows imply, the modes without blobs, the laws' limits, the
     trigger and sync facts, the program settles, and the capture table.
     RecordError when the IDENTITY record is missing or a record is
-    malformed; unknown record types are skipped."""
+    malformed; unknown and retired record types are skipped."""
     by_type: Dict[int, bytes] = {}
     for rec_type, payload in records:
-        by_type.setdefault(int(rec_type), bytes(payload))
+        if int(rec_type) not in RETIRED_RECORDS:
+            by_type.setdefault(int(rec_type), bytes(payload))
     if IDENTITY not in by_type:
         raise RecordError("the trailer carries no IDENTITY record: not a "
                           "camera personality this tool reads")
@@ -258,6 +254,9 @@ def decode_trailer(records: Sequence[Tuple[int, bytes]]) -> Dict[str, Any]:
     if "sync" in doc:
         sync.update(doc["sync"])
     doc["sync"] = sync
+    if identity["pulse_width_is_exposure"]:
+        trigger = doc.setdefault("trigger", {})
+        trigger.setdefault("timing", {})["pulse_width_is_exposure"] = True
     alive = identity["alive_reg"]
     if (alive is not None and family != "sony_imx"
             and alive != identity["device_id_reg"]):
@@ -268,10 +267,6 @@ def decode_trailer(records: Sequence[Tuple[int, bytes]]) -> Dict[str, Any]:
         doc.setdefault("program", {}).update(program)
     if TrailerRecord.CAPTURE in by_type:
         doc["capture"] = _decode_capture(by_type[TrailerRecord.CAPTURE])
-    if TrailerRecord.SHIPPED in by_type:
-        shipped = _decode_shipped(by_type[TrailerRecord.SHIPPED], modes)
-        if shipped:
-            doc["shipped"] = shipped
     if TrailerRecord.STATUS in by_type:
         doc["status"] = _decode_status(by_type[TrailerRecord.STATUS], registers)
     return doc

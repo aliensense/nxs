@@ -8,7 +8,7 @@ from nxs._generated_constants import CyphalDefaults
 from nxs.descriptor import is_decodable
 from nxs.stamp_modes import STAMP_ITOW, STAMP_MODES, STAMP_SYNCED
 from nxs.stream_cli import _configure_stream
-from nxs.transports import open_client
+from nxs import transports
 
 
 _DEVICE_FLAGS = {'-t', '--transport', '-b', '--bus', '-p', '--port',
@@ -76,9 +76,11 @@ def _ros2_lock_tokens(args, targets):
     return [f"{tr or 'flags'}:{sorted(kw.items()) if kw else adhoc}"
             for _, tr, kw in targets]
 
-def cmd_ros2(args, opener=open_client, argv=None, cfg=None):
+def cmd_ros2(args, opener=None, argv=None, cfg=None):
     """Bridge decoded samples onto ROS 2 topics: the whole suite by
-    default, one unit with --unit, or an ad-hoc flag-addressed device."""
+    default, one unit with --unit, or an ad-hoc flag-addressed device. The
+    opener defaults to the one `nxs.transports` holds at the call."""
+    opener = opener or transports.open_client
     from nxs.cli import _open_transport
     from nxs.ros2_bridge import (
         Ros2Bridge, UnitPlan, acquire_run_lock, epoch_binding, format_plan,

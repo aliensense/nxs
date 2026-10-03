@@ -6,13 +6,12 @@ import time
 from nxs._generated_constants import CyphalDefaults, RunnerStates, VmStates
 from nxs.client import (
     ACTIVE_SLOT, op_error_name, peek_slot,
-    SupportsBitTiming, SupportsCanTermination, SupportsCommissioning,
+    SupportsBitTiming, SupportsCameraRun, SupportsCanTermination, SupportsCommissioning,
     SupportsFaultCounters, SupportsIdentify, SupportsRecovery,
     SupportsSlotPeek, SupportsTimeSync)
 from nxs import params as device_params
 from nxs.compiler import SEMANTIC_NAMES
 from nxs.descriptor import sample_width
-from nxs.image import ImageKind
 from nxs.stream_cli import _get_output_fields
 from nxs.term import status_line
 
@@ -43,6 +42,27 @@ def _target_flags(args) -> str:
                 else CyphalDefaults.DEFAULT_NODE_ID)
         return f"-t cyphal-can -p {args.port or 'can0'} --remote-node-id {node}"
     return f"-t {args.transport} -p {args.port}"
+
+def _unanswered(args):
+    """The refusal for an I²C unit addressed at a camera link's alias that
+    does not answer: the port and link it rides, its address and bus, then
+    the next command. A port that is not up has no alias mapped, and `nxs
+    switch` brings it up; a port that is up reads its pods in `nxs <port>
+    status`. None for any other address, the unit's own included, which
+    answers whatever the port's state."""
+    from nxs.cam import port_state
+    from nxs.cam.unit_source import NATIVE_UNIT_ADDR
+    from nxs.personality_cli import port_link_for
+
+    where = port_link_for(args)
+    if where is None or args.addr == NATIVE_UNIT_ADDR:
+        return None
+    topology, link = where
+    port = port_state.port_name(topology)
+    fact = f"{port}/{link.name}: no unit answers at 0x{args.addr:02X} on {args.bus}"
+    if port_state.link_state(topology, link) != port_state.STATE_UP:
+        return f"{fact}, and the port is not up\n  - nxs switch"
+    return f"{fact}\n  - nxs {port} status"
 
 def _probe_detail(t) -> str:
     """The trailing reason suffix when the transport knows why the probe found
@@ -114,21 +134,14 @@ def _probe_personality(t, args) -> None:
                                      slot=found.slot, crc=found.crc,
                                      params=found.params, name=found.name)
 
-def _upload_and_run(t, img, kind=ImageKind.DRIVER):
-    from nxs.client import await_driver_up
+def _upload_and_run(t, img):
+    from nxs.time_sync import run_driver
 
     t.upload_image(img)
-    if kind == ImageKind.CAMERA:
-        # A camera personality is not run by the runner: it waits in a store
-        # slot for the host's CAM_RUN under the bus token.
-        print("Uploaded camera personality; nxs store save <slot> keeps it, "
-              "and the camera verbs run it from that slot.")
-        return 0
-    t.vm_run()
     # Store and sensor probe finish asynchronously after RUN; the runner state
     # separates "up" from "loaded but the sensor never answered".
     state = RunnerStates.RunnerState
-    settled = await_driver_up(t)
+    settled = run_driver(t)
     if settled == state.MEASURING:
         print("Uploaded and running.")
         return 0
@@ -290,6 +303,27 @@ def _print_outputs(t, name: str) -> None:
               f"{o['byte_order']:<6s}  {sem:<11s}  {o['scale']:>12.6g}  "
               f"{o['offset']:>10.4g}  {o['unit']}")
 
+def _camera_line(t):
+    """The `Camera:` value of an addressed status: the camera personality the
+    store holds, its slot and the last run the unit reports (`never run`
+    before its first), or `(none)`.
+    None on a wire that serves no camera run, or when the store cannot be
+    read; an unreadable slot is named by slot."""
+    from nxs.cam import unit_source
+
+    if not isinstance(t, SupportsCameraRun):
+        return None
+    try:
+        found = unit_source.read_unit_personality(t)
+        if found is None:
+            return "(none)"
+        state, _ = t.read_cam_state()
+    except unit_source.UnreadableSlot as exc:
+        return str(exc)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return f"{found.name} (slot {found.slot}, {unit_source.last_run_text(state)})"
+
 def cmd_status(t, args):
     ok = t.probe()
     if not ok:
@@ -340,6 +374,9 @@ def cmd_status(t, args):
           f"slot={slot_str}  retries={probe_retries}")
     if i2c_str:
         print(f"  mikroBUS I²C: {i2c_str}")
+    camera = _camera_line(t)
+    if camera is not None:
+        print(f"  Camera:       {camera}")
     if session_held:
         print("  Session:      held (calibration procedure or firmware push)")
     print(f"  Store:        {store_count} populated")
@@ -572,8 +609,12 @@ def cmd_push_fw(t, args):
     from nxs._generated_constants import NxsMcuboot
     from nxs.client import push_and_verify, read_identity
     name = os.path.basename(args.firmware)
-    with open(args.firmware, 'rb') as f:
-        data = f.read()
+    try:
+        with open(args.firmware, 'rb') as f:
+            data = f.read()
+    except OSError as e:
+        print(f"  ✗ {name}: {e.strerror}", file=sys.stderr)
+        return 1
     try:
         info = mcuboot_image.parse(data)
     except ValueError as e:
@@ -584,6 +625,11 @@ def cmd_push_fw(t, args):
     if len(data) > NxsMcuboot.UPDATE_IMAGE_MAX_SIZE:
         print(f"  ✗ {name}: {len(data)} bytes is larger than the update slot "
               f"({NxsMcuboot.UPDATE_IMAGE_MAX_SIZE} bytes)", file=sys.stderr)
+        return 1
+    # A unit silent at a camera link's alias takes no push: say where it
+    # should answer and what brings it there, before a push fails bare.
+    if (refusal := _unanswered(args)) is not None and not t.probe():
+        print(f"  ✗ {refusal}", file=sys.stderr)
         return 1
     # The bootloader installs any validly signed image, so a stale wheel would
     # regress a module silently; this is the one warning.

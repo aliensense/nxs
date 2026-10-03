@@ -151,8 +151,9 @@ def node_addrs(bus: str, sysfs_i2c: str = SYSFS_I2C) -> dict:
 def booted_modes(bus: str, sysfs_i2c: str = SYSFS_I2C) -> list:
     """The capture modes the booted tree offers on a port's bus, one dict per
     ``modeN`` (index, pool, width, height, bit_depth, lanes, vc, max_fps,
-    and direct: the mode names no SerDes pixel clock, the receiver takes a
-    sensor's own lanes). Empty when the tree is silent."""
+    default_fps, max_exp_us, and direct: the mode names no SerDes pixel
+    clock, the receiver takes a sensor's own lanes). Empty when the tree is
+    silent."""
     index = bus_index(bus)
     if index is None:
         return []
@@ -185,6 +186,7 @@ def booted_modes(bus: str, sysfs_i2c: str = SYSFS_I2C) -> list:
                 "lanes": int(prop("num_lanes", "0") or 0),
                 "vc": int(prop("vc_id", "0") or 0),
                 "max_fps": int(prop("max_framerate", "0") or 0) / factor,
+                "default_fps": int(prop("default_framerate", "0") or 0) / factor,
                 "max_exp_us": int(prop("max_exp_time", "0") or 0),
                 "direct": not prop("serdes_pix_clk_hz"),
             })

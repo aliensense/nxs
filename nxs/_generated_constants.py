@@ -257,7 +257,8 @@ class NxsRegisters:
         counter is cumulative since boot and saturates at 65535 — these are
         should-be-zero fault counters, so a saturated value stays sticky
         evidence instead of wrapping back to a healthy-looking small number.
-        The host reads a delta across its observation window. The served
+        The host reads a delta across its observation window. `CAM_RUNS` is
+        a count, not a fault: it wraps past 65535. The served
         value is a snapshot taken at the selector write — it never repaints
         under the reader, so an awaited echo guarantees a tear-free read;
         re-write the index to refresh.
@@ -267,6 +268,7 @@ class NxsRegisters:
         I2C_CMD_QUEUE_OVERFLOWS = 2  # Host writes dropped because the I²C command queue was full (the host sees EAGAIN in `CMD_ERROR` when the dropped item had armed it).
         VM_IO_ERRORS = 3  # Measure-loop I/O errors the VM absorbed — the diag-view copy of `vm_status.vm_io_err_count`, refreshed at the ~100 ms status cadence.
         PROBE_FAILURES = 4  # Probe give-ups — the diag-view copy of `vm_status.probe_failed_count`, refreshed at the ~100 ms status cadence.
+        CAM_RUNS = 5  # Camera runs accepted since boot: +1 on each accepted `Cmd::CAM_RUN`, untouched by a refused one, wrapping past 65535. A host reads it before the command and again at the accept's edge: a verdict in `CMD_ERROR` is this run's when the count advanced, the previous run's terminal state otherwise.
 
         _NAMES = {
             0: 'DRDY_COALESCED',
@@ -274,6 +276,7 @@ class NxsRegisters:
             2: 'I2C_CMD_QUEUE_OVERFLOWS',
             3: 'VM_IO_ERRORS',
             4: 'PROBE_FAILURES',
+            5: 'CAM_RUNS',
         }
 
     class DeviceParam:
@@ -392,7 +395,7 @@ class NxsRegisters:
 
     DEVICE_PARAM_COUNT = 1  # Number of `DeviceParam` indices the device-parameter view serves.
 
-    DIAG_COUNTER_COUNT = 5  # Number of `DiagCounter` indices the diag view serves.
+    DIAG_COUNTER_COUNT = 6  # Number of `DiagCounter` indices the diag view serves.
 
     SEL_TYPE_PARAM_TYPE_MASK = 15  # Param view: mask isolating `param_type` (0 = enum, 1 = range) in the low nibble of `Reg::SEL_TYPE`.
 
@@ -765,15 +768,16 @@ class NxsDriverImage:
         and skipped. `IDENTITY` names the part and its bus profile, `MODES`
         carries the index of the `mode` param and each mode's value,
         `TRIGGERS` the same for the `trigger` param, `PROGRAM` the family's
-        program settings, `SHIPPED` the fps range, line length and trigger
-        frame a mode ships per camera count and lane count (a tool that predates it
-        skips the record and offers no mode), `STATUS` the status probes a
-        host reads back from the sensor (register, format, decode table),
-        `RUN_PARAMS` the run parameters a host stages in physical units
-        (index, range, default, name, unit);
-        `INSTANCE_CAL` is reserved for per-pod calibration;
+        program settings, `STATUS` the status probes a host reads back from
+        the sensor (register, format, decode table), `RUN_PARAMS` the run
+        parameters a host stages in physical units (index, range, default,
+        name, unit); `INSTANCE_CAL` is reserved for per-pod calibration;
         `VENDOR_BASE`..`VENDOR_BASE + 15` are never interpreted. A new record
-        type, or a field retired from a record, moves the format's minor.
+        type, or a field retired from a record, moves the format's minor. A
+        retired record type (`retired: true`: `SHIPPED`) is written by no
+        compiler and skipped by every decoder, and its number stays reserved;
+        the firmware reads no record, so retiring one moves neither
+        `NXS_MAJOR` nor `NXS_MINOR`.
         """
         MODES = 1
         CONTROLS = 2
@@ -783,7 +787,7 @@ class NxsDriverImage:
         IDENTITY = 6
         PROGRAM = 7
         TRIGGERS = 8
-        SHIPPED = 9
+        SHIPPED = 9  # retired: written by no compiler, skipped by every decoder; the number stays reserved
         STATUS = 10
         RUN_PARAMS = 11
         VENDOR_BASE = 224
@@ -802,6 +806,9 @@ class NxsDriverImage:
             11: 'RUN_PARAMS',
             224: 'VENDOR_BASE',
         }
+
+        # Values no writer emits and every reader skips; their numbers stay reserved.
+        RETIRED = frozenset({9})
 
     IMAGE_FLAG_SEALED = 1  # Header flag bit; the bytecode section is AES-128-CTR sealed with the firmware's key and preceded by a `SEAL_NONCE_SIZE`-byte nonce.
 

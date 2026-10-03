@@ -138,7 +138,8 @@ def _mode_token(record, port, link) -> Optional[str]:
 
 
 def _rate(facts, name, port, link) -> Optional[float]:
-    rate = ((facts.records.get(name) or {}).get("rates") or {}).get(link.name)
+    from nxs.cam import port_state
+    rate = port_state.running_rate(facts.records.get(name) or {}, link.name)
     if rate is None:
         rate = link.camera_fps or port.camera_fps
     return float(rate) if rate is not None else None

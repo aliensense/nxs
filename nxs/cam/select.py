@@ -269,16 +269,13 @@ def _declare(pack, topology: Topology, links: List[LinkSpec], args
     return topology, links, modes
 
 def _link_descriptor(pack, topology: Topology, link: LinkSpec):
-    """A link's sensor descriptor as this port runs it: the pack's
-    own binding when its flows offer one (the line a pair leaves a mode
-    that ships a solo point only), the plain port view otherwise."""
-    from nxs.cam import shipped
-
+    """A link's sensor descriptor as this port runs it: the pack's own
+    binding when its flows offer one (the line a pair runs), the plain
+    descriptor otherwise."""
     bind = getattr(pack.flows(), "sensor_descriptor", None)
     if bind is not None:
         return bind(pack, link, topology)
-    return pack.descriptor(link.sensor_compatible, shipped.cameras(topology.links),
-                           int(topology.csi_lanes))
+    return pack.descriptor(link.sensor_compatible)
 
 
 def _descriptor_among(pack, topology: Topology, link: LinkSpec, port=None):

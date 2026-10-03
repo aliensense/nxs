@@ -265,21 +265,18 @@ class Pack:
     def _no_chip(self, name: str) -> PackError:
         return PackError(f"pack {self.name!r} has no chip {name!r} (chips: {self.chips})")
 
-    def descriptor(self, name_or_compatible: str, cameras: Optional[int] = None,
-                   csi_lanes: Optional[int] = None,
-                   pair_lines: Optional[Dict[str, int]] = None) -> Descriptor:
+    def descriptor(self, name_or_compatible: str,
+                   lines: Optional[Dict[str, int]] = None) -> Descriptor:
         """A chip descriptor by dir name or compatible (cached; the experimental
-        overlay merged under the flag); with a camera count, that count's
-        view, `pair_lines` the lines a pair leaves its one-camera modes."""
+        overlay merged under the flag); with `lines` (mode -> HMAX), the view
+        of a port that runs them (`Descriptor.at_lines`)."""
         descriptor = self._descriptors.get(name_or_compatible)
         if descriptor is None:
             root = self._chip_dir(name_or_compatible)
             descriptor = Descriptor(root, self._experimental.get(root.name))
             self._descriptors[name_or_compatible] = descriptor
             self._descriptors[descriptor.compatible] = descriptor
-        if cameras is None or csi_lanes is None:
-            return descriptor
-        return descriptor.for_cameras(cameras, int(csi_lanes), pair_lines)
+        return descriptor.at_lines(lines)
 
     def shipped_descriptor(self, name_or_compatible: str) -> Descriptor:
         """The chip's descriptor as the product ships it: the directory's
@@ -324,24 +321,23 @@ class Pack:
         self._modules[label] = module
         return module
 
-    def chip_module(self, name_or_compatible: str, cameras: Optional[int] = None,
-                    csi_lanes: Optional[int] = None,
-                    pair_lines: Optional[Dict[str, int]] = None) -> Optional[Any]:
+    def chip_module(self, name_or_compatible: str,
+                    lines: Optional[Dict[str, int]] = None) -> Optional[Any]:
         """A chip's physics surface (cached): the law family its descriptor
         names (`meta.chip`), whatever sits beside the yaml (a camera
         personality's `<chip>.py` is behaviour the compiler loads, never a
         law module); else the chip's own physics module; else None for a
         yaml-only plugin. A descriptor a unit served binds its family: its
         behaviour runs on the unit. A behaviour class beside a yaml naming
-        no family is refused by file. With a camera count, the family binds
-        to that count's view."""
+        no family is refused by file. With `lines`, the family binds to the
+        view of a port that runs them."""
         served = self._descriptors.get(name_or_compatible)
         if served is not None and served.from_unit:
-            return self._bind(served, cameras, csi_lanes, pair_lines)
+            return self._bind(served, lines)
         chip_dir = self._chip_dir(name_or_compatible)
         descriptor = self.descriptor(chip_dir.name)
         if (descriptor.raw("meta") or {}).get("chip"):
-            return self._bind(descriptor, cameras, csi_lanes, pair_lines)
+            return self._bind(descriptor, lines)
         path = chip_dir / f"{chip_dir.name}.py"
         if not path.exists():
             return None
@@ -358,15 +354,15 @@ class Pack:
                 f"meta.chip (sony_imx or generic)")
         return module
 
-    def _bind(self, descriptor: Descriptor, cameras: Optional[int] = None,
-              csi_lanes: Optional[int] = None,
-              pair_lines: Optional[Dict[str, int]] = None) -> Any:
-        """The descriptor's law family, cached by name (and camera count, and
-        the pair lines the view carries)."""
+    def _bind(self, descriptor: Descriptor,
+              lines: Optional[Dict[str, int]] = None) -> Any:
+        """The descriptor's law family, cached by name (and by the lines of
+        the view it binds to)."""
         key = descriptor.name
-        if cameras is not None and csi_lanes is not None:
-            descriptor = descriptor.for_cameras(cameras, int(csi_lanes), pair_lines)
-            key = f"{key}@{cameras}/{int(csi_lanes)}/{sorted((pair_lines or {}).items())}"
+        view = descriptor.at_lines(lines)
+        if view is not descriptor:
+            descriptor = view
+            key = f"{key}@{sorted(lines.items())}"
         if key not in self._bound:
             from .chips import bind
             self._bound[key] = bind(descriptor)

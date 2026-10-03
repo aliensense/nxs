@@ -137,6 +137,41 @@ def await_driver_up(client, timeout_s: float = DRIVER_UP_TIMEOUT_S,
             return current
         time.sleep(poll_s)
 
+#: How long a STOP may take to park the runner. The library's stop waits
+#: 2 s for the park; a personality inside a long step (a `poll` with its own
+#: timeout) takes that step's time, and a STOP lost on the wire needs another.
+PARK_TIMEOUT_S = 10.0
+
+def park(client, timeout_s: float = PARK_TIMEOUT_S) -> None:
+    """STOP until the runner parks; TimeoutError for one that does not. A
+    parked runner holds no verdict and reloads nothing on its own."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            client.vm_stop()
+            return
+        except TimeoutError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"the runner did not park in {timeout_s:g} s") from None
+
+def run_driver(client) -> int:
+    """Run the loaded personality and return the state its own run settles
+    in. From the accept of a RUN until the unit begins the probe, the runner
+    still reads the verdict of the personality that ran before, so it is
+    parked first."""
+    park(client)
+    client.vm_run()
+    return await_driver_up(client)
+
+def cycle_driver(client) -> int:
+    """Advance to the next populated slot and return the state its run
+    settles in. A CYCLE ends in a RUN of the slot it loads, so the runner is
+    parked first, as `run_driver` parks it; the park keeps the active slot
+    the cycle advances from."""
+    park(client)
+    client.cycle()
+    return await_driver_up(client)
+
 #: Budget for the time-sync mirror to catch up with a push, sized for a seed
 #: issued straight after a panel deploy.
 PUSH_ECHO_TIMEOUT_S = 2.0

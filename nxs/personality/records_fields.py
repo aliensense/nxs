@@ -12,6 +12,9 @@ from nxs.cam.descriptors import Descriptor, to_int
 
 TrailerRecord = NxsDriverImage.TrailerRecord
 MAX_TRAILER_SIZE = NxsDriverImage.MAX_TRAILER_SIZE
+#: The record types no compiler writes and every decoder skips (SHIPPED,
+#: the shipped points); their numbers stay reserved.
+RETIRED_RECORDS = frozenset(TrailerRecord.RETIRED)
 
 IDENTITY = TrailerRecord.IDENTITY
 PROGRAM = TrailerRecord.PROGRAM
@@ -75,6 +78,7 @@ _MODE_FLAG_DEFAULT = 0x01
 _MODE_FLAG_TRIGGERABLE = 0x02
 _MODE_FLAG_SERIALIZER_CSI = 0x04
 _IDENTITY_FLAG_TAKES_TRIGGER = 0x01
+_IDENTITY_FLAG_PULSE_EXPOSURE = 0x02
 _PROGRAM_FLAGS = ("timing_start", "trigger_switch", "fast_trigger",
                   "sync_switch", "restart", "start", "stop_ms", "hmax_live")
 #: A mode's timing facts, in presence-bit order, with the struct format of
@@ -111,8 +115,6 @@ _RUN_PARAMS_HEAD = struct.Struct("<B")
 _RUN_PARAM = struct.Struct("<BIII")
 _CONTROL_ROW = struct.Struct("<BHBBBIIII")
 _LAWS_HEAD = struct.Struct("<BH")
-_SHIPPED_POINT = struct.Struct("<BBBIIHI")
-_CAMERA_COUNTS = (1, 2)
 _CAPTURE_HEAD = struct.Struct("<IIBIiiIiHHIIIIIIIB")
 #: A capture row: width u16, height u16, bit depth u8, pixel phase u8, line
 #: length u32, max fps x1000 u32, min exposure us u32, embedded-data lines

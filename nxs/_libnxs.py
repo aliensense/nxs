@@ -188,8 +188,24 @@ def _load() -> ctypes.CDLL:
         lib.nxs_unit_close.argtypes = [ctypes.c_void_p]
         lib.nxs_unit_last_refusal.restype = None
         lib.nxs_unit_last_refusal.argtypes = [ctypes.c_void_p, ctypes.POINTER(_Refusal)]
+        _declare_bus(lib)
         _lib = lib
     return _lib
+
+
+def _declare_bus(lib: ctypes.CDLL) -> None:
+    """The signatures of the calls `Bus` makes, declared with the library:
+    ctypes passes an undeclared handle as a C int, which truncates it."""
+    u8p = ctypes.POINTER(ctypes.c_uint8)
+    for name, args in (("nxs_bus_lock", [ctypes.c_void_p, ctypes.c_uint32]),
+                       ("nxs_bus_unlock", [ctypes.c_void_p]),
+                       ("nxs_bus_probe", [ctypes.c_void_p, ctypes.c_uint8]),
+                       ("nxs_bus_read", [ctypes.c_void_p, ctypes.c_uint8, u8p, ctypes.c_size_t,
+                                         u8p, ctypes.c_size_t]),
+                       ("nxs_bus_write", [ctypes.c_void_p, ctypes.c_uint8, u8p, ctypes.c_size_t])):
+        fn = getattr(lib, name)
+        fn.restype = ctypes.c_int
+        fn.argtypes = args
 
 
 def _declare(lib: ctypes.CDLL) -> None:
@@ -337,6 +353,9 @@ class PortReport:
             if self.run.reg is not None:
                 where += f" at {self.run.reg:#06x}"
             return f"{where} (device {self.run.addr:#04x}, pc {self.run.pc})"
+        if self.rc == -errno.ETIMEDOUT and self.step.startswith("pod "):
+            # The unit took the run and reported no end: the host's wait ran out.
+            return f"{self.step}: the unit's run did not end within the walk's wait"
         return f"{self.step}: {errno.errorcode.get(-self.rc, str(-self.rc))}"
 
 

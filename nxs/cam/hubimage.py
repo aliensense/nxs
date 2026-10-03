@@ -7,7 +7,7 @@ parameter vocabulary the images and the walk (`nxs_port_up`) share."""
 
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, Optional
 
 from nxs.cam.contracts import InfeasibleConfig, LinkSpec, NxsUnitSpec, Topology
 from nxs.cam.descriptors import Descriptor
@@ -37,15 +37,18 @@ def pack_of(chip: str):
     raise InfeasibleConfig(f"no discoverable pack ships {chip} with its flows")
 
 
-def reference_topology(pack, sensors: Dict[str, str], csi_lanes: int = 2) -> Topology:
+def reference_topology(pack, sensors: Dict[str, str], csi_lanes: int = 2,
+                       modes: Optional[Dict[str, str]] = None) -> Topology:
     """A two-link port of the pack's hub with `sensors` (link name ->
-    compatible), a pod on each link at the seeded aliases: what a hub
-    image's phases are composed on."""
+    compatible), each link in its mode from `modes` (link name -> mode
+    name; the laws' choice for a link it leaves out), a pod on each link
+    at the seeded aliases: what a hub image's phases are composed on."""
     ser = next(c for c in pack.chips if pack.descriptor(c).role == "SER")
     links = tuple(
         LinkSpec(name=name, des_window=0x21 + i, csi_vc=1 - i,
                  sensor_compatible=sensors[name],
                  ser_compatible=pack.descriptor(ser).compatible,
+                 mode=(modes or {}).get(name),
                  nxs_units=(NxsUnitSpec(0x31 + i, 0x30),))
         for i, name in enumerate(("A", "B")))
     return Topology(carrier=f"{pack.name}/cam0", i2c_bus="/dev/i2c-0", csi_lanes=csi_lanes,

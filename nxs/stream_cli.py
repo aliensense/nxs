@@ -5,6 +5,7 @@ import importlib
 import os
 import sys
 import time
+from typing import Optional
 
 from nxs.client import SupportsCalibration, SupportsEgressDecimation
 from nxs.descriptor import (
@@ -13,21 +14,47 @@ from nxs.term import status_line
 
 
 class _RateMeter:
-    """Rolling-window sample-rate meter for the `stream` display: a fixed
-    1-second window converges to the steady-state rate on bursty sources."""
+    """The sample rate by the unit's clock, read from each sample's
+    timestamp (the host's arrival clock for a transport that stamps none):
+    over a rolling one-second window for a row, over the whole read for the
+    closing line. A timestamp that runs backward, as after a unit restart,
+    starts both again."""
 
-    def __init__(self, window_s: float = 1.0):
-        self._window_s = window_s
-        self._times: collections.deque = collections.deque()
+    def __init__(self, window_us: int = 1_000_000):
+        self._window_us = window_us
+        self._stamps: collections.deque = collections.deque()
+        self._first: Optional[int] = None
+        self._count = 0
 
-    def tick(self, now: float, count: int = 1) -> float:
-        """Record `count` samples that arrived at `now` and return the rolling
-        rate in Hz. A batched receiver stamps all `count` at `now`."""
-        for _ in range(count):
-            self._times.append(now)
-        while self._times and now - self._times[0] > self._window_s:
-            self._times.popleft()
-        return len(self._times) / self._window_s
+    def tick(self, stamp_us: int) -> Optional[float]:
+        """Record one sample's timestamp and return the rate over the window
+        in Hz, None until two samples span some time."""
+        if self._stamps and stamp_us < self._stamps[-1]:
+            self._stamps.clear()
+            self._first, self._count = None, 0
+        if self._first is None:
+            self._first = stamp_us
+        self._count += 1
+        self._stamps.append(stamp_us)
+        while stamp_us - self._stamps[0] > self._window_us:
+            self._stamps.popleft()
+        return _rate(len(self._stamps), stamp_us - self._stamps[0])
+
+    def average(self) -> Optional[float]:
+        """The rate over the whole read in Hz, None below two samples."""
+        if self._first is None:
+            return None
+        return _rate(self._count, self._stamps[-1] - self._first)
+
+
+def _rate(count: int, span_us: int) -> Optional[float]:
+    """`count` samples whose first and last lie `span_us` apart, in Hz."""
+    return (count - 1) * 1e6 / span_us if count > 1 and span_us > 0 else None
+
+
+def _duration(seconds: float) -> str:
+    """A read's length as the closing line prints it: ms below a second."""
+    return f"{seconds:.1f}s" if seconds >= 1 else f"{seconds * 1000:.0f}ms"
 
 # Human display units for the stream table, keyed by a field's declared
 # canonical unit. Render-time only: the wire and every machine consumer stay SI.
@@ -158,6 +185,9 @@ def cmd_stream(t, args):
 
     count = args.count
     samples = 0
+    # The stream's count of lost samples, read while it stands: the read's
+    # end closes the stream, and a closed stream counts none.
+    lost_count = None
     t0 = time.time()
     meter = _RateMeter()
     prev_seq = first_seq = window_seq0 = None
@@ -186,9 +216,11 @@ def cmd_stream(t, args):
                     print(f"\n(VM restart #{restarts} detected — stats reset)")
             prev_seq = s.count
             samples += 1
+            lost_count = t.lost_samples
             if first_seq is None:
                 first_seq = s.count
-            rolling = meter.tick(now)
+            rolling = meter.tick(s.timestamp_us if s.timestamp_us is not None
+                                 else int(now * 1e6))
 
             if as_json:
                 values = s.values or (parse_sample(s.raw, local_fields,
@@ -207,8 +239,7 @@ def cmd_stream(t, args):
                     inst = window_samples / win_dt if win_dt > 0 else 0
                     sensor_rate = ((s.count - window_seq0) & 0xFFFF) / win_dt \
                         if win_dt > 0 else 0
-                    elapsed = now - t0
-                    avg = samples / elapsed if elapsed > 0 else 0
+                    avg = meter.average() or 0.0
                     # Sensor produced this many more than received. Under host
                     # pacing (I2C poll, --hz decimation) most is skip, not loss.
                     skipped = max(0, ((s.count - first_seq) & 0xFFFF) - samples + 1)
@@ -220,7 +251,8 @@ def cmd_stream(t, args):
                     next_print = now + QUIET_WINDOW_S
             else:
                 ts = f" ts={s.timestamp_us}" if s.timestamp_us is not None else ""
-                prefix = f"[{rolling:6.1f} Hz] n={s.count:5d}{ts}"
+                rate = f"{rolling:6.1f}" if rolling is not None else f"{'-':>6}"
+                prefix = f"[{rate} Hz] n={s.count:5d}{ts}"
                 if args.raw:
                     print(f"{prefix}  {' '.join(f'{b:02X}' for b in s.raw)}")
                 elif not fields:
@@ -248,22 +280,27 @@ def cmd_stream(t, args):
         except Exception:
             pass
 
-    elapsed = time.time() - t0
-    avg = samples / elapsed if elapsed > 0 else 0
+    avg = meter.average()
     if as_json:
         import json
 
         from nxs.schemas import CONTRACT
-        print(json.dumps({
+        doc = {
             "contract": CONTRACT,
             "personality": driver_name,
             "fields": [{"name": f["name"], "unit": f.get("unit", "")} for f in fields],
             "samples": records,
-            "rate_hz": round(avg, 3),
-        }, indent=2))
+        }
+        if avg is not None:
+            doc["rate_hz"] = round(avg, 3)
+        print(json.dumps(doc, indent=2))
         return 0 if records else 1
-    loss = "" if t.lost_samples is None else f", {t.lost_samples} lost"
-    print(f"\nStopped after {samples} samples in {elapsed:.1f}s ({avg:.1f} Hz avg{loss})")
+    detail = [f"{avg:.1f} Hz avg"] if avg is not None else []
+    if lost_count:
+        detail.append(f"{lost_count} lost")
+    span = f" in {_duration(samples / avg)}" if avg else ""
+    tail = f" ({', '.join(detail)})" if detail else ""
+    print(f"\nStopped after {samples} samples{span}{tail}")
     return 0
 
 def _looks_like_vm_restart(prev_seq, curr_seq, threshold: int = 1000) -> bool:

@@ -102,8 +102,9 @@ def port_spec(pack, topology: Topology, links: List[LinkSpec], modes: Dict[str, 
     if int(topology.csi_lanes) not in hi.CSI_LANES:
         raise InfeasibleConfig(f"the hub's CSI output takes 2 or 4 lanes, not "
                                f"{topology.csi_lanes}")
+    # A pair's head runs the pair line beside the mode the partner runs.
     port = (topology if len(links) == len(topology.links)
-            else dataclasses.replace(topology, links=tuple(links)))
+            else dataclasses.replace(topology, links=tuple(links))).with_modes(modes)
     out = []
     for name, spec in by_name.items():
         facts = (hi.link_facts(pack.descriptor(spec.sensor_compatible), modes[name])

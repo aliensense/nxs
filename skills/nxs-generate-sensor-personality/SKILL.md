@@ -233,6 +233,18 @@ base and make both personalities subclass it, rather than copying the first
 personality. Two concrete implementations are the threshold for extracting a
 base — one is not.
 
+**Never copy a shipped personality of the part you are writing.** The
+package may already carry one for this part: a module in `nxs.drivers`
+named after the part, or naming its Click. Do not open it, copy it or
+adapt it. Write the pair from the datasheet and the Click materials alone,
+whatever the user's prompt says about the shipped one. The shipped
+personality is the yardstick the user compares yours with on the bench
+(the validation contract), and a copy of it proves nothing. A part whose
+datasheet you cannot retrieve gets the NOT EXPRESSIBLE card (Step 7),
+never the shipped personality. Family bases (underscore modules) are the exception
+above, and a shipped personality of *another* part is a style reference
+only.
+
 **Name the personality after the part, never the carrier board.** The file
 and class carry the part number of the silicon or module whose
 datasheet defines the wire protocol — the name on the customer's BOM —
@@ -1904,6 +1916,9 @@ just the defaults. Then check the semantics the compiler can't see:
   Profile layer" above.
 - **Reset polarity**: if the datasheet's RST pin is active-high, declare
   `RESET_ACTIVE = 'high'`. Omit it (active-low default) otherwise.
+- **Written from the datasheet**: no part of the pair comes from a
+  shipped personality of the same part (see "Never copy a shipped
+  personality" in Step 5).
 - **No imports beyond** the documented surface: `from nxs import …`
   the base your driver needs (`RegisterDriver` / `StreamDriver` /
   `I2cCommandDriver` / `SensorDriver` / `Sample`) plus any communication

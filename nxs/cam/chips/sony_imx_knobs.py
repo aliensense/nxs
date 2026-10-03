@@ -39,19 +39,17 @@ class _KnobMixin:
         vmax: int,
         mode: Optional[str] = None,
         trigger: str = FREERUN,
-        transport: str = "native",
         exposure_us: Optional[float] = None,
         gain: Optional[int] = None,
-        tail_rows: Optional[int] = None,
         inck_hz: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Standby-wrapped timing program + sensor start: STANDBY -> repairs
         -> AD depth and chromacity -> trigger regs -> SYNCSEL -> HMAX/VMAX
         -> black level -> shutter/gain -> release STANDBY -> release XMSTA.
         A mode without a declared exposure or gain keeps the program's own;
-        `transport` picks the VMAX law; `inck_hz` is the clock the pod
-        feeds the sensor, checked against the one the init table is set
-        for."""
+        VMAX answers to the frame law (`validate_vmax`); `inck_hz` is the
+        clock the pod feeds the sensor, checked against the one the init
+        table is set for."""
         prog = self._program("timing_start") or {}
         mode = mode or self.default_mode()
         timing = self._timing(mode)
@@ -59,7 +57,7 @@ class _KnobMixin:
             exposure_us = timing.get("exposure_us")
         if gain is None:
             gain = timing.get("gain")
-        self.validate_vmax(vmax, mode, transport=transport, tail_rows=tail_rows)
+        self.validate_vmax(vmax, mode)
         self.check_inck(inck_hz)
         presets = self._trigger_presets()
         if trigger != FREERUN and trigger not in presets:
@@ -235,12 +233,9 @@ class _KnobMixin:
                               comment="master start"))
 
     # --- live knobs -------------------------------------------------------
-    def _vmax_writes(self, vmax: int, mode: Optional[str] = None,
-                     transport: str = "native",
-                     tail_rows: Optional[int] = None) -> List[Dict[str, Any]]:
+    def _vmax_writes(self, vmax: int, mode: Optional[str] = None) -> List[Dict[str, Any]]:
         """Live VMAX change, REGHOLD-wrapped; the same law as the start."""
-        self.validate_vmax(vmax, mode or self.default_mode(),
-                           transport=transport, tail_rows=tail_rows)
+        self.validate_vmax(vmax, mode or self.default_mode())
         return self._hold(self._write("VMAX", vmax, comment=f"VMAX {vmax}"))
 
     def _hmax_writes(self, hmax: int) -> List[Dict[str, Any]]:
@@ -248,27 +243,25 @@ class _KnobMixin:
         return self._hold(self._write("HMAX", hmax, comment=f"HMAX {hmax}"))
 
     def knob_fps(self, fps: float, hmax: Optional[int] = None,
-                 mode: Optional[str] = None,
-                 transport: str = "native") -> List[Dict[str, Any]]:
+                 mode: Optional[str] = None) -> List[Dict[str, Any]]:
         """Live frame-rate change via VMAX (validated) at the running line
         length, the mode's when none is given."""
         mode = mode or self.default_mode()
         if hmax is None:
             hmax = int(self._timing(mode)["hmax"])
-        return self._vmax_writes(self.vmax_for_fps(fps, hmax), mode,
-                                 transport=transport)
+        return self._vmax_writes(self.vmax_for_fps(fps, hmax), mode)
 
     def knob_exposure(self, exposure_us: float, hmax: Optional[int] = None,
                       vmax: Optional[int] = None) -> List[Dict[str, Any]]:
         """Live exposure change via the shutter register, REGHOLD-wrapped
         (free-run only; under fast trigger the pulse width integrates).
-        Defaults: the default mode's line length and its shortest frame."""
+        Defaults: the default mode's line length and its recommended frame."""
         _require_positive("exposure", exposure_us)
         mode = self.default_mode()
         if hmax is None:
             hmax = int(self._timing(mode)["hmax"])
         if vmax is None:
-            vmax = self._shortest_frame(mode)[0]
+            vmax = self.recommended_frame_length(mode)
         shutter = self._shutter_reg()
         shs = self.shs_for_exposure_us(exposure_us, hmax, vmax)
         actual = (vmax - shs) * self.line_time_us(hmax)

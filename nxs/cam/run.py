@@ -52,10 +52,12 @@ def _execute(raw: Dict[str, Any], bus: str, name: str,
         if not quiet:
             term.err(f"{name}: {exc}")
         ok = False
-    # The polled waits that replaced the program's fixed settles: how
-    # long the links really took against the budget they had.
+    # The polled waits that replaced the program's fixed settles: how long
+    # the links really took against the budget they had, on the bench or
+    # when a wait ran to its deadline.
     summary = manager.settle_summary()
-    if summary and not quiet:
+    missed = any(not settle["held"] for settle in manager.settles)
+    if summary and not quiet and (missed or os.environ.get("NXS_CAM_VERBOSE")):
         term.info(f"{name}: {summary}")
     return ok
 
@@ -252,7 +254,10 @@ def _run_unit_program(pack, topology: Topology, link: str, mode: str,
         # personality is uploaded when the pod holds another or none.
         from nxs.cam import pods
         try:
-            converged = pods.converge(client, pack, topology, spec, log=term.info)
+            converged = pods.converge(client, pack, topology, spec)
+        except (pods.PodSilent, pods.PodRefused) as exc:
+            term.err(str(exc))
+            return False
         except (InfeasibleConfig, RuntimeError) as exc:
             term.err(f"link {link}: {exc}")
             return False
@@ -291,6 +296,69 @@ def _run_unit_program(pack, topology: Topology, link: str, mode: str,
     finally:
         if owned and hasattr(client, "close"):
             client.close()
+
+
+def park_pods(pack, topology: Topology) -> None:
+    """After the host's park program: each camera link's pod runs its
+    personality's park action, the walk's `pod <link>: park` turn, so the
+    unit's last run is a park and its status LED stops beating for the head.
+    The host's program already stood every sensor by, so a pod that does not
+    park is one line and never fails the park."""
+    for spec in topology.camera_links:
+        why = _park_pod(pack, topology, spec)
+        if why is not None:
+            term.info(f"pod {spec.name}: no park run ({why})")
+
+
+def _park_pod(pack, topology: Topology, spec: LinkSpec) -> Optional[str]:
+    """Run `spec`'s pod park action at the pod's alias; the reason it did
+    not run, else None. Only a pod whose last run brought its head up is
+    parked: its probe program would fail on a head that never came up and
+    leave the unit reporting a fault."""
+    from nxs.cam import pods
+    from nxs.client import CamRunState, DeviceRefused
+    from nxs.personality.records import ACTION_PARAM, ACTIONS
+    from nxs.transports import open_client
+
+    if not spec.nxs_units:
+        return "no pod"
+    name = pods.declared_name(pack, spec)
+    try:
+        names = pods.param_names(pack, spec)
+    except InfeasibleConfig as exc:
+        return exc.reason
+    if ACTION_PARAM not in names:
+        return f"{name} has no park action"
+    try:
+        client = open_client("i2c", bus=topology.i2c_bus, address=spec.nxs_units[0].alias_addr)
+    except (OSError, RuntimeError, ValueError):
+        return "no answer"
+    try:
+        try:
+            state, _error = client.read_cam_state()
+            found = unit_source.read_unit_personality(client)
+        except unit_source.UnreadableSlot as exc:
+            return str(exc)
+        except (OSError, RuntimeError, ValueError):
+            return "no answer"
+        if state != CamRunState.DONE:
+            return unit_source.last_run_text(state)
+        held = pods.held_instead(found, pack, spec)
+        if held is not None:
+            return f"holds {held}"
+        term.info(f"pod {spec.name}: park ({name}, slot {found.slot})")
+        try:
+            client.cam_stage_params(found.slot, {names.index(ACTION_PARAM): ACTIONS["park"]})
+            client.cam_run(found.slot, timeout_s=UNIT_RUN_TIMEOUT_S)
+        except DeviceRefused as exc:
+            term.warn(f"pod {spec.name}: park: {exc} (errno {exc.code})")
+        except (OSError, RuntimeError, TimeoutError) as exc:
+            term.warn(f"pod {spec.name}: park: {exc}")
+        return None
+    finally:
+        close = getattr(client, "close", None)
+        if close is not None:
+            close()
 
 
 def _rates_arg(args: argparse.Namespace, links: List[LinkSpec]) -> Optional[Dict[str, float]]:
@@ -505,17 +573,25 @@ def _link_sensor(pack, port: Topology, spec: LinkSpec, mode: str, frame_length: 
     return sensor
 
 
+class WalkStopped(RuntimeError):
+    """The port's walk stopped once it was under way: the line names the
+    port and the step, and what the walk started is the caller's to park."""
+
+
 def run_graph(pack, topology: Topology, links: List[LinkSpec], modes: Dict[str, str],
               rates: Dict[str, float], images: Tuple[bytes, bytes], name: str) -> bool:
     """Bring `links` up on the executor: the pods brought to the
     declaration and their staging gathered, then the walk in libnxs (the
     hub images' phases on the port's bus, the pods' actions between them).
-    The frame each pod's timing writes is the rate's, by the pack's law."""
+    The frame each pod's timing writes is the rate's, by the pack's law.
+    False after a refusal printed before the walk; WalkStopped when the
+    walk stopped under way."""
     from nxs import _libnxs
     from nxs.cam import graph
 
     flows = pack.flows()
-    port = _port_links(topology, links)
+    # A pair's head runs the pair line beside the mode the partner runs.
+    port = _port_links(topology, links).with_modes(modes)
     frames: Dict[str, Optional[int]] = {}
     sensor_module = getattr(flows, "sensor_module", None)
     law = getattr(flows, "frame_law", None)
@@ -557,26 +633,54 @@ def run_graph(pack, topology: Topology, links: List[LinkSpec], modes: Dict[str, 
         # brings it to the declaration before the walk looks for the slot.
         from nxs.cam import pods
 
-        converged = pods.converge(unit, pack, port, by_name[link], log=term.info)
+        converged = pods.converge(unit, pack, port, by_name[link])
         if converged:
             term.info(converged)
+
+    from nxs.cam import pods
 
     try:
         bus = _libnxs.Bus.open(topology.i2c_bus)
     except OSError as exc:
         term.err(f"{name}: {topology.i2c_bus} does not open: {exc}")
         return False
+    where = _port_name(topology)
     try:
         report = bus.port_up(spec, log=log, pod=on_pod)
     except InfeasibleConfig as exc:
-        term.err(f"{name}: {exc}")
-        return False
+        raise WalkStopped(f"{where}: {exc}") from exc
+    except (pods.PodSilent, pods.PodRefused) as exc:
+        # The line names the port and the link already.
+        raise WalkStopped(str(exc)) from exc
     except (OSError, RuntimeError) as exc:
-        term.err(f"{name}: {exc}")
-        return False
+        raise WalkStopped(f"{where}: {exc}") from exc
     finally:
         bus.close()
     if not report.ok:
-        term.err(f"{name}: {report}")
-        return False
+        raise WalkStopped(f"{where}: {report}")
     return True
+
+
+def abort_pods(topology: Topology, links: List[LinkSpec]) -> None:
+    """Abort each pod's camera run that is still live, as a walk that
+    stopped on the wait for a run leaves it: a pod running holds its bus and
+    takes no command but the abort. A pod with no live run is left as it is."""
+    from nxs.client import DeviceRefused
+    from nxs.transports import open_client
+
+    for spec in links:
+        if not spec.nxs_units:
+            continue
+        try:
+            client = open_client("i2c", bus=topology.i2c_bus, address=spec.nxs_units[0].alias_addr)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        try:
+            client.cam_abort()
+            term.info(f"pod {spec.name}: its live run aborted")
+        except (DeviceRefused, OSError, RuntimeError, TimeoutError):
+            pass        # no run is live, or the pod does not answer: nothing to abort
+        finally:
+            close = getattr(client, "close", None)
+            if close is not None:
+                close()

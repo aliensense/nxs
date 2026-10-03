@@ -112,13 +112,7 @@ def _declare_unit(lib: ctypes.CDLL) -> None:
     lib.nxs_stream_lost.argtypes = [ctypes.c_void_p]
     lib.nxs_stream_close.restype = None
     lib.nxs_stream_close.argtypes = [ctypes.c_void_p]
-    for name, args in (("nxs_bus_lock", [ctypes.c_void_p, ctypes.c_uint32]),
-                       ("nxs_bus_unlock", [ctypes.c_void_p]),
-                       ("nxs_bus_probe", [ctypes.c_void_p, ctypes.c_uint8]),
-                       ("nxs_bus_read", [ctypes.c_void_p, ctypes.c_uint8, u8p, ctypes.c_size_t,
-                                         u8p, ctypes.c_size_t]),
-                       ("nxs_bus_write", [ctypes.c_void_p, ctypes.c_uint8, u8p, ctypes.c_size_t]),
-                       ("nxs_unit_link_dropped", [unit]),
+    for name, args in (("nxs_unit_link_dropped", [unit]),
                        ("nxs_unit_probe", [unit]),
                        ("nxs_unit_read_identity", [unit, ctypes.POINTER(_Identity)]),
                        ("nxs_unit_identify", [unit]),
@@ -166,6 +160,7 @@ def _declare_unit(lib: ctypes.CDLL) -> None:
                        ("nxs_unit_recover", [unit]),
                        ("nxs_unit_reboot", [unit]),
                        ("nxs_unit_read_diag", [unit, ctypes.POINTER(_Diag)]),
+                       ("nxs_unit_read_cam_runs", [unit, ctypes.POINTER(ctypes.c_uint32)]),
                        ("nxs_unit_upload", [unit, ctypes.c_char_p, ctypes.c_size_t]),
                        ("nxs_unit_save_slot", [unit, ctypes.c_uint8]),
                        ("nxs_unit_delete_slot", [unit, ctypes.c_uint8]),

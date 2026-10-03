@@ -1,4 +1,4 @@
-"""The frame-sync plan and the viewer hints: which links take the trigger, the generator rate, the recorded sync."""
+"""The frame-sync plan and the viewer hints: which links take the trigger, the generator rate, whether the pulse sets the exposure, who sets a pair's exposure and gain, the recorded sync."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ from nxs import term
 from nxs.cam.contracts import InfeasibleConfig, LinkSpec, Topology
 from nxs import host as host_layer
 from nxs.cam import port_state
-from nxs.cam import packs
 from nxs.cam.run import _accepted
 
 
@@ -49,18 +48,38 @@ def _frames_kwarg(fn, frames: Optional[Dict[str, int]]) -> Dict[str, Any]:
     return {}
 
 
-def _exposure_kwarg(fn, exposure_us: Optional[float]) -> Dict[str, Any]:
-    """`exposure_us=` for a caps hook that pins the plan's exposure."""
-    if exposure_us is not None and "exposure_us" in _accepted(fn):
-        return {"exposure_us": float(exposure_us)}
+def _ae_roles(ae: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    """Each camera link's part in the port's exposure and gain as the record
+    carries it (the pack's `pair_ae`): `leader` and `follower` of a pair
+    that follows its leader's loop, `locked` on a declared gain; {} where
+    each link runs its own loop."""
+    ae = ae or {}
+    if ae.get("mode") == "follow":
+        return {str(ae["leader"]): "leader", str(ae["follower"]): "follower"}
+    if ae.get("mode") == "locked":
+        return {str(name): "locked" for name in ae.get("links") or []}
     return {}
+
+
+def _ae_kwargs(fn, ae: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """`ae_roles=` and `gain_db=` for a caps hook that takes them."""
+    roles = _ae_roles(ae)
+    if roles and "ae_roles" in _accepted(fn):
+        return {"ae_roles": roles, "gain_db": (ae or {}).get("gain_db")}
+    return {}
+
+
+def _pair_ae(pack, flows, topology: Topology, source: str) -> Optional[Dict[str, Any]]:
+    """Who sets the exposure and the gain of the port's camera links under
+    `source`, from the pack's `pair_ae`; None for a pack without the law."""
+    hook = getattr(flows, "pair_ae", None)
+    return dict(hook(pack, topology, source)) if hook is not None else None
 
 
 def _port_viewer_hint(pack, flows, topology: Topology, links: List[LinkSpec],
                       mode, triggered: bool = False,
                       rates: Optional[Dict[str, float]] = None,
-                      trigger_frames: Optional[Dict[str, int]] = None,
-                      exposure_us: Optional[float] = None
+                      trigger_frames: Optional[Dict[str, int]] = None
                       ) -> Optional[Dict[str, Any]]:
     """The port-level viewer caps, for a whole port only. A partial
     bring-up is described by its per-link caps (the port record writer promotes
@@ -72,8 +91,7 @@ def _port_viewer_hint(pack, flows, topology: Topology, links: List[LinkSpec],
     try:
         return flows.viewer_hints(pack, topology, mode, triggered=triggered,
                                   **_rate_kwarg(flows.viewer_hints, rates),
-                                  **_frames_kwarg(flows.viewer_hints, trigger_frames),
-                                  **_exposure_kwarg(flows.viewer_hints, exposure_us))
+                                  **_frames_kwarg(flows.viewer_hints, trigger_frames))
     except InfeasibleConfig:
         return None
 
@@ -82,10 +100,11 @@ def _hints_by_link(pack, flows, topology: Topology, links: List[LinkSpec],
                    modes, triggered: bool = False,
                    rates: Optional[Dict[str, float]] = None,
                    trigger_frames: Optional[Dict[str, int]] = None,
-                   exposure_us: Optional[float] = None
+                   ae: Optional[Dict[str, Any]] = None
                    ) -> Optional[Dict[str, Dict[str, Any]]]:
     """Per-link viewer caps from packs that compose them per link, their
-    capture mode index taken from the booted tree when it has one."""
+    capture mode index taken from the booted tree when it has one, each
+    carrying the link's part in the exposure and gain `ae` records."""
     hook = getattr(flows, "viewer_hints_by_link", None)
     if hook is None:
         return None
@@ -94,7 +113,7 @@ def _hints_by_link(pack, flows, topology: Topology, links: List[LinkSpec],
                      triggered=triggered,
                      **_rate_kwarg(hook, rates),
                      **_frames_kwarg(hook, trigger_frames),
-                     **_exposure_kwarg(hook, exposure_us))
+                     **_ae_kwargs(hook, ae))
     except InfeasibleConfig:
         # Caps are advisory; a pair the port cannot carry is the mode
         # planner's verdict, given before the program ran, not here.
@@ -115,176 +134,135 @@ def _sync_links(pack, flows, topology: Topology) -> Optional[Dict[str, str]]:
             for name, (ok, text) in plan.items()}
 
 
-def _nth(n: int) -> str:
-    return {1: "1st", 2: "2nd", 3: "3rd"}.get(int(n), f"{int(n)}th")
+#: Why an exposure asked in free run is refused, or under a frame sync whose
+#: pulse does not set it: the capture stack's loop owns the exposure.
+LOOP_EXPOSURE = ("the capture stack's exposure loop sets the exposure; "
+                 "`set exposure` sets it on a running link")
 
 
-def _fsync_plan(flows, pack, topology: Topology, fps: float,
-                exposure_us: Optional[float], modes):
-    """The pack's frame-sync plan (generator multiple, exposure, trigger
-    frames), None for a pack without the law."""
+def _fsync_plan(flows, pack, topology: Topology, fps: float, modes):
+    """The pack's frame-sync plan (whether the pulse sets the exposure, the
+    trigger frames), None for a pack without the law."""
     hook = getattr(flows, "fsync_plan", None)
     if hook is None:
         return None
     kwargs: Dict[str, Any] = {}
-    if exposure_us is not None:
-        kwargs["exposure_us"] = exposure_us
     if modes and "modes" in _accepted(hook):
         kwargs["modes"] = modes
     return hook(pack, topology, fps, **kwargs)
 
 
+#: What sets a synced link's exposure when its pulse does.
+PULSE_EXPOSURE = "the trigger pulse's low time"
+
+
 def plan_text(plan) -> str:
-    """One line on what the synced pair runs: the frame rate, the
-    pulse multiple, the exposure the pulse sets, the trigger frame."""
-    n = int(plan.pulses_per_frame)
-    parts = [f"fsync {plan.fps:g} fps"]
-    parts.append(f"every {_nth(n)} pulse of {plan.pulse_hz:.2f} Hz" if n > 1
-                 else "one pulse per frame")
-    if plan.exposure_us is not None:
-        parts.append(f"exposure {plan.exposure_us / 1000:.2f} ms")
+    """One line on what the synced pair runs: the frame rate, the exposure
+    when the pulse sets it, the trigger frame."""
+    parts = []
+    if plan.pulse_exposure:
+        parts.append(f"exposure {PULSE_EXPOSURE}")
     frames = sorted(set(plan.trigger_vmax.values()))
     if len(frames) == 1:
         parts.append(f"trigger frame {frames[0]} lines")
     else:
         parts.append("trigger frame " + ", ".join(
             f"{k} {v}" for k, v in sorted(plan.trigger_vmax.items())))
-    return ": ".join([parts[0], ", ".join(parts[1:])])
+    return f"fsync {plan.fps:g} fps: " + ", ".join(parts)
 
 
 def sync_text(live: Dict[str, Any]) -> str:
     """The live sync record as `status` prints it."""
     fps = live.get("fps")
     text = str(live["source"]) + (f" {fps:g} fps" if fps else "")
-    n = int(live.get("pulses_per_frame") or 1)
-    exposure = live.get("exposure_us")
-    details = []
-    if fps and n > 1:
-        details.append(f"every {_nth(n)} pulse of {n * float(fps):.2f} Hz")
-    if exposure is not None:
-        details.append(f"exposure {float(exposure) / 1000:.2f} ms")
-    return text + (f" ({', '.join(details)})" if details else "")
+    if live.get("pulse_exposure"):
+        text += f" (exposure {PULSE_EXPOSURE})"
+    return text
+
+
+def pulse_exposure_fact(fps: Optional[float]) -> str:
+    """Why an exposure asked under frame sync is refused: the trigger pulse
+    sets it, and the rate sets the pulse. The fact names the rate, never a
+    number the pulse's width would need."""
+    at = f" at {float(fps):g} fps" if fps is not None else ""
+    return (f"under frame sync the exposure is {PULSE_EXPOSURE}{at}; "
+            f"a shorter exposure needs a higher rate or less light")
+
+
+def pulse_sets_exposure(topology: Topology, link: str) -> bool:
+    """True when the recorded frame sync's pulse sets the link's exposure:
+    the port runs fsync, the link takes the pulse, and its sensor integrates
+    for the pulse's low time (False where the sensor's shutter works under
+    its trigger)."""
+    sync = port_state.port_sync(topology) or {}
+    if sync.get("source") != "fsync" or not sync.get("pulse_exposure"):
+        return False
+    return str((sync.get("links") or {}).get(link, "fsync")).startswith("fsync")
+
+
+def pair_gain_fact(topology: Topology) -> Optional[str]:
+    """Why a gain asked of the port is refused while the recorded sync gives
+    its camera links one gain (the pack's `pair_ae`): the leader's capture
+    session decides it and nxsd copies it to the follower's head, or the
+    declared `camera.gain_db` locks it; None where each link runs its own
+    loop."""
+    ae = (port_state.port_sync(topology) or {}).get("ae") or {}
+    if ae.get("mode") == "follow":
+        return (f"link {ae['leader']}'s capture session decides the pair's gain and nxsd "
+                f"copies it to link {ae['follower']}")
+    if ae.get("mode") == "locked":
+        return (f"camera.gain_db locks links {' and '.join(ae.get('links') or [])} "
+                f"at {float(ae['gain_db']):.1f} dB")
+    return None
+
+
+def declared_exposure_fact(topology: Topology, synced: bool) -> str:
+    """Why a declared `camera.exposure_us` is refused: under the port's frame
+    sync (``synced``) the pulse sets the exposure at the rate the port runs
+    (`synced_fps`); otherwise the capture stack's loop does."""
+    if not synced:
+        return LOOP_EXPOSURE
+    return pulse_exposure_fact(topology.synced_fps)
+
+
+def _record_hints(pack, flows, topology: Topology, triggered: bool,
+                  frames: Optional[Dict[str, int]] = None,
+                  ae: Optional[Dict[str, Any]] = None) -> None:
+    """Re-derive every link's capture caps from the port record. Free
+    running, the caps carry the rate each sensor was programmed for (the
+    record's rates); under the trigger the pack's hook derives the trigger
+    frame's, the plan's `frames` when given. Each link's caps carry its
+    part in the exposure and gain `ae` records."""
+    links = list(topology.links)
+    modes = {l.name: m for l in links
+             if (m := port_state.port_mode(topology, l))} or None
+    rates = ({l.name: r for l in links
+              if (r := port_state.port_rate(topology, l)) is not None} or None
+             if not triggered else None)
+    port_state.set_viewer_hints(
+        _port_viewer_hint(pack, flows, topology, links, None,
+                          triggered=triggered, rates=rates, trigger_frames=frames),
+        topology=topology,
+        viewers=_hints_by_link(pack, flows, topology, links, modes,
+                               triggered=triggered, rates=rates,
+                               trigger_frames=frames, ae=ae))
 
 
 def _record_sync(pack, flows, topology: Topology, source: str,
                  fps: Optional[float], plan=None) -> None:
+    """Record the port's live sync: the caps each link's consumers open
+    with, and the sync itself with who sets the exposure and the gain of
+    its camera links under it."""
     triggered = source == "fsync"
-    links = list(topology.links)
-    modes = {l.name: m for l in links
-             if (m := port_state.port_mode(topology, l))} or None
-    # Free-running again, the caps carry the rate each sensor was
-    # programmed for (the port record); under the trigger the pack's
-    # hook derives the trigger frame's, the plan's frame when it has one.
-    rates = ({l.name: r for l in links
-              if (r := port_state.port_rate(topology, l)) is not None} or None
-             if not triggered else None)
     frames = dict(plan.trigger_vmax) if (triggered and plan is not None) else None
-    exposure = plan.exposure_us if (triggered and plan is not None) else None
-    port_state.set_viewer_hints(
-        _port_viewer_hint(pack, flows, topology, links, None,
-                          triggered=triggered, rates=rates, trigger_frames=frames,
-                          exposure_us=exposure),
-        topology=topology,
-        viewers=_hints_by_link(pack, flows, topology, links, modes,
-                               triggered=triggered, rates=rates,
-                               trigger_frames=frames, exposure_us=exposure))
+    ae = _pair_ae(pack, flows, topology, source)
+    _record_hints(pack, flows, topology, triggered, frames, ae=ae)
     per_link = _sync_links(pack, flows, topology) if triggered else None
     port_state.set_sync(
         source, fps if triggered else None, topology=topology, links=per_link,
-        pulses_per_frame=(plan.pulses_per_frame if triggered and plan else None),
-        exposure_us=(plan.exposure_us if triggered and plan else None),
-        trigger_vmax=frames)
+        pulse_exposure=bool(triggered and plan is not None and plan.pulse_exposure),
+        trigger_vmax=frames, ae=ae)
     for name, what in (per_link or {}).items():
         if not what.startswith("fsync"):
             term.warn(f"link {name} is not synced: "
                       f"{what[len('free_run ('):-1]}")
-
-
-def _budget_warning(pack, topology: Topology, fps: float) -> None:
-    """Warn when this port's rate plus the other ports' up ports exceed
-    the host's measured capture budget (advisory; see nxs.cam.budget)."""
-    from nxs.cam import budget as host_budget
-    from nxs.cam.topology import load_ports
-
-    limit = host_layer.current().capture_budget_mpix_s()
-    if limit is None:
-        return
-    streams = []
-    try:
-        ports, _ = load_ports(None)
-    except Exception:
-        ports = {0: topology}
-    me = port_state.port_name(topology)
-    for port in ports.values():
-        name = port_state.port_name(port)
-        own = port_state.port_record(port)
-        hints = own.get("viewer") or {}
-        viewers = own.get("viewers") or {}
-        if name == me:
-            # One stream per link at its own geometry (`viewers`) or the shared one;
-            # a link that free-runs under the trigger keeps its own rate.
-            mine = [l for l in topology.links
-                    if port_state.link_state(topology, l) == port_state.STATE_UP
-                    ] or list(topology.links)
-            plan = _sync_plan(pack, topology)
-            for link in mine:
-                link_hints = (viewers.get(link.name) or hints
-                              or port_state.viewer_hints(topology, link=link.name) or {})
-                if not link_hints.get("width"):
-                    continue
-                rate = float(fps)
-                if plan and not plan.get(link.name, (True,))[0]:
-                    rate = _native_rate(topology, link, link_hints) or rate
-                streams.append((name, 1, int(link_hints["width"]),
-                                int(link_hints["height"]), rate))
-            continue
-        sync = own.get("sync") or {}
-        up = [l for l in port.links
-              if port_state.link_state(port, l) == port_state.STATE_UP]
-        # One stream per up link: a mixed hub records each link's own
-        # geometry under `viewers`; a uniform port shares `viewer`.
-        for other in up:
-            link_hints = viewers.get(other.name) or hints
-            if not link_hints.get("width"):
-                continue
-            rate = float(sync.get("fps") or 0.0) or _native_rate(port, other, link_hints)
-            if not rate:
-                continue
-            streams.append((name, 1, int(link_hints["width"]), int(link_hints["height"]),
-                            float(rate)))
-    note = host_budget.budget_note(streams, limit, me)
-    if note:
-        term.warn(note)
-
-
-def _sync_plan(pack, topology: Topology) -> Dict[str, Any]:
-    """Which links take the hub's trigger, per the pack ({} without one)."""
-    try:
-        return dict(pack.flows().sync_plan(pack, topology)) if pack is not None else {}
-    except Exception:
-        return {}
-
-
-def _native_rate(port: Topology, link: LinkSpec, hints: Dict[str, Any]) -> Optional[float]:
-    """A free-running link's rate: the one its last `on` recorded, else
-    its mode's lawful ceiling from the port's own pack (None when the
-    pack or the mode is unknown)."""
-    recorded = port_state.port_rate(port, link)
-    if recorded is not None:
-        return recorded
-    try:
-        own_pack = packs.pack_for(port)
-        mode = hints.get("mode") or own_pack.flows().default_mode(own_pack, link)
-        from nxs.cam import timing as cam_timing
-        rates = cam_timing.lawful_range(own_pack, port, link, mode)
-        if rates is not None:
-            return rates.ceiling
-        # A pack without the range law: the mode's own frame at its line.
-        sen = own_pack.descriptor(link.sensor_compatible)
-        timing = sen.modes[mode]["timing"]
-        frame = timing.get("vmax") or timing.get("min_frame_length")
-        return int(sen.limits["inck_hz"]) / (int(timing["hmax"]) * int(frame))
-    except Exception:
-        return None
-
-

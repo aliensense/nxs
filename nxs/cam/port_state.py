@@ -2,17 +2,23 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Port bookkeeping: the bus lock and the per-link state machine. `on`
-records each link's state, capture id, and viewer caps in a YAML under
-`state_dir()`; `off` records `parked`; an absent record reads as `unknown`."""
+records each link's state, capture id, and viewer caps, and the port's
+declaration, in a YAML under `state_dir()`; `off` records `parked`; an
+absent record reads as `unknown`.
+The delivery check that last passed on a port rides its section until the
+port changes under it."""
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import fcntl
 import functools
 import os
 import threading
+import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
@@ -67,7 +73,11 @@ def capture_path(port: str, link: str) -> Path:
 def _write_capture(port: str, ids: Dict[str, Any], viewers: Dict[str, Dict[str, Any]],
                    topology: Topology) -> None:
     """Write the capture facts of every link the viewer caps cover; a link
-    without a capture id or a mode index gets none."""
+    without a capture id or a mode index gets none. A synced pair's link
+    carries its part in the pair's exposure and gain (`ae_role`): the
+    loop's lock, with the port whose follower heartbeat names the gain for
+    a follower (`follow=`, read as the session opens) and the declared gain
+    for a locked link, and the ISP left alone for every part."""
     declared = {link.name: link.capture_id for link in topology.links}
     for link, hints in viewers.items():
         capture_id = ids.get(link)
@@ -88,6 +98,13 @@ def _write_capture(port: str, ids: Dict[str, Any], viewers: Dict[str, Dict[str, 
             for key in ("exposure_min_us", "exposure_max_us"):
                 if hints.get(key) is not None:
                     lines.append(f"{key}={float(hints[key]):g}")
+        role = hints.get("ae_role")
+        if role == "follower":
+            lines += ["ae_lock=1", f"follow={port}"]
+        elif role == "locked":
+            lines += ["ae_lock=1", f"gain_db={float(hints.get('gain_db') or 0.0):g}"]
+        if role:
+            lines += ["isp_gain_unity=1", "isp_filters_off=1"]
         path = capture_path(port, link)
         path.parent.mkdir(parents=True, exist_ok=True)
         staged = path.with_name(path.name + ".tmp")
@@ -98,6 +115,51 @@ def _write_capture(port: str, ids: Dict[str, Any], viewers: Dict[str, Dict[str, 
 def _remove_capture(port: str, links: List[str]) -> None:
     for link in links:
         capture_path(port, link).unlink(missing_ok=True)
+
+
+#: The heartbeat of the follower nxsd runs on a port's synced pair, one
+#: `key=value` file per port beside the record.
+FOLLOW_DIR = "follow"
+
+
+def follow_path(port: str) -> Path:
+    return state_dir() / FOLLOW_DIR / port
+
+
+def write_follow(port: str, fields: Dict[str, Any]) -> None:
+    """Write a port's follower heartbeat whole, a `key=value` line per field
+    in order, for the owner and the store's group (nxsd writes it as root,
+    `status` reads it as the operator)."""
+    path = follow_path(port)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    staged = path.with_name(path.name + ".tmp")
+    staged.unlink(missing_ok=True)
+    with _open_private(str(staged), os.O_EXCL) as fh:
+        fh.write("".join(f"{key}={value}\n" for key, value in fields.items()))
+    os.replace(staged, path)
+
+
+def read_follow(port: str) -> Optional[Dict[str, str]]:
+    """A port's follower heartbeat as written; None when nothing follows there."""
+    try:
+        text = follow_path(port).read_text()
+    except OSError:
+        return None
+    return dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
+
+
+def follow_gain_db(port: str) -> Optional[float]:
+    """The leader's gain a port's follower heartbeat names, in dB: the gain
+    the following link's capture session starts at. None without a
+    heartbeat, or before the follower takes a gain."""
+    try:
+        return float((read_follow(port) or {})["gain_db"])
+    except (KeyError, ValueError):
+        return None
+
+
+def remove_follow(port: str) -> None:
+    follow_path(port).unlink(missing_ok=True)
 
 
 def _open_private(path: str, flags: int = 0):
@@ -113,21 +175,73 @@ STATE_UP = "up"
 STATE_PARKED = "parked"
 STATE_UNKNOWN = "unknown"
 
+#: The port section's key for the delivery check that last passed on it.
+VERIFIED = "verified"
+
+#: How long a command waits for another's hold on the bus before it
+#: refuses: longer than a gate write holds the lock (half a second behind
+#: the hub), shorter than a bring-up.
+BUS_LOCK_WAIT_S = 1.0
+#: How often a waiting command tries the lock again.
+BUS_LOCK_POLL_S = 0.01
+
+
+class BusHeld(SystemExit):
+    """The bus lock is another run's: the exit a verb ends with unprepared,
+    and its own type for the one that reports a held bus instead."""
+
+
+#: The wait `waiting` sets, (seconds, poll seconds), per context so one thread's policy
+#: never reaches another's; None waits BUS_LOCK_WAIT_S, polling every BUS_LOCK_POLL_S.
+_WAIT: contextvars.ContextVar = contextvars.ContextVar("bus_wait", default=None)
+
+
+@contextlib.contextmanager
+def waiting(seconds: float, poll_s: float = 0.5):
+    """Every `BusLock` taken inside waits up to `seconds` for a held lock,
+    trying every `poll_s`, so a read that takes the lock on its own waits
+    the way the verb's own acquisitions do."""
+    token = _WAIT.set((seconds, poll_s))
+    try:
+        yield
+    finally:
+        _WAIT.reset(token)
+
+
+#: A run's wait for a bus another run holds, and its poll: nxsd holds the lock per step
+#: while it brings the ports up after boot, each step well under the wait.
+HELD_WAIT_S = 20.0
+HELD_POLL_S = 0.5
+
+
+def held_wait():
+    """The bounded wait for a held bus: every `BusLock` taken inside waits
+    up to HELD_WAIT_S, trying every HELD_POLL_S."""
+    return waiting(HELD_WAIT_S, HELD_POLL_S)
+
 
 class BusLock:
-    """Exclusive lock so concurrent runs can't interleave I2C."""
+    """Exclusive lock so concurrent runs can't interleave I2C. A hold that
+    ends within the wait (BUS_LOCK_WAIT_S, or the policy `waiting` sets) is
+    waited out, a longer one refused with BusHeld; the lock is a `flock` on
+    a fresh descriptor, so a second one in the same process waits on the
+    first like any other run's."""
 
     def __init__(self) -> None:
         self._fh = _open_private(lock_path())
 
     def __enter__(self) -> "BusLock":
-        try:
-            fcntl.flock(self._fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise SystemExit(
-                f"another nxs cam run holds {lock_path()} — wait for it"
-            )
-        return self
+        wait_s, poll_s = _WAIT.get() or (BUS_LOCK_WAIT_S, BUS_LOCK_POLL_S)
+        deadline = time.monotonic() + wait_s
+        while True:
+            try:
+                fcntl.flock(self._fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    self._fh.close()
+                    raise BusHeld(f"another nxs cam run holds {lock_path()} — wait for it")
+                time.sleep(poll_s)
 
     def __exit__(self, *exc: Any) -> None:
         fcntl.flock(self._fh, fcntl.LOCK_UN)
@@ -150,10 +264,12 @@ def _load() -> Dict[str, Any]:
         record = yaml.safe_load(path.read_text()) or {}
     except FileNotFoundError:
         return {}
-    # The states hold for one boot: the hub is unprogrammed after a reboot,
-    # whatever the record said before it, on every port at once.
+    # The states and every delivery check hold for one boot: after a reboot
+    # the hub is unprogrammed on every port at once, whatever the record said.
     if record.get("boot") != _boot_id():
         record.pop("states", None)
+        for section in (record.get("ports") or {}).values():
+            section.pop(VERIFIED, None)
     return record
 
 
@@ -227,11 +343,16 @@ def save_port(
     viewers: Optional[Dict[str, Dict[str, Any]]] = None,
     modes: Optional[Dict[str, str]] = None,
     rates: Optional[Dict[str, float]] = None,
+    line: Optional[Dict[str, int]] = None,
 ) -> None:
     """Record an applied port: selected links go `up`, port siblings go `parked`.
     ``viewer`` is one set of capture caps, ``viewers`` the per-link caps of a
     mixed hub, ``modes`` the mode each link runs, ``rates`` the free-run
-    rate each link's sensor was programmed for."""
+    rate each link's sensor was programmed for, ``line`` the line in HMAX
+    each head of a pair runs where the delivery check found it (a port
+    recorded without one runs the datasheet's). The port's declaration
+    rides as `declared` when the topology carries one (`nxs switch` brings
+    a port up again once the manifest's differs)."""
     vc_to_capture = {
         link.csi_vc: link.capture_id
         for link in topology.links
@@ -249,6 +370,10 @@ def save_port(
     port = record.setdefault("ports", {}).setdefault(port_name(topology), {})
     port.update({"carrier": topology.carrier, "links": ids,
                  "pipes": dict(getattr(csi, "pipes", None) or {})})
+    if topology.declared is not None:
+        port["declared"] = topology.declared
+    else:
+        port.pop("declared", None)
     # The port's section describes the links this port declares and no
     # other: a link a previous declaration carried is forgotten with it.
     selected = {link.name for link in links}
@@ -268,6 +393,10 @@ def save_port(
     if rates:
         port.setdefault("rates", {}).update(
             {str(k): float(v) for k, v in rates.items()})
+    if line:
+        port["line"] = {str(k): int(v) for k, v in line.items()}
+    else:
+        port.pop("line", None)
     if viewers:
         port["viewers"] = {str(k): dict(v) for k, v in viewers.items()}
         first = next(iter(viewers.values()))
@@ -309,11 +438,42 @@ def port_mode(topology: Topology, link: LinkSpec) -> Optional[str]:
     return str(value) if value else None
 
 
+def found_lines(topology: Topology) -> Dict[str, Tuple[str, int]]:
+    """The line each head of the port's pair runs as the delivery check
+    found it on the rig, (mode, HMAX) by link; {} when the record holds
+    none."""
+    section = _port(_load(), topology)
+    modes = section.get("modes") or {}
+    return {str(name): (str(modes[name]), int(hmax))
+            for name, hmax in (section.get("line") or {}).items() if modes.get(name)}
+
+
+def with_found_lines(topology: Topology) -> Topology:
+    """The port at the lines the delivery check found for it
+    (`found_lines`), the laws judging its rates there; the port itself
+    where the record holds none."""
+    found = found_lines(topology)
+    return topology.with_lines(found) if found else topology
+
+
 def port_rate(topology: Topology, link: LinkSpec) -> Optional[float]:
     """The free-run rate a link's last `on` programmed, if recorded."""
     rates = _port(_load(), topology).get("rates") or {}
     value = rates.get(link.name)
     return float(value) if value is not None else None
+
+
+def running_rate(record: Dict[str, Any], link: str) -> Optional[float]:
+    """The rate a link of a port's record runs at: the generator's while the
+    recorded frame sync paces it, else the free-run rate its last `on`
+    programmed; None when the record holds neither. A sync record that
+    names no links paces every link."""
+    sync = record.get("sync") or {}
+    if (sync.get("source") == "fsync" and sync.get("fps") is not None
+            and str((sync.get("links") or {}).get(link, "fsync")).startswith("fsync")):
+        return float(sync["fps"])
+    rate = (record.get("rates") or {}).get(link)
+    return float(rate) if rate is not None else None
 
 
 def port_record(topology: Topology) -> Dict[str, Any]:
@@ -339,6 +499,7 @@ def mark_unknown(topology: Topology, links: List[LinkSpec]) -> None:
         port_name(topology), {})
     for link in links:
         states[link.name] = STATE_UNKNOWN
+    _port(record, topology).pop(VERIFIED, None)
     _store(record)
     _remove_capture(port_name(topology), [link.name for link in links])
 
@@ -351,8 +512,46 @@ def mark_parked(topology: Topology, links: List[LinkSpec]) -> None:
         port_name(topology), {})
     for link in links:
         states[link.name] = STATE_PARKED
+    _port(record, topology).pop(VERIFIED, None)
     _store(record)
     _remove_capture(port_name(topology), [link.name for link in links])
+
+
+@_locked
+def set_rates(topology: Topology, rates: Dict[str, float]) -> None:
+    """Record the free-run rate `set fps` programs on each named link's
+    sensor, and clear the port's last delivery check."""
+    record = _load()
+    port = record.setdefault("ports", {}).setdefault(port_name(topology), {})
+    port.setdefault("rates", {}).update({str(k): float(v) for k, v in rates.items()})
+    port.pop(VERIFIED, None)
+    _store(record)
+
+
+@_locked
+def set_verified(topology: Topology, rates: Dict[str, float], when: float) -> None:
+    """Record the delivery check that passed on the port: the rate each link
+    delivered and `when` it ran, in seconds since the epoch. A new boot, a
+    sync or rate change, and a link marked unknown or parked clear it."""
+    record = _load()
+    port = record.setdefault("ports", {}).setdefault(port_name(topology), {})
+    port[VERIFIED] = {"at": float(when),
+                      "rates": {str(k): round(float(v), 3) for k, v in rates.items()}}
+    _store(record)
+
+
+def verified(topology: Topology) -> Optional[Dict[str, Any]]:
+    """The port's last passing delivery check, `{at, rates}`; None when the
+    record holds none."""
+    seen = _port(_load(), topology).get(VERIFIED)
+    return {"at": float(seen["at"]), "rates": dict(seen["rates"])} if seen else None
+
+
+def recorded_states(topology: Topology) -> Dict[str, str]:
+    """The states a step recorded this boot for the port's links, by link
+    name; a link no step recorded is absent."""
+    record = _load()
+    return dict((record.get("states") or {}).get(port_name(topology)) or {})
 
 
 def link_state(topology: Topology, link: LinkSpec) -> str:
@@ -424,28 +623,31 @@ def viewer_hints(topology: Optional[Topology] = None,
 def set_sync(source: str, fps: Optional[float] = None,
              topology: Optional[Topology] = None,
              links: Optional[Dict[str, str]] = None,
-             pulses_per_frame: Optional[int] = None,
-             exposure_us: Optional[float] = None,
-             trigger_vmax: Optional[Dict[str, int]] = None) -> None:
+             pulse_exposure: bool = False,
+             trigger_vmax: Optional[Dict[str, int]] = None,
+             ae: Optional[Dict[str, Any]] = None) -> None:
     """Record the live synced pair: `free_run`, or `fsync` at fps.
     ``links`` names what each link does under it (`fsync`, or
     `free_run` with the reason) when a mixed hub syncs only some;
-    ``pulses_per_frame``, ``exposure_us`` and ``trigger_vmax`` carry the
-    generator plan (the pulse multiple, the exposure it sets, the frame
-    each link runs)."""
+    ``pulse_exposure`` and ``trigger_vmax`` carry the generator plan
+    (whether the pulse sets the synced links' exposure, the frame each
+    link runs); ``ae`` who sets the camera links' exposure and gain (the
+    pack's `pair_ae`: `follow`, `locked` or `per_link`)."""
     record = _load()
     sync: Dict[str, Any] = {"source": source, "fps": fps}
     if links:
         sync["links"] = {str(k): str(v) for k, v in links.items()}
-    if pulses_per_frame is not None:
-        sync["pulses_per_frame"] = int(pulses_per_frame)
-    if exposure_us is not None:
-        sync["exposure_us"] = float(exposure_us)
+    if pulse_exposure:
+        sync["pulse_exposure"] = True
     if trigger_vmax:
         sync["trigger_vmax"] = {str(k): int(v) for k, v in trigger_vmax.items()}
+    if ae:
+        sync["ae"] = dict(ae)
     record["sync"] = sync
     if topology is not None:
-        record.setdefault("ports", {}).setdefault(port_name(topology), {})["sync"] = dict(sync)
+        port = record.setdefault("ports", {}).setdefault(port_name(topology), {})
+        port["sync"] = dict(sync)
+        port.pop(VERIFIED, None)
     _store(record)
 
 

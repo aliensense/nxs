@@ -212,24 +212,22 @@ def save_model(path, channels, only=None):
     if not raw.get("ports") and not raw.get("units"):
         raise SystemExit("nxs tune: nothing declared to save — set a HUB and "
                          "a link sensor, or a unit's PERSONALITY, first")
+    from nxs.suite.freeze import _write_atomic
+
     backup = None
     if existed:
         backup = f"{path}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
         with open(path, encoding="utf-8") as fh:
             original = fh.read()
-        with open(backup, "w", encoding="utf-8") as fh:
-            fh.write(original)
-    else:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
-        yaml_rt.dump(raw, fh)
+        _write_atomic(backup, lambda f: f.write(original))
+    _write_atomic(path, lambda f: yaml_rt.dump(raw, f))
     return backup
 
 
 def _write_declaration(raw, ch):
     """Write (or update) the manifest entry a strip's DECLARE section
     describes: a port's hub and link sensors, a unit's personality."""
-    from nxs.suite.freeze import port_block
+    from nxs.suite.freeze import hex_address, port_block
 
     knobs = ch.knobs()
     if ch.kind == "port":
@@ -280,7 +278,8 @@ def _write_declaration(raw, ch):
     if sensor_section is not None:
         config = {f.name: f.value for f in sensor_section.fields}
     entry = {"name": ch.name, "module": "nxs",
-             "links": [{"transport": "i2c", "bus": link.bus, "address": link.address}]}
+             "links": [{"transport": "i2c", "bus": link.bus,
+                        "address": hex_address(link.address)}]}
     if serial and serial != "?":
         entry["serial"] = serial
     entry["sensors"] = [{"personality": personality, "config": config} if config

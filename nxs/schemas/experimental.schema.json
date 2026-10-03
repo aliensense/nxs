@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://aliensense.dev/schemas/experimental.schema.json",
   "title": "Experimental manifest (experimental.yaml)",
-  "description": "The index of a pack's experimental material: measured operating points and jump thresholds layered over the shipped descriptors, and the sensors that ship no shipped point, read only under `nxs --experimental`. Never shipped; the shipped pack manifest never names it.",
+  "description": "The index of a pack's experimental material: measured operating points and jump thresholds layered over the shipped descriptors, and the sensors the product does not ship, read only under `nxs --experimental`. Never shipped; the shipped pack manifest never names it.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -33,7 +33,7 @@
     },
     "chips": {
       "type": "array",
-      "description": "Sensors the product does not ship (no shipped point), joining the pack after its shipped sensors: each a chip directory beside this file.",
+      "description": "Sensors the product does not ship, joining the pack after its shipped sensors: each a chip directory beside this file.",
       "items": {
         "type": "string",
         "pattern": "^[a-z][a-z0-9_]*$"

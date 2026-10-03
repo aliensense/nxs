@@ -101,14 +101,6 @@ def derive_lines(pack, compatible: str,
     if hook is None:
         return []
     readings = {r.name: r.raw for r in results if r.raw is not None}
-    # Facts one chip's derivation needs from another — the serializer's
-    # tail law for the sensor's delivery line — come from the pack.
-    extra = getattr(pack.flows(), "status_readings", None)
-    if extra is not None:
-        try:
-            readings.update(extra(pack, compatible) or {})
-        except Exception:
-            pass
     try:
         return list(hook(readings))
     except Exception:

@@ -226,10 +226,22 @@ def mode_label(descriptor, name: str) -> str:
     return f"{geo.get('width')}x{geo.get('height')} {dt}"
 
 
+def mode_token(descriptor, name: str) -> str:
+    """The token `--mode` takes for a mode: its geometry, or the geometry
+    with the depth when another mode shares it (WxH-rawN)."""
+    geo = descriptor.modes[name].get("geometry") or {}
+    token = f"{geo.get('width')}x{geo.get('height')}"
+    shared = [n for n, m in descriptor.modes.items()
+              if f"{(m.get('geometry') or {}).get('width')}x"
+                 f"{(m.get('geometry') or {}).get('height')}" == token]
+    if len(shared) > 1:
+        token += f"-raw{geo.get('bit_depth')}"
+    return token
+
+
 #: The per-mode timing keys a bench measures; a shipped descriptor never
-#: states them (its operating points are the `shipped` block), a bench
-#: overlay may, and a unit-served descriptor decoded from an image drops
-#: them.
+#: states them, a bench overlay may, and a unit-served descriptor decoded
+#: from an image drops them.
 EXPERIMENTAL_TIMING_KEYS = frozenset({
     "vmax_clean", "vmax_jump_threshold", "trigger_vmax", "framerate_cap",
     "exposure_us", "gain"})
@@ -280,24 +292,17 @@ class Descriptor:
         win and its blobs are searched first."""
         self._root = root
         self._overlay = overlay
-        # True for a port's view (`for_cameras`): a point's line merged over
-        # the timing, which a personality never compiles from.
-        self._view = False
-        # Timing keys the overlay states per mode: they win over a record's.
-        self._over_timing: Dict[str, set] = {}
+        # The descriptor a port's view (`at_lines`) lays its lines over; a
+        # personality never compiles from a view.
+        self._plain: Optional["Descriptor"] = None
         path = root / f"{root.name}.yaml"
         data = yaml.safe_load(path.read_text())
-        # The shipped yaml carries transcription and the shipped operating
-        # points; an experimental key in it would ship a measurement as the part.
+        # The shipped yaml carries transcription; an experimental key in it
+        # would ship a measurement as the part.
         _refuse_experimental_keys(data, path)
-        shipped, shipped_path = data, path
         if overlay is not None:
             over_path = overlay / f"{overlay.name}.yaml"
             extra = yaml.safe_load(over_path.read_text()) or {}
-            self._over_timing = {
-                str(name): set((mode or {}).get("timing") or {})
-                for name, mode in (extra.get("modes") or {}).items()
-                if isinstance(mode, dict)}
             # Gate the overlay on its own schema before the merge, so it cannot
             # carry a datasheet source or override a limit without its source.
             from nxs import schemas as _schemas
@@ -316,8 +321,6 @@ class Descriptor:
         self._data: Dict[str, Any] = data
         self._blob_cache: Dict[str, Dict[str, Any]] = {}
         self._check_provenance(path)
-        # A record is audited against the shipped facts, never an overlay's.
-        self._check_shipped(str(shipped_path), shipped)
 
     @classmethod
     def from_data(cls, data: Dict[str, Any], name: str) -> "Descriptor":
@@ -331,57 +334,11 @@ class Descriptor:
         self = cls.__new__(cls)
         self._root = None
         self._overlay = None
-        self._over_timing = {}
+        self._plain = None
         self._name = str(name)
         self._data = dict(data)
         self._blob_cache = {}
-        self._check_shipped(str(name))
         return self
-
-    def _check_shipped(self, where: str, data: Optional[Dict[str, Any]] = None) -> None:
-        """Refuse a shipped point that no longer matches its mode: a line
-        shorter than the mode's, a trigger frame below the rows, a mode
-        the personality's program does not offer, and a pair point that
-        adds nothing to the one-camera point on the same lanes (no trigger
-        frame, the same range at the same line: the pair line law derives
-        it)."""
-        data = self._data if data is None else data
-        modes = data.get("modes") or {}
-        for name, points in (data.get("shipped") or {}).items():
-            mode = modes.get(name)
-            if mode is None:
-                raise ContractError(f"{where}: shipped point for unknown mode {name!r}")
-            if mode.get("host_only"):
-                raise ContractError(
-                    f"{where}: mode {name!r} has no unit program and cannot "
-                    f"ship a point")
-            hmax = to_int((mode.get("timing") or {}).get("hmax", 0))
-            rows = to_int((mode.get("geometry") or {}).get("height", 0))
-            for point in points:
-                line = int(point["hmax"])
-                if line < hmax:
-                    raise ContractError(
-                        f"{where}: {name} ships HMAX {line}, shorter than "
-                        f"the mode's {hmax}")
-                frame = point.get("trigger_vmax")
-                if frame is not None and int(frame) < rows:
-                    raise ContractError(
-                        f"{where}: {name} ships trigger frame {frame} with "
-                        f"fewer lines than the mode's {rows} rows")
-            by_lanes: Dict[int, Dict[int, Dict[str, Any]]] = {}
-            for point in points:
-                by_lanes.setdefault(int(point["csi_lanes"]), {})[int(point["cameras"])] = point
-            for lanes, per_count in by_lanes.items():
-                solo, pair = per_count.get(1), per_count.get(2)
-                if (solo is not None and pair is not None
-                        and pair.get("trigger_vmax") is None
-                        and int(pair["hmax"]) == int(solo["hmax"])
-                        and pair["fps"] == solo["fps"]):
-                    raise ContractError(
-                        f"{where}: {name} ships a pair point on {lanes} CSI lanes "
-                        f"that adds nothing to its one-camera point (no trigger "
-                        f"frame, the same range at the same line); the pair line "
-                        f"law derives it")
 
     def _check_provenance(self, path: Path) -> None:
         """Every limit names its source; a limit without one, or a source without
@@ -401,7 +358,7 @@ class Descriptor:
 
     @property
     def limits_source(self) -> Dict[str, str]:
-        """Where each limit came from: datasheet, driver, measured, or experimental."""
+        """Where each limit came from: datasheet, driver, or experimental."""
         return {k: str(v)
                 for k, v in (self._data.get("limits_source") or {}).items()}
 
@@ -411,51 +368,22 @@ class Descriptor:
         return sorted(k for k, v in self.limits_source.items()
                       if v == "experimental")
 
-    def measured_limits(self) -> List[str]:
-        """Limits measured on a bench and shipped as facts."""
-        return sorted(k for k, v in self.limits_source.items()
-                      if v == "measured")
-
-    def shipped_points(self) -> Dict[str, List[Dict[str, Any]]]:
-        """The shipped points per mode: the fps range, line and trigger
-        frame each camera count and lane count ships."""
-        return {str(k): list(v) for k, v in (self._data.get("shipped") or {}).items()}
-
-    def for_cameras(self, cameras: int, csi_lanes: int,
-                    pair_lines: Optional[Dict[str, int]] = None) -> "Descriptor":
-        """The view a camera count runs: each mode's shipped line and
-        trigger frame over its timing (an overlay's stated key wins); self
-        without a point. `pair_lines` (mode -> hmax) are the lines the
-        hub's output leaves modes that ship a one-camera point only: each
-        becomes a derived pair point of the view, in its `shipped` and its
-        timing."""
-        from . import shipped as records
-
+    def at_lines(self, lines: Optional[Dict[str, int]]) -> "Descriptor":
+        """The view of a port that runs `lines` (mode -> HMAX): each named
+        mode's line laid over its timing, never shorter than the mode's
+        own; self when no line is longer than its mode's. A view carries
+        nothing else of the port, and a personality never compiles from
+        one (`product`)."""
         over: Dict[str, Any] = {}
-        points: Dict[str, List[Dict[str, Any]]] = {}
-        for name, mode in self.modes.items():
-            record = records.entry(self, name, cameras, int(csi_lanes))
-            if record is None and cameras == 2 and (pair_lines or {}).get(name):
-                record = records.derived_point(self, name, int(csi_lanes), int(pair_lines[name]))
-                if record is not None:
-                    points[name] = records.entries(self, name) + [record]
-            if record is None:
-                continue
-            stated = self._over_timing.get(name, set())
-            timing = mode.get("timing") or {}
-            point = {key: int(value)
-                     for key, value in records.operating_point(record).items()
-                     if key not in stated and timing.get(key) != int(value)}
-            if point:
-                over[name] = {"timing": point}
-        if not over and not points:
+        for name, line in (lines or {}).items():
+            timing = (self.modes.get(name) or {}).get("timing") or {}
+            if timing.get("hmax") is not None and int(line) > to_int(timing["hmax"]):
+                over[name] = {"timing": {"hmax": int(line)}}
+        if not over:
             return self
         view = copy.copy(self)
-        view._view = True
-        merged: Dict[str, Any] = {"modes": over}
-        if points:
-            merged["shipped"] = points
-        view._data = _deep_merge(self._data, merged)
+        view._plain = self._plain if self._plain is not None else self
+        view._data = _deep_merge(self._data, {"modes": over})
         return view
 
     @property
@@ -551,14 +479,15 @@ class Descriptor:
         """Return an arbitrary top-level section of the descriptor YAML."""
         return self._data.get(key)
 
-    def shipped(self) -> "Descriptor":
-        """The descriptor as the product ships it: this one without its
-        experimental overlay and without a port's view (itself when neither
-        is merged, or when a unit served it): what a personality compiles
-        from."""
-        if self._root is None or (self._overlay is None and not self._view):
-            return self
-        return Descriptor(self._root, None)
+    def product(self) -> "Descriptor":
+        """The descriptor as the product ships it: this one without a
+        port's view and without its experimental overlay (itself when
+        neither is merged, or when a unit served it): what a personality
+        compiles from."""
+        plain = self._plain if self._plain is not None else self
+        if plain._root is None or plain._overlay is None:
+            return plain
+        return Descriptor(plain._root, None)
 
     def digest(self) -> str:
         """A digest of every fact the descriptor holds (the merged data):

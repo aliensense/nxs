@@ -91,9 +91,13 @@ def node_row(node: Node, prefix: str, focused: bool) -> Row:
 
 
 def knob_row(knob: Knob, prefix: str, focused: bool) -> Row:
-    return [("→ " if focused else "  ", "accent"), (prefix, "rule"),
-            (f"{knob.name.lower():<{NAME_WIDTH}} ", "dim"),
-            (knob.value, "accent" if focused else "text")]
+    """A knob's name and value; a shipped value (a detent) reads `· shipped`."""
+    row: Row = [("→ " if focused else "  ", "accent"), (prefix, "rule"),
+                (f"{knob.name.lower():<{NAME_WIDTH}} ", "dim"),
+                (knob.value, "accent" if focused else "text")]
+    if knob.field.value in knob.field.detents:
+        row += [(" · ", "muted"), ("shipped", "muted")]
+    return row
 
 
 def findings_rows(findings) -> List[Row]:

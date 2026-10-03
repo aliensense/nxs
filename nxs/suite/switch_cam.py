@@ -1,11 +1,14 @@
 # Copyright (c) 2026 Aliensense.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The camera side of `nxs switch`: the host, each declared pod's
-personality, each port's boot table, the capture stack's configuration,
-then the ports themselves. Every step is idempotent and prints one line
-per thing it changed; a boot table that changed ends the run with
-`REBOOT NEEDED` (exit 3), because the ports come up on the booted table."""
+"""The camera side of `nxs switch`: the host and its camera buses, each
+declared pod's personality, each port's boot table, then the ports
+themselves, whose `on` builds the capture stack's configuration the
+booted table lacks. Every step is idempotent and prints one line per
+thing it changed; a boot entry that changed ends the run with `REBOOT
+NEEDED` (exit 3), because the ports come up on the booted table, and on
+the camera buses the boot entry brings up, and so does a port whose `on`
+in nxsd stopped for a reboot (the daemon's verdict)."""
 
 from __future__ import annotations
 
@@ -13,7 +16,7 @@ import argparse
 import os
 import subprocess
 import time
-from typing import Callable, List
+from typing import Callable, List, Optional
 
 from nxs import host as host_layer
 from nxs.cam.contracts import InfeasibleConfig
@@ -27,7 +30,8 @@ NXSD_UNIT_PATH = "/etc/systemd/system/nxsd.service"
 #: bring-up is under a minute) and how often the record is read meanwhile.
 NXSD_CONVERGE_TIMEOUT_S = 120.0
 NXSD_POLL_S = 2.0
-#: The group that owns the I²C devices on the host, and with it the store.
+#: The group that owns the I²C devices on the host, and with them the store
+#: and the declaration's directory.
 STATE_GROUP = "i2c"
 
 Log = Callable[[str], None]
@@ -46,20 +50,28 @@ def _write(target: str, text: str) -> bool:
 
 
 def host_step(dry_run: bool) -> List[str]:
-    """The host's part: the state store, the bus rules, the capture daemon's
-    quiet, the completion file, the nxsd unit. Returns what changed."""
+    """The host's part: the state store, the declaration's directory on a
+    host whose declaration is the system one, the bus rules, the capture
+    daemon's quiet, the completion file, the nxsd unit. Returns what
+    changed."""
+    from nxs import suite
     from nxs.setup_cli import COMPLETION_TARGET, completion_text
 
     host = host_layer.current()
     done: List[str] = []
     would = "would " if dry_run else ""
-    if not (os.path.isdir(STATE_DIR) and os.access(STATE_DIR, os.W_OK)):
+    if not _writable(STATE_DIR):
         if not dry_run:
-            group = ["-g", STATE_GROUP] if _group_exists(STATE_GROUP) else []
-            root.run(["install", "-d", "-m", "2775", *group, STATE_DIR])
-            root.run(["install", "-d", "-m", "2775", *group, os.path.join(STATE_DIR, "cam")])
+            make_group_dir(STATE_DIR)
+            make_group_dir(os.path.join(STATE_DIR, "cam"))
         done.append(f"{would}create the state store {STATE_DIR}" if dry_run
                     else f"state store {STATE_DIR}")
+    declaration_dir = os.path.dirname(suite._SYSTEM_CONFIG)
+    if host.keeps_system_declaration() and not _writable(declaration_dir):
+        if not dry_run:
+            make_group_dir(declaration_dir)
+        done.append(f"{would}create the declaration directory {declaration_dir}" if dry_run
+                    else f"declaration directory {declaration_dir}")
     rules = host.bus_rules()
     if rules is not None:
         text = rules.read_text()
@@ -87,6 +99,17 @@ def host_step(dry_run: bool) -> List[str]:
         done.append(f"{would}tab completion installed")
     done.extend(_daemon_step(host, dry_run))
     return done
+
+
+def make_group_dir(path: str) -> None:
+    """Create `path` under root for the I²C group: mode 2775, so the group
+    writes it and what lands in it keeps the group."""
+    group = ["-g", STATE_GROUP] if _group_exists(STATE_GROUP) else []
+    root.run(["install", "-d", "-m", "2775", *group, path])
+
+
+def _writable(path: str) -> bool:
+    return os.path.isdir(path) and os.access(path, os.W_OK)
 
 
 def _group_exists(name: str) -> bool:
@@ -123,8 +146,9 @@ def daemon_step(cfg, dry_run: bool, log: Log) -> int:
     the manifest only): one of another build than this tool's restarts
     onto the installed wheel, and the step waits for the restarted daemon
     to record its build, which it does once its ports are constructed,
-    since the pod steps reach a unit only through its port. 0, or 1 with
-    the fact when the restarted daemon does not come back."""
+    since the pod steps reach a unit only through its port. 0; 3 when the
+    restarted daemon's `on` of a port stops for a reboot; 1 with the fact
+    when the daemon does not come back or refuses a port."""
     from nxs.cli import _git_version
     from nxs.daemon import running_build
 
@@ -137,6 +161,7 @@ def daemon_step(cfg, dry_run: bool, log: Log) -> int:
     if dry_run:
         log(f"host: would restart nxsd ({was} -> {mine})")
         return 0
+    since = time.time()
     root.run(["systemctl", "restart", NXSD_UNIT])
     log(f"host: nxsd restarted ({was} -> {mine})")
     deadline = time.monotonic() + NXSD_CONVERGE_TIMEOUT_S
@@ -146,7 +171,7 @@ def daemon_step(cfg, dry_run: bool, log: Log) -> int:
                 f"{NXSD_CONVERGE_TIMEOUT_S:g} s\n  - journalctl -u nxsd")
             return 1
         time.sleep(NXSD_POLL_S)
-    return _wait_for_nxsd(_owned_ports(cfg), log)
+    return _wait_for_nxsd(_owned_ports(cfg), log, since)
 
 
 def _systemctl(*argv: str) -> bool:
@@ -165,8 +190,9 @@ def nxsd_active() -> bool:
 
 
 def _port_args(name: str) -> argparse.Namespace:
+    """`nxs <port> on` as `switch` runs it inside its own report."""
     return argparse.Namespace(topology=None, port=name, links=[], mode=None, fps=None,
-                              sensor=None, dry_run=False, cam_cmd="on")
+                              sensor=None, dry_run=False, cam_cmd="on", inner=True)
 
 
 def _owned_ports(cfg) -> List[str]:
@@ -175,13 +201,48 @@ def _owned_ports(cfg) -> List[str]:
     return [name for name in sorted(cfg.ports) if _owned(cfg.ports[name])]
 
 
-def pods_step(cfg, dry_run: bool, log: Log) -> List[str]:
-    """Every declared pod holds its link's declared personality after this;
-    a pod the host cannot reach yet (two pods behind one hub answer apart
-    only through the aliases `on` programs) is left to `on`."""
+def laws_step(cfg) -> None:
+    """The ports this tool owns judged whole by the laws `nxs status` runs,
+    before a step brings a pod, the boot table or a port to them: a finding
+    ends the run with its lines. The findings that hold the declaration
+    against the booted tree are left out, since the boot table step writes
+    that tree; a unit's own findings fail that unit alone, in its step, and
+    a port the tool does not own (a kernel-driven hub's) is no step's here,
+    so its findings stop nothing: `nxs status` names them."""
+    from nxs.check import check_config
+
+    owned = set(_owned_ports(cfg))
+    refused = [finding for finding in check_config(cfg, booted=False)
+               if _port_of(finding) in owned]
+    if refused:
+        raise StepFailed("\n".join(refused))
+
+
+def _port_of(finding) -> Optional[str]:
+    """The port a finding names (`ports.cam0.sync.fps` names cam0), else None."""
+    head, _, rest = finding.where.partition(".")
+    return rest.split(".", 1)[0] if head == "ports" and rest else None
+
+
+def _refusal(name: str, exc: InfeasibleConfig) -> str:
+    """A law's refusal on a port as the step's error line: the fact, then
+    its alternatives."""
+    return "\n".join([f"{name}: {exc.reason}", *(f"  - {alt}" for alt in exc.alternatives)])
+
+
+def pods_step(cfg, dry_run: bool) -> List[str]:
+    """Every declared pod holds its link's declared personality after this.
+    A pod silent at its alias sits behind a hub that lost the aliases `on`
+    maps (a power cycle) or never had them, whatever the port's record says:
+    its port comes up again, which maps them. A pod alone behind its hub is
+    looked for where it straps and brought to the declaration there; two
+    pods strap one address and answer there as one through every runtime
+    window, so theirs are left to the port's walk, which maps each alias
+    through its own link before it reaches the pod."""
     from nxs.cam import pods, port_state
     from nxs.cam import run as cam_run
     from nxs.cam.select import _pack_for, select_port_links
+    from nxs.client import DeviceRefused
     from nxs.suite.scan import scan_bus_units
     from nxs.transports import open_client
 
@@ -196,35 +257,56 @@ def pods_step(cfg, dry_run: bool, log: Log) -> List[str]:
         if not pod_links:
             continue
         names = {l.name: (l.unit.name if l.unit else None) for l in port.links}
-        with port_state.BusLock():
+        # Two pods behind one hub strap one address: only their aliases tell them apart.
+        shared = not topology.is_direct and sum(1 for l in links if l.nxs_units) > 1
+        try:
+            lock = port_state.BusLock()
+            with port_state.held_wait():
+                lock.__enter__()
+        except port_state.BusHeld as exc:
+            raise StepFailed(_bus_held(name)) from exc
+        with lock:
             i2c = cam_run.CamI2c(addr=hex(topology.des_addr), bus=topology.i2c_bus)
             try:
                 i2c.open()
                 for link in pod_links:
-                    alias = int(link.nxs_units[0].alias_addr)
-                    candidates = (alias,) if len(pod_links) > 1 else (alias, 0x30)
+                    unit = link.nxs_units[0]
+                    alias, strapped = int(unit.alias_addr), int(unit.target_addr)
+                    who = names.get(link.name) or f"@{alias:#04x}"
+                    candidates = (alias,) if shared else tuple(dict.fromkeys((alias, strapped)))
                     if not topology.is_direct:
                         flows.open_window(pack, i2c, topology, link)
                     hit = next(iter(scan_bus_units(topology.i2c_bus, candidates)), None)
+                    if hit is None and shared:
+                        lines.append(f"{name}/{link.name}: pod {who} does not answer at its alias "
+                                     f"{alias:#04x}; the port comes up to map it")
+                        continue
                     if hit is None:
-                        if len(pod_links) > 1 and port_state.link_state(topology, link) \
-                                != port_state.STATE_UP:
-                            continue        # `on` maps it, then brings it here
-                        raise StepFailed(f"{name}/{link.name}: no pod answers at "
-                                         f"{alias:#04x} ({names.get(link.name) or 'the pod'})")
+                        where = " or at ".join(f"{a:#04x}" for a in candidates)
+                        raise StepFailed(f"{name}/{link.name}: no pod answers at {where} "
+                                         f"({names.get(link.name) or 'the pod'})")
                     client = open_client(hit.link.transport, **hit.link.client_kwargs())
                     try:
                         line = pods.converge(client, pack, topology, link,
-                                             unit_name=names.get(link.name),
-                                             dry_run=dry_run, log=log)
+                                             unit_name=names.get(link.name), dry_run=dry_run)
+                    except DeviceRefused as exc:
+                        # The pod answered: its refusal is the line, never a silent hub.
+                        raise StepFailed(f"{name}/{link.name}: pod {who}: {exc}") from exc
                     finally:
                         client.close()
                     if line:
                         lines.append(line)
+                    if (found := int(hit.link.address)) != alias:
+                        lines.append(f"{name}/{link.name}: pod {who} answers at {found:#04x}, not at "
+                                     f"its alias {alias:#04x}; the port comes up to map it")
                 if not topology.is_direct:
                     flows.close_windows(pack, i2c, topology)
             except StepFailed:
                 raise
+            except InfeasibleConfig as exc:
+                raise StepFailed(_refusal(name, exc)) from exc
+            except (pods.PodSilent, pods.PodRefused) as exc:
+                raise StepFailed(str(exc)) from exc
             except (OSError, RuntimeError) as exc:
                 raise StepFailed(f"{name}: the hub does not answer at "
                                  f"{topology.des_addr:#04x} ({exc})") from exc
@@ -233,14 +315,16 @@ def pods_step(cfg, dry_run: bool, log: Log) -> List[str]:
     return lines
 
 
-def boot_table_step(cfg, dry_run: bool, log: Log) -> bool:
-    """Every owned port's boot table carries its declared modes after this.
-    Returns True when a table was (or would be) installed: a reboot is
-    needed before the ports can come up."""
+def boot_table_step(cfg, dry_run: bool, log: Log, fdt: Optional[str] = None) -> bool:
+    """Every owned port's boot table carries its declared modes after this,
+    `fdt` naming the base device tree the boot entry takes, and the boot
+    entry names no overlay of a port the manifest does not declare (a line
+    for each one dropped). Returns True when a table was (or would be)
+    installed: a reboot is needed before the ports can come up."""
     from nxs.cam.identity import _declared_camera
     from nxs.cam.run import _resolve_modes
     from nxs.cam.select import _declare, _pack_for, select_port_links
-    from nxs.host.cli import reboot_rule
+    from nxs.host.cli import BootTableRefused, reboot_rule
 
     host = host_layer.current()
     reboot = False
@@ -248,26 +332,37 @@ def boot_table_step(cfg, dry_run: bool, log: Log) -> bool:
         args = _port_args(name)
         topology, links = select_port_links(args, require_port=True)
         pack = _pack_for(topology)
-        topology, links, modes = _declare(pack, topology, links, args)
-        modes = _declared_camera(pack, topology, links, modes, args)
-        cameras = [l for l in links if l.has_camera]
-        if not cameras:
-            continue        # a pod alone streams no video: no boot table
-        planned = _resolve_modes(pack.flows(), pack, cameras, modes, topology)
-        vcs = {l.name: int(l.csi_vc) for l in cameras}
-        text = reboot_rule(host, pack, topology, cameras, planned,
-                           install_overlays=not dry_run, vcs=vcs)
+        reports: List[str] = []
+        try:
+            topology, links, modes = _declare(pack, topology, links, args)
+            modes = _declared_camera(pack, topology, links, modes, args)
+            cameras = [l for l in links if l.has_camera]
+            if not cameras:
+                continue        # a pod alone streams no video: no boot table
+            planned = _resolve_modes(pack.flows(), pack, cameras, modes, topology)
+            vcs = {l.name: int(l.csi_vc) for l in cameras}
+            text = reboot_rule(host, pack, topology, cameras, planned,
+                               install_overlays=not dry_run, vcs=vcs, declared=sorted(cfg.ports),
+                               fdt=fdt, report=reports.append)
+        except InfeasibleConfig as exc:
+            raise StepFailed(_refusal(name, exc)) from exc
+        except BootTableRefused as exc:
+            raise StepFailed(f"{name}: {exc}") from exc
         if text:
             log(f"{name}: boot table {'would be ' if dry_run else ''}installed")
+            for line in reports:
+                log(f"{name}: {line}")
             reboot = True
     return reboot
 
 
-def capture_stack_step(cfg, dry_run: bool, log: Log) -> None:
-    """Every owned port's capture-stack configuration is built for the
-    booted table after this; a build that fails ends the run."""
+def capture_stack_step(cfg, log: Log) -> None:
+    """The capture stack's configuration for the booted table is the port's
+    to build: its `on` makes it once the bring-up walk has the heads
+    streaming, so a port without one comes up in `ports_step`. This step
+    says so, or that another run is building it."""
     from nxs.cam.select import select_port_links
-    from nxs.host.cli import TuningRefused, ensure_tuning, preparing_marker
+    from nxs.host.cli import capture_stack_state, preparing_marker
 
     host = host_layer.current()
     for name in _owned_ports(cfg):
@@ -276,31 +371,31 @@ def capture_stack_step(cfg, dry_run: bool, log: Log) -> None:
             continue        # a pod alone streams no video: no tuning
         if preparing_marker(name).is_file():
             log(f"{name}: preparing the capture stack (nxsd)")
-            continue
-        if dry_run:
-            continue
-        try:
-            done = ensure_tuning(host, topology, log=log)
-        except TuningRefused as exc:
-            raise StepFailed(f"{name}: {exc}") from exc
-        except (RuntimeError, PermissionError) as exc:
-            raise StepFailed(f"{name}: the capture stack's configuration was not built "
-                             f"({exc})") from exc
-        if done:
-            log(f"{name}: capture stack configured")
+        elif capture_stack_state(host, name, topology) == "missing":
+            log(f"{name}: the capture stack's configuration is built when the port comes up")
 
 
 def _port_is_up(name: str) -> bool:
-    """Whether every declared link of the port is recorded up with the
-    declared sensor and mode: a converged port is left as it runs, a
-    port whose declaration moved comes up again."""
+    """Whether the port runs its declaration: the record carries the
+    declaration the manifest makes now (`declared`, one digest of every
+    key that shapes the port), every declared link is recorded up with
+    the declared sensor and mode, and the capture stack holds a
+    configuration for the booted table. A converged port is left as it
+    runs; a port whose declaration moved in any key comes up again, and
+    so does a port whose record names no declaration or whose capture
+    stack has no configuration (its `on` builds it after the walk)."""
     from nxs.cam import port_state
     from nxs.cam.select import select_port_links
+    from nxs.host.cli import capture_stack_state
 
     topology, links = select_port_links(_port_args(name), require_port=True)
     if not links:
         return False
     record = port_state.port_record(topology)
+    if record.get("declared") != topology.declared:
+        return False
+    if topology.camera_links and capture_stack_state(host_layer.current(), name, topology) == "missing":
+        return False
     sensors = record.get("sensors") or {}
     modes = record.get("modes") or {}
     for link in links:
@@ -313,22 +408,27 @@ def _port_is_up(name: str) -> bool:
     return True
 
 
-def ports_step(cfg, dry_run: bool, log: Log, again=()) -> int:
+def ports_step(cfg, dry_run: bool, log: Log, again=(), daemon: bool = True) -> int:
     """The owned ports come up: through the daemon when it runs (a reload),
-    else here; a port whose declared links are up is left as it runs,
-    unless it is named in ``again`` (a pod behind it took a new build,
-    and the port runs the old program until it comes up again).
-    Returns 0, or the first port's failure."""
+    else here; a port up under its declaration is left as it runs, unless
+    it is named in ``again`` (a pod behind it took a new build, and the
+    port runs the old program until it comes up again, or its hub lost the
+    aliases the bring-up maps). Returns 0, 3 when nxsd's `on` of a port
+    stopped for a reboot, or the first port's failure."""
     from nxs.cam import cli as cam_cli
 
     owned = [name for name in _owned_ports(cfg) if name in again or not _port_is_up(name)]
     if not owned:
         return 0
-    if nxsd_active():
+    if daemon and nxsd_active():
+        since = time.time()
         if not dry_run:
+            # The record of a port named again says it runs its declaration,
+            # which a reload leaves as it runs: it is recorded down first.
+            _record_down([name for name in owned if name in again])
             root.run(["systemctl", "kill", "-s", "HUP", NXSD_UNIT])
         log(f"{', '.join(owned)}: nxsd {'would reconverge' if dry_run else 'reconverging'}")
-        return 0 if dry_run else _wait_for_nxsd(owned, log)
+        return 0 if dry_run else _wait_for_nxsd(owned, log, since)
     rc = 0
     for name in owned:
         if dry_run:
@@ -347,16 +447,85 @@ def ports_step(cfg, dry_run: bool, log: Log, again=()) -> int:
     return rc
 
 
-def _wait_for_nxsd(owned: List[str], log: Log) -> int:
-    """Wait until the daemon records every owned port up: the units behind
-    a port answer only through the port it is rebuilding, and the unit
-    steps follow. 1 with the fact when the deadline passes."""
+def _bus_held(name: str) -> str:
+    """The line for a port's bus another run held past the wait: `nxsd`
+    holds it for a bring-up it runs on its own, after a hub power cycle."""
+    from nxs.cam import port_state
+
+    return (f"{name}: another nxs run holds the bus after {port_state.HELD_WAIT_S:g} s of waiting "
+            f"(nxsd brings a port up after boot and after a hub power cycle)\n"
+            f"  - nxs {name} status\n  - nxs switch")
+
+
+def bring_up_wait_step(cfg, log: Log) -> int:
+    """Wait out a bring-up the daemon runs on its own: after a hub power
+    cycle its watch brings the port up again, and the port's verdict reads
+    `bringing up` from the start of that `on` to its end, which holds the
+    bus for the walk. The steps that read the pods follow the verdict.
+    Returns 0, or the verdict's status as `_wait_for_nxsd` ends on it."""
+    from nxs.daemon import BRINGING_UP, port_verdict
+
+    if not nxsd_active():
+        return 0
+    pending, since = [], None
+    for name in _owned_ports(cfg):
+        verdict = port_verdict(name)
+        if verdict is not None and verdict["verdict"] == BRINGING_UP:
+            pending.append(name)
+            since = verdict["at"] if since is None else min(since, verdict["at"])
+    if not pending:
+        return 0
+    log(f"{', '.join(pending)}: nxsd is bringing the port up; waiting for it")
+    return _wait_for_nxsd(pending, log, since)
+
+
+def _record_down(names: List[str]) -> None:
+    """Record every link of each named port neither up nor parked: the
+    reload brings such a port up, and the wait reads its record."""
+    from nxs.cam import port_state
+    from nxs.cam.select import select_port_links
+
+    for name in names:
+        topology, links = select_port_links(_port_args(name), require_port=True)
+        port_state.mark_unknown(topology, links)
+
+
+def _wait_for_nxsd(owned: List[str], log: Log, since: float) -> int:
+    """Wait until the daemon's `on` of every owned port ends up: the units
+    behind a port answer only through the port it is rebuilding, and the
+    unit steps follow. The port's record says up when the walk ends, before
+    its `on` does (the video lock, a synced pair's pod runs, the capture
+    stack's build and the delivery check follow it), and a unit read then
+    meets a pod bus a camera run holds: the wait ends on the daemon's
+    verdict, recorded after `since`, with the record up. A port whose `on`
+    stopped short ends the wait with the daemon's lines: `REBOOT NEEDED`
+    and 3, or its refusal and 1. 1 with the fact when the deadline
+    passes."""
+    from nxs.daemon import BRINGING_UP, port_verdict
+
+    def done(name: str) -> bool:
+        verdict = port_verdict(name)
+        return (verdict is not None and verdict["at"] >= since and verdict["verdict"] == "up"
+                and _port_is_up(name))
+
     deadline = time.monotonic() + NXSD_CONVERGE_TIMEOUT_S
     pending = list(owned)
     while True:
-        pending = [name for name in pending if not _port_is_up(name)]
+        pending = [name for name in pending if not done(name)]
         if not pending:
             return 0
+        # A verdict older than the restart or the reload is another run's.
+        stopped = [verdict for verdict in map(port_verdict, pending)
+                   if verdict is not None and verdict["at"] >= since
+                   and verdict["verdict"] not in ("up", BRINGING_UP)]
+        if stopped:
+            for verdict in stopped:
+                for line in verdict["lines"]:
+                    log(line)
+            if any(verdict["verdict"] != "reboot needed" for verdict in stopped):
+                return 1
+            log("REBOOT NEEDED")
+            return 3
         if time.monotonic() >= deadline:
             log(f"{', '.join(pending)}: nxsd did not bring the port up in "
                 f"{NXSD_CONVERGE_TIMEOUT_S:g} s")
@@ -366,34 +535,84 @@ def _wait_for_nxsd(owned: List[str], log: Log) -> int:
 
 
 def kernel_step(cfg, host) -> None:
-    """A declared camera port needs the host's camera kernel package for the
-    booted kernel; a rig of pods alone needs none."""
-    if not any(getattr(link, "camera", None) for port in cfg.ports.values()
-               for link in (getattr(port, "links", None) or [])):
-        return
-    missing = host.kernel_package_missing()
+    """The host's camera kernel package: the camera buses boot from its
+    overlay, declaration or not, and a declared camera port needs its
+    modules for the booted kernel. A rig of pods alone needs the overlay
+    only; `cfg` is None before anything is declared."""
+    missing = host.camera_bus_package_missing()
+    if missing is None and cfg is not None and any(
+            getattr(link, "camera", None) for port in cfg.ports.values()
+            for link in (getattr(port, "links", None) or [])):
+        missing = host.kernel_package_missing()
     if missing:
         raise StepFailed(f"{missing}\n  - {host.kernel_package_next()}")
 
 
-def camera_steps(cfg, *, dry_run: bool = False, log: Log = print) -> int:
-    """Run the camera steps in order; 0 when every port is up, 3 when a
-    reboot is needed first, 1 when a step failed (its line printed)."""
+def camera_bus_step(host, dry_run: bool, fdt: Optional[str], log: Log) -> bool:
+    """A host whose booted tree has no camera bus gets the boot entry that
+    boots them: every port rides one, and a pod alone answers only there.
+    True when the entry was (or would be) written, or waits for its reboot;
+    an entry that booted and brought up no bus is the host's refusal, since
+    another reboot would boot the same."""
+    from nxs.host.cli import boot_write_refusal
+
+    if not host.camera_bus_missing():
+        return False
     try:
-        kernel_step(cfg, host_layer.current())
+        lines = host.install_camera_buses(fdt=fdt, dry_run=dry_run)
+    except PermissionError as exc:
+        raise StepFailed(f"host: {boot_write_refusal(exc)}") from exc
+    except RuntimeError as exc:
+        raise StepFailed(f"host: {exc}") from exc
+    for line in lines:
+        log(f"host: {line}")
+    return True
+
+
+def daemon_reads(config_path: Optional[str]) -> bool:
+    """Whether nxsd reads the declaration at `config_path`: it runs as
+    root, so it reads the system manifest (None: the caller's own)."""
+    from nxs import suite
+
+    return config_path is None or os.path.abspath(config_path) == os.path.abspath(suite._SYSTEM_CONFIG)
+
+
+def camera_steps(cfg, *, dry_run: bool = False, fdt: Optional[str] = None,
+                 log: Log = print, config_path: Optional[str] = None) -> int:
+    """Run the camera steps in order; 0 when every port is up, 3 when a
+    reboot is needed first, 1 when a step failed or the laws refuse the
+    declaration's ports before any step brings them up (its lines printed).
+    Without a declaration (`cfg` None) the host's steps run alone, and 0
+    says the host is ready for one. `fdt` names the base device tree a
+    boot entry the steps write takes. A declaration nxsd does not read
+    (`config_path` outside the system manifest) comes up here, never
+    through the daemon."""
+    try:
+        host = host_layer.current()
+        kernel_step(cfg, host)
         for line in host_step(dry_run):
             log(f"host: {line}")
-        if daemon_step(cfg, dry_run, log) != 0:
-            return 1
-        uploaded = set()
-        for line in pods_step(cfg, dry_run, log):
-            log(line)
-            uploaded.add(line.split("/", 1)[0])
-        if boot_table_step(cfg, dry_run, log):
+        if camera_bus_step(host, dry_run, fdt, log):
             log("REBOOT NEEDED")
             return 3
-        capture_stack_step(cfg, dry_run, log)
-        return ports_step(cfg, dry_run, log, again=uploaded)
+        if cfg is None:
+            return 0
+        laws_step(cfg)
+        daemon = daemon_reads(config_path)
+        rc = daemon_step(cfg, dry_run, log) if daemon else 0
+        if rc == 0 and daemon:
+            rc = bring_up_wait_step(cfg, log)
+        if rc != 0:
+            return rc
+        again = set()
+        for line in pods_step(cfg, dry_run):
+            log(line)
+            again.add(line.split("/", 1)[0])
+        if boot_table_step(cfg, dry_run, log, fdt):
+            log("REBOOT NEEDED")
+            return 3
+        capture_stack_step(cfg, log)
+        return ports_step(cfg, dry_run, log, again=again, daemon=daemon)
     except (StepFailed, root.RootRefused) as exc:
         log(str(exc))
         return 1

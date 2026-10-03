@@ -5,7 +5,7 @@
 capture node per link the ports' records carry. The GStreamer camera node
 runs the capture source the tool's own viewers use, on every host that
 has it; the Isaac ROS Argus node is the alternative where that package is
-installed."""
+installed, on a link that is not a synced pair's."""
 
 from __future__ import annotations
 
@@ -28,6 +28,12 @@ class CameraTopic:
     exposure_max_us: Optional[float] = None
     #: The exposure a trigger's pulse fixes, in microseconds; None when free-running.
     exposure_us: Optional[float] = None
+    #: The link's part in a synced pair's one exposure and gain (`leader`,
+    #: `follower`, `locked`), the pair's other link, and a locked link's
+    #: gain; None where the link runs its own loop.
+    ae_role: Optional[str] = None
+    ae_peer: Optional[str] = None
+    gain_db: Optional[float] = None
 
     def namespace(self, topic_base: str = "nxs") -> str:
         """The topic namespace: `/<base>/<port>/<link>`."""
@@ -64,7 +70,8 @@ def camera_plan() -> List[CameraTopic]:
                                    int(resolved["height"]), resolved.get("framerate"),
                                    resolved.get("exposure_min_us"),
                                    resolved.get("exposure_max_us"),
-                                   resolved.get("exposure_us")))
+                                   resolved.get("exposure_us"), resolved.get("ae_role"),
+                                   resolved.get("ae_peer"), resolved.get("gain_db")))
     return out
 
 
@@ -83,19 +90,16 @@ CAMERA_ENCODINGS = ("yuv422", "mono8", "rgb8", "jpeg")
 
 def gscam_pipeline(topic: CameraTopic, host=None, encoding: str = CAMERA_ENCODINGS[0]) -> str:
     """The link's capture source into system memory in the encoding, for the
-    GStreamer camera node to publish: the viewer's source and caps, the
-    row's exposure range included. The description ends on an element: the
-    node appends its own sink and sets the encoding's caps on it."""
+    GStreamer camera node to publish: the viewer's source, caps and source
+    properties (`nxs.cam.viewers.source_props`). The description ends on an
+    element: the node appends its own sink and sets the encoding's caps on
+    it."""
     from nxs import host as host_layer
+    from nxs.cam.viewers import source_props
 
     host = host or host_layer.current()
-    props = ""
-    if topic.exposure_us is not None:
-        # A trigger's pulse fixes the exposure: pinned, so the capture
-        # stack's loop drives gain alone, as the viewers do.
-        props = " " + host.exposure_props(topic.exposure_us)
-    elif topic.exposure_max_us is not None:
-        props = " " + host.ae_props(topic.exposure_min_us, topic.exposure_max_us)
+    props = source_props(dataclasses.asdict(topic), host, port=topic.port)
+    props = f" {props}" if props else ""
     return (f"{host.source(topic.capture_id, topic.sensor_mode)}{props} ! "
             f"{host.caps(topic.width, topic.height, topic.framerate)} ! "
             f"{host.topic_convert(encoding)}")
@@ -135,7 +139,17 @@ def gscam_node(topic: CameraTopic, topic_base: str = "nxs", host=None,
 
 def argus_node(topic: CameraTopic, topic_base: str = "nxs") -> Dict[str, Any]:
     """The Isaac ROS Argus mono node for a link: its component, parameters
-    and the remappings onto the link's namespace."""
+    and the remappings onto the link's namespace.
+
+    Raises:
+        ValueError: The link is one of a synced pair's: its capture session
+            runs the pair's exposure and gain, which the node's parameters
+            cannot set.
+    """
+    if topic.ae_role:
+        raise ValueError(f"{topic.port}/{topic.link}: a synced pair's link locks its capture "
+                         f"session, and the Argus node takes no exposure or gain; "
+                         f"camera_source:=gstreamer")
     namespace = topic.namespace(topic_base)
     frame = f"{topic.port}_{topic.link}"
     return {

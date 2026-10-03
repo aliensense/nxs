@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 from types import SimpleNamespace
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 
 from nxs import term
@@ -15,11 +15,14 @@ from nxs.cam.plan import flatten
 from nxs.cam import port_state
 from nxs.cam import packs, unit_source
 from nxs.cam import run as cam_run
+from nxs.cam import timing as cam_timing
 from nxs.cam.identity import _require_nxs_hub
 from nxs.cam.run import _accepted
 from nxs.cam.select import _pack_for, _port_name, _refuse, _refuse_pod_only, _require_up, print_stream, select_port_links
+from nxs.cam.verbs import verify
 from nxs.cam.verbs.caps import _camera_knobs, _hub_fsync_rate
-from nxs.cam.verbs.sync import _budget_warning, _fsync_plan, _record_sync, plan_text, sync_text
+from nxs.cam.verbs.sync import (LOOP_EXPOSURE, _fsync_plan, _record_hints, _record_sync, pair_gain_fact,
+                                plan_text, pulse_exposure_fact, pulse_sets_exposure, sync_text)
 
 
 def _sensor_readings(pack, topology: Topology, link) -> Dict[str, int]:
@@ -48,20 +51,41 @@ def _sensor_readings(pack, topology: Topology, link) -> Dict[str, int]:
 def cmd_set(args: argparse.Namespace) -> int:
     """`set NAME VALUE`: `sync` is the port's frame sync (`fsync` starts the
     hub's generator, `free_run` stops it); every other knob is the link's
-    sensor's, composed under the pack's laws."""
+    sensor's, composed under the pack's laws. Every refusal starts with the
+    port's name, the laws' own included; the delivery check's name it
+    already."""
     topology, _ = select_port_links(args)
     _require_nxs_hub(topology, "set")
+    # The laws judge a knob at the line the delivery check found for the port.
+    topology = port_state.with_found_lines(topology)
     pack = _pack_for(topology)
-    flows = pack.flows()
+    try:
+        return _set(args, topology, pack, pack.flows())
+    except InfeasibleConfig as exc:
+        port = _port_name(topology)
+        named = exc.reason.startswith((f"{port}:", f"{port}/"))
+        raise InfeasibleConfig(exc.reason if named else f"{port}: {exc.reason}",
+                               alternatives=exc.alternatives)
+
+
+def _set(args: argparse.Namespace, topology: Topology, pack, flows) -> int:
+    """`set` on the port: the sync, else a link's knob."""
     if args.knob == "sync":
         return _set_sync(args, topology, pack, flows)
-    if args.knob == "exposure":
-        sync = port_state.port_sync(topology) or {}
-        if sync.get("source") == "fsync":
-            port = _port_name(topology)
-            raise _refuse(
-                f"{port}: under frame sync the exposure is the trigger pulse's low time",
-                f"nxs {port} set sync fsync --fps {sync.get('fps', '<fps>')} --exposure <us>")
+    if args.knob == "exposure" and pulse_sets_exposure(topology, args.link or topology.links[0].name):
+        # A synced link's exposure is its trigger pulse's; a link the trigger
+        # leaves free-running keeps its own.
+        port = _port_name(topology)
+        fps = (port_state.port_sync(topology) or {}).get("fps")
+        raise InfeasibleConfig(pulse_exposure_fact(fps),
+                               alternatives=[f"nxs {port} set sync free_run"]
+                               + _fastest(pack, topology, _running_modes(topology), fps))
+    pair_gain = pair_gain_fact(topology) if args.knob in ("gain", "gain_db") else None
+    if pair_gain:
+        # A gain set by hand leaves the pair's one gain: the leader's loop or
+        # the follower moves it back, or it breaks the declared lock.
+        raise InfeasibleConfig(pair_gain, alternatives=[
+            f"ports.{_port_name(topology)}.camera.gain_db: <dB> in suite.yaml, then nxs switch"])
     if args.link is None and len(topology.links) > 1:
         names = "|".join(l.name for l in topology.links)
         raise _refuse(
@@ -80,10 +104,10 @@ def cmd_set(args: argparse.Namespace) -> int:
     if "mode" in inspect.signature(flows.build_knob).parameters:
         extra["mode"] = port_state.port_mode(topology, link_spec)
 
-    def compose(readings):
+    def compose(readings, value=args.value):
         try:
             return flows.build_knob(
-                pack, topology, args.knob, args.value,
+                pack, topology, args.knob, value,
                 link=args.link, readings=readings, **extra,
             )
         except KeyError as exc:
@@ -112,14 +136,75 @@ def cmd_set(args: argparse.Namespace) -> int:
         cfg = compose(_sensor_readings(pack, topology, link_spec))
         ok = cam_run._execute(cfg.to_dict(), topology.i2c_bus, f"set-{args.knob}",
                       guard=(pack, topology))
+    if ok and args.knob == "fps":
+        _hold_rate(args, topology, pack, flows, link_spec, compose)
     return 0 if ok else 1
 
 
+def _record_rate(pack, flows, topology: Topology, link, fps: float) -> None:
+    """Record the rate a link's sensor now runs and re-derive the caps the
+    capture stack's sessions open with, each link's part in the exposure
+    and gain the recorded sync names kept."""
+    port_state.set_rates(topology, {link.name: fps})
+    sync = port_state.port_sync(topology) or {}
+    triggered = sync.get("source") == "fsync"
+    _record_hints(pack, flows, topology, triggered,
+                  sync.get("trigger_vmax") if triggered else None, ae=sync.get("ae"))
+
+
+def _hold_rate(args: argparse.Namespace, topology: Topology, pack, flows, link,
+               compose) -> None:
+    """`set fps` holds the link to the rate it asked. The rate and the caps
+    are recorded before the count, since the capture stack's driver sets
+    the frame from the caps' rate when a session starts (caveat C-024); a
+    rate the link does not deliver is refused with the previous rate
+    written back and recorded."""
+    port = _port_name(topology)
+    previous = port_state.port_rate(topology, link)
+    _record_rate(pack, flows, topology, link, float(args.value))
+    at = f" {link.name}" if args.link else ""
+    try:
+        verify.check(pack, topology, [link], retry=f"nxs {port}{at} set fps {{fps}}")
+    except InfeasibleConfig:
+        if previous is not None:
+            with port_state.BusLock():
+                cfg = compose(_sensor_readings(pack, topology, link), str(previous))
+                back = cam_run._execute(cfg.to_dict(), topology.i2c_bus, "set-fps",
+                                        guard=(pack, topology))
+            if back:
+                _record_rate(pack, flows, topology, link, previous)
+                term.info(f"{port}/{link.name}: back at {previous:g} fps")
+        raise
+
+
+def _crop_lines(flows, topology: Topology) -> List[str]:
+    """What the viewers crop under the trigger, from the recorded caps: the
+    filler rows a triggered frame's capture window ends in (the pack's
+    output-delay law, cited by the flows' `FAST_TRIGGER_SECTION`), one line
+    for the port, per link where the links crop differently; nothing where
+    no link crops."""
+    hints = port_state.port_record(topology).get("viewers") or {}
+    crops = {name: int(h.get("crop_bottom") or 0) for name, h in hints.items()}
+    crops = {name: rows for name, rows in crops.items() if rows}
+    if not crops:
+        return []
+    section = getattr(flows, "FAST_TRIGGER_SECTION", None)
+    cited = f", datasheet {section}" if section else ""
+    if len(set(crops.values())) == 1:
+        rows = f"{next(iter(crops.values()))} lines"
+    else:
+        rows = ", ".join(f"{name} {n} lines" for name, n in sorted(crops.items()))
+    return [f"viewers crop the trigger frame's filler rows ({rows}{cited})"]
+
+
 def _set_sync(args: argparse.Namespace, topology: Topology, pack, flows) -> int:
-    """`set sync fsync|free_run [--fps F] [--exposure US]`: the hub's
-    generator on at `fps` with every synced sensor on its trigger, or
-    off with the sensors back in free run. A whole-port change: the
-    generator paces every link."""
+    """`set sync fsync|free_run [--fps F]`: the hub's generator on at `fps`,
+    one pulse per frame, with every synced sensor on its trigger, or off
+    with the sensors back in free run. A whole-port change: the generator
+    paces every link, and the delivery check counts every camera link after
+    it; a sync the links do not deliver is refused with the previous one
+    back. `--exposure` is refused with the fact that sets the exposure: the
+    pulse at the asked rate, else the capture stack's loop."""
     action = str(args.value).lower()
     if action not in ("fsync", "free_run"):
         raise SystemExit(f"nxs: sync is fsync or free_run, not {args.value!r}")
@@ -129,30 +214,24 @@ def _set_sync(args: argparse.Namespace, topology: Topology, pack, flows) -> int:
     if not args.dry_run:
         _require_up(topology, list(topology.links), f"set sync {action}")
     fps = (float(args.fps) if getattr(args, "fps", None) is not None
-           else float(topology.camera_fps or topology.sync.fps or 30.0))
-    plan = None
-    if action == "free_run":
-        cfg = flows.build_trigger_off(pack, topology)
-    else:
-        kwargs: Dict[str, Any] = {"fps": fps, "method": "manual"}
-        if getattr(args, "exposure", None) is not None:
-            if "exposure_us" not in _accepted(flows.build_fsync):
-                raise InfeasibleConfig("this pack's frame sync takes no exposure")
-            kwargs["exposure_us"] = float(args.exposure)
-        running = {l.name: m for l in topology.links
-                   if (m := port_state.port_mode(topology, l))}
-        if running and "modes" in _accepted(flows.build_fsync):
-            kwargs["modes"] = running
-        cfg = flows.build_fsync(pack, topology, **kwargs)
-        plan = _fsync_plan(flows, pack, topology, fps,
-                           kwargs.get("exposure_us"), kwargs.get("modes"))
+           else topology.synced_fps)
+    port = _port_name(topology)
+    asked = getattr(args, "exposure", None) is not None
+    if action == "free_run" and asked:
+        raise InfeasibleConfig(LOOP_EXPOSURE, alternatives=[f"nxs {port} set sync free_run"])
+    cfg, plan = _sync_program(pack, flows, topology, action, fps)
+    if action == "fsync":
+        if asked:
+            fact = (pulse_exposure_fact(fps) if plan is not None and plan.pulse_exposure
+                    else LOOP_EXPOSURE)
+            raise InfeasibleConfig(fact, alternatives=[f"nxs {port} set sync fsync --fps {fps:g}"]
+                                   + _fastest(pack, topology, _running_modes(topology), fps))
         if plan is not None:
             term.info(plan_text(plan))
-        # The laws first; the host budget is advice on a lawful rate.
-        _budget_warning(pack, topology, fps)
     if args.dry_run:
         print_stream(flatten(cfg))
         return 0
+    previous = port_state.port_sync(topology)
     with port_state.BusLock():
         ok = cam_run._execute_split(cfg, topology, f"set-sync-{action}",
                             guard=(pack, topology))
@@ -160,9 +239,65 @@ def _set_sync(args: argparse.Namespace, topology: Topology, pack, flows) -> int:
         _record_sync(pack, flows, topology, action,
                      fps if action == "fsync" else None,
                      plan=plan if action == "fsync" else None)
-        term.info("viewers now crop the trigger filler tail"
-                  if action == "fsync" else "viewers back to full frame")
+        if action == "fsync":
+            for line in _crop_lines(flows, topology):
+                term.info(line)
+        else:
+            term.info("viewers back to full frame")
+        retry = (f"nxs {port} set sync fsync --fps {{fps}}" if action == "fsync"
+                 else f"nxs {port} on --fps {{fps}}")
+        try:
+            verify.check(pack, topology, list(topology.camera_links), retry=retry)
+        except InfeasibleConfig:
+            _restore_sync(pack, flows, topology, previous)
+            raise
     return 0 if ok else 1
+
+
+def _sync_program(pack, flows, topology: Topology, action: str, fps: Optional[float]):
+    """The program that puts the port on `action`, the generator at `fps`
+    under fsync, and the frame-sync plan it runs (None in free run)."""
+    if action == "free_run":
+        return flows.build_trigger_off(pack, topology), None
+    kwargs: Dict[str, Any] = {"fps": fps, "method": "manual"}
+    running = _running_modes(topology)
+    if running and "modes" in _accepted(flows.build_fsync):
+        kwargs["modes"] = running
+    return (flows.build_fsync(pack, topology, **kwargs),
+            _fsync_plan(flows, pack, topology, fps, kwargs.get("modes")))
+
+
+def _restore_sync(pack, flows, topology: Topology, previous: Optional[Dict[str, Any]]) -> None:
+    """Put the port back on the sync the record held before a change its
+    links did not deliver, free run when it held none, and say so."""
+    port = _port_name(topology)
+    fps = (previous or {}).get("fps")
+    action = "fsync" if (previous or {}).get("source") == "fsync" and fps is not None else "free_run"
+    rate = float(fps) if action == "fsync" else None
+    cfg, plan = _sync_program(pack, flows, topology, action, rate)
+    with port_state.BusLock():
+        ok = cam_run._execute_split(cfg, topology, f"set-sync-{action}", guard=(pack, topology))
+    if not ok:
+        term.err(f"{port}: the sync it ran before did not come back\n  - nxs {port} on")
+        return
+    _record_sync(pack, flows, topology, action, rate, plan=plan)
+    term.info(f"{port}: sync back to {sync_text(port_state.port_sync(topology))}")
+
+
+def _running_modes(topology: Topology) -> Dict[str, str]:
+    """The mode each link's last `on` ran, where the record has one."""
+    return {l.name: m for l in topology.links if (m := port_state.port_mode(topology, l))}
+
+
+def _fastest(pack, topology: Topology, modes: Dict[str, str],
+             fps: Optional[float]) -> List[str]:
+    """The command that runs the synced pair at the highest whole rate it
+    takes, the shortest exposure the pulse sets; none when the pair runs
+    there already or the pack names no synced rate."""
+    rates = cam_timing.synced_rates(pack, topology, modes or None)
+    if not rates or (fps is not None and max(rates) <= float(fps)):
+        return []
+    return [f"nxs {_port_name(topology)} set sync fsync --fps {max(rates)}"]
 
 
 def cmd_get(args: argparse.Namespace) -> int:
@@ -192,6 +327,11 @@ def cmd_get(args: argparse.Namespace) -> int:
     # hook derives them from the timing registers), knob or not.
     if args.knob in knobs or args.knob in ("fps", "exposure"):
         _require_up(topology, [link], "get")
+        if args.knob == "exposure" and pulse_sets_exposure(topology, link.name):
+            # A synced link integrates for the pulse's low time; its shutter
+            # register is not what the sensor runs.
+            print(pulse_exposure_fact((port_state.port_sync(topology) or {}).get("fps")))
+            return 0
         i2c = cam_run.CamI2c(addr=hex(topology.des_addr), bus=topology.i2c_bus)
         hub_rate = None
         with port_state.BusLock():

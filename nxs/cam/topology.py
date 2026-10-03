@@ -16,6 +16,8 @@ from typing import Any, Dict, Optional, Tuple
 
 import yaml
 
+from nxs.suite.schema_ports import port_signature
+
 from .contracts import LinkSpec, NxsUnitSpec, SyncSpec, Topology
 from .descriptors import to_int
 from . import packs
@@ -258,18 +260,21 @@ def _hub_rules(hub_compatible: str) -> Tuple[Optional[str], Dict[str, int], Dict
 
 
 def port_topology(port, host=None) -> Topology:
-    """The port a manifest port declares, as the flows take it; a port spec
-    stands alone and is never re-resolved by name. What the declaration
-    leaves out is the host's fact (the bus) or the pack's rule (the
-    serializer, the window and the channel of a link behind the hub)."""
+    """The port a manifest port declares, as the flows take it, carrying the
+    declaration's digest (`declared`); a port spec stands alone and is never
+    re-resolved by name. What the declaration leaves out is the host's fact
+    (the bus) or the pack's rule (the serializer, the window and the channel
+    of a link behind the hub)."""
     if host is None:
         from nxs import host as host_layer
         host = host_layer.current()
     bus = port.bus or host.camera_buses().get(port.name)
     if not bus:
+        # A host that boots no camera bus gets them from `nxs switch`.
         raise TopologyError(
             f"ports.{port.name}: no bus on this host answers to that name "
-            f"(the host's ports: {', '.join(sorted(host.camera_buses())) or 'none'})")
+            f"(the host's ports: {', '.join(sorted(host.camera_buses())) or 'none'})"
+            + ("\n  - nxs switch" if host.camera_bus_missing() else ""))
     ser_rule, windows, vcs = (_hub_rules(port.hub_compatible) if port.hub_compatible
                               else (None, {}, {}))
     if port.hub_compatible and ser_rule is None:
@@ -284,13 +289,13 @@ def port_topology(port, host=None) -> Topology:
         if l.csi_vc is None and l.name not in vcs:
             raise TopologyError(f"ports.{port.name}.links.{l.name}: no channel rule for "
                                 f"a link named {l.name!r}; declare csi_vc")
-    # A declared value is the operator's word (check compares it with
-    # the booted tree); an undeclared one follows the tree.
+    # A declared value is the operator's word (check compares it with the booted
+    # tree); an undeclared one follows the tree, then the connector's wiring.
     booted_ids = host.capture_ids(bus)
     node_addrs = _booted_node_addrs(host, bus)
     lanes = port.csi_lanes
     if not port.csi_lanes_declared:
-        lanes = host.booted_lanes(bus) or port.csi_lanes
+        lanes = host.booted_lanes(bus) or _connector_lanes(host, port.name) or port.csi_lanes
     links = tuple(
         LinkSpec(
             name=l.name,
@@ -334,9 +339,18 @@ def port_topology(port, host=None) -> Topology:
         camera_mode=port.camera_mode,
         camera_fps=port.camera_fps,
         camera_exposure_us=port.camera_exposure_us,
+        camera_gain_db=port.camera_gain_db,
         sync=SyncSpec(source=port.sync_source, fps=port.sync_fps),
         node_addrs=pairs,
+        declared=port_signature(port),
     )
+
+
+def _connector_lanes(host, port: str) -> Optional[int]:
+    """The lane count the port's connector wires; None from a host that
+    does not say."""
+    read = getattr(host, "connector_lanes", None)
+    return read(port) if read is not None else None
 
 
 def _booted_node_addrs(host, bus: str) -> Dict[int, int]:
@@ -388,12 +402,14 @@ def _ports_from_platform() -> Optional[Tuple[Dict[int, Topology], int]]:
 
 def _follow_booted_tree(shaped: Dict[str, Any], bus: str) -> None:
     """The booted overlay decides the CSI lane count and the capture ids; where
-    the tree is silent the port's values stand, where it speaks a link whose
-    virtual channel has no capture node gets none."""
+    the tree is silent the connector's lane count and the port's other values
+    stand, where it speaks a link whose virtual channel has no capture node
+    gets none."""
     from nxs import host as host_layer
 
     host = host_layer.current()
-    lanes = host.booted_lanes(bus)
+    port = str(shaped.get("carrier", "")).rsplit("/", 1)[-1]
+    lanes = host.booted_lanes(bus) or _connector_lanes(host, port)
     if lanes is not None:
         shaped["csi_lanes"] = lanes
     node_addrs = _booted_node_addrs(host, bus)

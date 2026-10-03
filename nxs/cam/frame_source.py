@@ -13,7 +13,7 @@ from nxs import host as host_layer
 
 from . import port_state
 from .contracts import Topology
-from .viewers import resolve_capture_hints
+from .viewers import resolve_capture_hints, source_props
 
 
 @dataclasses.dataclass(frozen=True)
@@ -44,8 +44,9 @@ def link_pipeline(port: str, link: str,
                   count: Optional[int] = None) -> Tuple[str, Dict[str, Any]]:
     """The GStreamer description that hands a link's frames to an appsink
     named `sink` as RGBA in system memory, at the caps the port record
-    carries for the link, and those caps. `count` bounds the frames the
-    source delivers."""
+    carries for the link and the source properties they give
+    (`source_props`), and those caps. `count` bounds the frames the source
+    delivers."""
     topology = port_topology(port)
     spec = topology.link(link)
     capture_id = port_state.port_capture_id(topology, spec)
@@ -55,11 +56,8 @@ def link_pipeline(port: str, link: str,
     hints = (port_state.port_record(topology).get("viewers") or {}).get(spec.name)
     resolved = resolve_capture_hints(hints, link)
     host = host_layer.current()
-    props = ""
-    if resolved.get("exposure_us") is not None:
-        props = " " + host.exposure_props(resolved["exposure_us"])
-    elif resolved.get("exposure_max_us") is not None:
-        props = " " + host.ae_props(resolved.get("exposure_min_us"), resolved["exposure_max_us"])
+    props = source_props(resolved, host, port=port)
+    props = f" {props}" if props else ""
     limit = f" num-buffers={int(count)}" if count else ""
     desc = (f"{host.source(capture_id, resolved['sensor_mode'])}{props}{limit} ! "
             f"{host.caps(resolved['width'], resolved['height'], resolved.get('framerate'))} ! "

@@ -2,29 +2,27 @@
 Compiles the panel, opens the management link, verifies identity and every
 other link, then DFU, commission, and deploy, skipping what already matches."""
 import hashlib
-import importlib.util
-import sys
 import json
 import logging
 import os
-import time
 from dataclasses import dataclass, field
 from typing import List, Optional
 
 from nxs._generated_constants import CyphalDefaults, RunnerStates
-from nxs.client import (DFU_REBOOT_TIMEOUT_S, SupportsTimeSync, await_driver_up,
-                        await_reachable, estimate_and_push)
+from nxs.client import SupportsTimeSync, estimate_and_push, push_and_verify
 from nxs.compiler import SensorDriver
 from nxs.descriptor import load_driver
-from nxs.suite import DRIVERS_DIR, FIRMWARE_DIR
-from nxs.suite.drift import UnitDrift, detect_unit_drift, firmware_drift
-from nxs.suite.firmware import find_image
+from nxs.suite import FIRMWARE_DIR
+from nxs.suite.drift import (STORE_SLOTS, UnitDrift, detect_unit_drift,
+                             driver_slots, firmware_drift)
+from nxs.suite.firmware import find_image, image_identity
 from nxs.suite.schema import (SuiteConfig, UnitSpec, device_runs,
                               parse_version)
 from nxs.suite.state import SuiteState
 from nxs.image import serialize
 from nxs.client import contract_mismatch, exc_detail, import_failure_detail
-from nxs.transports import open_client
+from nxs.time_sync import await_driver_up, park
+from nxs import transports
 
 log = logging.getLogger("nxs.suite")
 
@@ -112,21 +110,14 @@ def module_for_driver_name(active: str, drivers_dir: Optional[str] = None):
 def load_unit_driver(name: str, drivers_dir: Optional[str] = None):
     """Resolve a driver class: the personality store first (`<name>/<name>.py`
     or a flat `<name>.py`), then the package built-ins."""
+    from nxs.personality import load_source
     from nxs.suite import personality_dirs, personality_file
 
     path = personality_file(name, "py", drivers_dir)
     if path is not None:
-        spec = importlib.util.spec_from_file_location(f"nxs_suite_drivers.{name}", path)
-        if spec is None or spec.loader is None:
-            raise DriverNotFound(f"{path}: not importable as a Python module")
-        module = importlib.util.module_from_spec(spec)
-        # Registered like any imported module: the driver's class finds its
-        # own module (and its sibling descriptor) through sys.modules.
-        sys.modules[spec.name] = module
         try:
-            spec.loader.exec_module(module)
+            module = load_source(f"nxs_suite_drivers.{name}", str(path))
         except Exception as e:
-            sys.modules.pop(spec.name, None)
             raise DriverNotFound(
                 f"{path}: import failed: "
                 f"{import_failure_detail(e, str(path))}") from e
@@ -161,11 +152,13 @@ def panel_hash(unit: UnitSpec) -> str:
 
 def switch_suite(cfg: SuiteConfig, state: SuiteState, *,
                 dry_run: bool = False, only_unit: Optional[str] = None,
-                accept_new_serial: bool = False, opener=open_client,
+                accept_new_serial: bool = False, opener=None,
                 firmware_dir: str = FIRMWARE_DIR,
                 drivers_dir: Optional[str] = None) -> List[UnitReport]:
     """Reconcile the suite; returns one report per (selected) unit. A
-    None `drivers_dir` resolves personalities through the store chain."""
+    None `drivers_dir` resolves personalities through the store chain, and
+    the opener defaults to the one `nxs.transports` holds at the call."""
+    opener = opener or transports.open_client
     reports = []
     seen_serials: dict = {}
     for unit in cfg.units:
@@ -206,7 +199,9 @@ def _apply_unit(unit: UnitSpec, state: SuiteState, *, dry_run: bool,
         panel = [(spec, load_unit_driver(spec.driver, drivers_dir)().compile(spec.config))
                  for spec in (unit.sensors or [])]
         pin = unit.firmware or assets_pin(firmware_dir)
-        image_path = find_image(firmware_dir, pin) if pin else None
+        image_path = (find_image(firmware_dir, pin, None if unit.firmware else tool_build_identity())
+                      if pin else None)
+        image = image_identity(image_path) if image_path else None
     except Exception as e:
         report.ok = False
         report.error = str(e) or type(e).__name__
@@ -254,8 +249,8 @@ def _apply_unit(unit: UnitSpec, state: SuiteState, *, dry_run: bool,
         # A contract mismatch is drift whatever the versions say: a v1 and a
         # v2 image can report the same `fw`.
         if pin and not _converge_firmware(
-                unit, state, transport, report, image_path, would, dry_run, pin,
-                needs_flash=(firmware_drift(unit, state, transport, pin)
+                unit, state, transport, report, image_path, image, would, dry_run, pin,
+                needs_flash=(firmware_drift(unit, state, transport, pin, image)
                              or bool(mismatch))):
             return report
         if mismatch and not dry_run:
@@ -491,13 +486,18 @@ def _push_orientation(unit: UnitSpec, transport, report, would: str):
 
 
 def _converge_firmware(unit: UnitSpec, state: SuiteState, transport, report,
-                       image_path: str, would: str, dry_run: bool, pin: str, *,
-                       needs_flash: bool) -> bool:
+                       image_path: str, image: Optional[str], would: str,
+                       dry_run: bool, pin: str, *, needs_flash: bool) -> bool:
     """DFU to `pin` (the unit's own, else the assets' release) when
-    `needs_flash` (`UnitDrift.fw`) says the device runs something else."""
+    `needs_flash` (`UnitDrift.fw`) says the device runs something else, and
+    judge the push as `push-fw` does: the unit fails unless it boots the
+    pushed image, proven by `image`, the build identity the image carries,
+    where it carries one."""
     if not needs_flash:
+        if image is not None and not dry_run and state.unit(unit.name).get("fw_version") != pin:
+            # The identity proves the pinned image: `status`'s rule reads the record.
+            state.record(unit.name, fw_version=pin)
         return True
-    want = parse_version(pin)
     device = transport.read_fw_version()
 
     report.actions.append(
@@ -506,17 +506,15 @@ def _converge_firmware(unit: UnitSpec, state: SuiteState, transport, report,
     if dry_run:
         return True
 
-    transport.push_image(image_path)
-    if not await_reachable(transport, DFU_REBOOT_TIMEOUT_S):
+    ok, line, after = push_and_verify(transport, image_path, pin, before=device)
+    # Without an identity in the image, a boot into another version than the
+    # pin is a failed update, whatever else changed.
+    if ok and image is None and after and device_runs(after, parse_version(pin)) is False:
+        ok, line = False, (f"✗ rejected or reverted: the device reports {after} after "
+                           f"the push of {pin}")
+    if not ok:
         report.ok = False
-        report.error = f"device did not return within {DFU_REBOOT_TIMEOUT_S:.0f}s after DFU"
-        return False
-    after = transport.read_fw_version()
-    # A full build identity proves the patch; recording the pin over a
-    # wrong-patch boot would mask the failed update.
-    if after and device_runs(after, want) is False:
-        report.ok = False
-        report.error = f"DFU verify failed: device reports {after}, pinned {pin}"
+        report.error = line.removeprefix("✗ ")
         return False
     state.record(unit.name, fw_version=pin)
     return True
@@ -527,6 +525,24 @@ def tool_base_version() -> Optional[str]:
     from nxs import __version__
     base = str(__version__).split("+", 1)[0].lstrip("v").split("rc", 1)[0]
     return base if base and base != "0.0.0" else None
+
+
+def tool_build_identity() -> Optional[str]:
+    """The build identity the firmware built with this wheel carries: the
+    wheel's own build record (`v1.1.0-rc1-174-gd7bb22bf` on a build between
+    tags, the tag on a release build), else the tag its version names
+    (`v1.1.0-rc1`); None in a source checkout, which records no build."""
+    from nxs import __version__
+    from nxs.assets_cli import release_tag, tool_build
+
+    if tool_base_version() is None:
+        return None
+    if (build := tool_build()) is not None:
+        return build
+    try:
+        return release_tag(str(__version__).split("+", 1)[0].lstrip("v"))
+    except ValueError:
+        return None
 
 
 def assets_pin(firmware_dir: str) -> Optional[str]:
@@ -560,20 +576,32 @@ def _converge_panel(unit: UnitSpec, state: SuiteState, transport, report,
     if dry_run:
         return
 
-    transport.clear_store()
-    for slot, (_, compiled) in enumerate(panel):
+    # Read before anything stops: a store a session holds, or one too full,
+    # refuses the deploy with the unit as it runs.
+    room = _room(transport)
+    if room < len(panel):
+        report.ok = False
+        report.error = (f"the store has room for {room} of the panel's "
+                        f"{len(panel)} personalities")
+        return
+    # Parked before the store changes: a runner left running reloads from it
+    # on its own (a probe retry, the watchdog), and its verdict must not
+    # outlive it.
+    park(transport)
+    slots = _clear_driver_slots(transport)[:len(panel)]
+    for slot, (_, compiled) in zip(slots, panel):
         transport.upload_image(serialize(compiled))
         transport.save_slot(slot)
     transport.vm_run()
     runner = await_driver_up(transport)
     active = transport.read_active_slot()
     if runner == RunnerStates.RunnerState.MEASURING:
-        if 0 <= active < len(panel):
-            report.actions.append(f"active: {names[active]} (slot {active})")
+        if active in slots:
+            report.actions.append(f"active: {names[slots.index(active)]} (slot {active})")
         else:
             # A fresh deploy runs the just-uploaded RAM image, which carries no
-            # slot number until a reboot loads slot 0; MEASURING is the success
-            # signal, and the running driver names itself.
+            # slot number until a reboot loads the first sensor slot; MEASURING
+            # is the success signal, and the running driver names itself.
             report.actions.append(
                 f"active: {transport.read_driver_name() or names[-1]} (running)")
     elif runner == RunnerStates.RunnerState.PROBE_FAILED:
@@ -589,18 +617,44 @@ def _converge_panel(unit: UnitSpec, state: SuiteState, transport, report,
     state.record(unit.name, panel_hash=digest)
 
 
+def _room(transport) -> int:
+    """How many slots a panel can take once the sensor personalities are
+    cleared: every slot but a camera personality's."""
+    from nxs.client import SupportsSlotPeek
+
+    if not isinstance(transport, SupportsSlotPeek):
+        return STORE_SLOTS
+    sensors = set(driver_slots(transport))
+    return sum(slot in sensors or transport.read_slot_info(slot) is None
+               for slot in range(STORE_SLOTS))
+
+
+def _clear_driver_slots(transport) -> List[int]:
+    """Delete every sensor personality's slot, the last first so the others
+    keep their index, and leave a camera personality's in place: it is the
+    camera steps'. Returns the empty slots after, lowest first, where a
+    panel lands."""
+    from nxs.client import SupportsSlotPeek
+
+    for slot in reversed(driver_slots(transport)):
+        transport.delete_slot(slot)
+    if not isinstance(transport, SupportsSlotPeek):
+        return list(range(STORE_SLOTS))
+    return [slot for slot in range(STORE_SLOTS) if transport.read_slot_info(slot) is None]
+
+
 def _converge_empty_panel(unit: UnitSpec, state: SuiteState, transport,
                           report, would: str, dry_run: bool):
     """Converge a declared-empty panel: stop the driver and clear the
-    store when either is present; record the empty panel hash."""
-    if transport.read_store_count() == 0 and not transport.read_driver_name():
+    sensor slots when either is present; record the empty panel hash."""
+    if not driver_slots(transport) and not transport.read_driver_name():
         return
     report.actions.append(f"{would}clear panel (declared empty)")
     if dry_run:
         return
     transport.vm_stop()
     transport.vm_reset()
-    transport.clear_store()
+    _clear_driver_slots(transport)
     state.record(unit.name, panel_hash=panel_hash(unit))
 
 

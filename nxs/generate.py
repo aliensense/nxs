@@ -36,6 +36,8 @@ class LinkFinding:
     unit_addr: Optional[int] = None
     unit_serial: str = ""
     unit_fw: str = ""
+    #: The driver the pod runs, by the name it reports; "" when it runs none.
+    unit_driver: str = ""
     #: The camera personality the pod holds, as a sensor compatible.
     unit_personality: Optional[str] = None
     #: True when this link's pod is reached through a translation, so the
@@ -66,6 +68,8 @@ class PortFinding:
     #: (addr, serial, fw) of a unit that answers through every window —
     #: on the port's bus, owned by no link.
     shared_unit: Optional[tuple] = None
+    #: The driver that unit runs, by the name it reports.
+    shared_driver: str = ""
     #: Links whose pods share one un-aliased address, so the walk cannot
     #: say which of them answered. (addr, [link names]).
     collided: Optional[tuple] = None
@@ -365,6 +369,7 @@ def _walk_hub(topology) -> PortFinding:
                     finding.unit_addr = int(hit.link.address)
                     finding.unit_serial = hit.serial
                     finding.unit_fw = hit.fw_version
+                    finding.unit_driver = hit.driver
                     finding.unit_personality = _pod_personality(hit)
                     break
                 if sensor is None and finding.unit_personality:
@@ -460,6 +465,7 @@ def _walk_bare(topology) -> PortFinding:
             finding.unit_addr = int(hit.link.address)
             finding.unit_serial = hit.serial
             finding.unit_fw = hit.fw_version
+            finding.unit_driver = hit.driver
             finding.unit_personality = _pod_personality(hit)
             break
         if sensor is None and finding.unit_personality:
@@ -486,14 +492,14 @@ def _flag_unprogrammed_alias(port: PortFinding) -> None:
     translation yet. The pods are still merged onto that one address, so
     what answered there may be several of them at once — the bytes read
     back are whatever the bus settles on, not one unit's. The address
-    stands; the serial does not."""
+    stands; the serial and the driver do not."""
     silent = [l.name for l in port.links if l.unit_aliased and not l.unit_serial]
     merged = [l for l in port.links if not l.unit_aliased and l.unit_serial]
     if not silent or not merged:
         return
     port.unprogrammed = (silent, merged[0].unit_addr)
     for link in merged:
-        link.unit_serial, link.unit_fw = "", ""
+        link.unit_serial, link.unit_fw, link.unit_driver = "", "", ""
 
 
 def _disown_shared_unit(port: PortFinding) -> None:
@@ -520,12 +526,13 @@ def _disown_shared_unit(port: PortFinding) -> None:
         port.collided = (port.links[0].unit_addr,
                          [l.name for l in port.links])
         for link in port.links:
-            link.unit_addr, link.unit_serial, link.unit_fw = None, "", ""
+            link.unit_addr, link.unit_serial, link.unit_fw, link.unit_driver = None, "", "", ""
         return
     shared = port.links[0]
     port.shared_unit = (shared.unit_addr, shared.unit_serial, shared.unit_fw)
+    port.shared_driver = shared.unit_driver
     for link in port.links:
-        link.unit_addr, link.unit_serial, link.unit_fw = None, "", ""
+        link.unit_addr, link.unit_serial, link.unit_fw, link.unit_driver = None, "", "", ""
 
 
 def scan_units(ports: List[PortFinding]) -> List[UnitFinding]:
@@ -571,6 +578,22 @@ def _serial_or_none(serial: str) -> Optional[str]:
         return None
 
 
+def _unit_entry(name: str, route: Dict[str, Any], serial: str, driver: str) -> Dict[str, Any]:
+    """A seeded unit: its name and route, its serial when the parser takes
+    it back, and the personality that compiles to the driver it runs. A unit
+    running no personality the tool knows gets no `sensors` key, which leaves
+    its store undeclared: `sensors: []` would clear it on the first switch."""
+    from nxs.suite.scan import _module_for_driver
+
+    entry: Dict[str, Any] = {"name": name, "module": "nxs", "links": [route]}
+    if _serial_or_none(serial):
+        entry["serial"] = _serial_or_none(serial)
+    personality = _module_for_driver(driver) if driver else None
+    if personality:
+        entry["sensors"] = [{"personality": personality}]
+    return entry
+
+
 def name_by_trial(units: List[UnitFinding], opener=None) -> None:
     """A unit running nothing is asked by trial: every personality the tool
     knows uploaded in turn, and the one whose sensor answers stays running
@@ -607,6 +630,7 @@ def seed_intent(ports: List[PortFinding], units: List[UnitFinding],
     (mode, sync), a name and alias for every unit found riding a link,
     and every unit found on a bare bus — named by where it answers,
     for the operator to rename."""
+    from nxs.suite.freeze import hex_address
     from nxs.suite.scan import I2C_ADDRESSES
 
     doc: Dict[str, Any] = {}
@@ -645,31 +669,19 @@ def seed_intent(ports: List[PortFinding], units: List[UnitFinding],
                 # Nothing translates on the port's own bus: the unit is
                 # reached where it answered, its own address.
                 if link.unit_addr is not None and link.unit_addr != alias_base:
-                    ref["target"] = link.unit_addr
+                    ref["target"] = hex_address(link.unit_addr)
             else:
-                ref["alias"] = alias_base + index + 1
+                ref["alias"] = hex_address(alias_base + index + 1)
             entry.setdefault("links", {}).setdefault(link.name, {})["unit"] = ref
-            unit_doc: Dict[str, Any] = {
-                "name": name, "module": "nxs",
-                "links": [{"transport": "i2c",
-                           "link": f"{port.name}/{link.name}"}]}
-            if _serial_or_none(link.unit_serial):
-                unit_doc["serial"] = _serial_or_none(link.unit_serial)
-            unit_doc["sensors"] = []
-            unit_docs.append(unit_doc)
+            route = {"transport": "i2c", "link": f"{port.name}/{link.name}"}
+            unit_docs.append(_unit_entry(name, route, link.unit_serial, link.unit_driver))
         if entry:
             port_docs[port.name] = entry
         if port.shared_unit:
             addr, serial, _fw = port.shared_unit
-            entry_u: Dict[str, Any] = {
-                "name": f"unit-{port.name}", "module": "nxs",
-                "links": [{"transport": "i2c", "bus": port.bus,
-                           "address": int(addr)}]}
-            if _serial_or_none(serial):
-                entry_u["serial"] = _serial_or_none(serial)
-            entry_u["sensors"] = []
-            unit_docs.append(entry_u)
-    from nxs.suite.scan import _module_for_driver, _suggest_name
+            route = {"transport": "i2c", "bus": port.bus, "address": hex_address(addr)}
+            unit_docs.append(_unit_entry(f"unit-{port.name}", route, serial, port.shared_driver))
+    from nxs.suite.scan import _suggest_name
 
     for unit in units:
         link = unit.link
@@ -677,14 +689,8 @@ def seed_intent(ports: List[PortFinding], units: List[UnitFinding],
         for key in ("bus", "address", "port", "iface", "node_id"):
             value = getattr(link, key, None)
             if value is not None:
-                route[key] = value
-        entry: Dict[str, Any] = {"name": _suggest_name(link), "module": "nxs",
-                                 "links": [route]}
-        if _serial_or_none(unit.serial):
-            entry["serial"] = _serial_or_none(unit.serial)
-        personality = _module_for_driver(unit.driver) if unit.driver else None
-        entry["sensors"] = [{"personality": personality}] if personality else []
-        unit_docs.append(entry)
+                route[key] = hex_address(value) if key == "address" else value
+        unit_docs.append(_unit_entry(_suggest_name(link), route, unit.serial, unit.driver))
     if port_docs:
         doc["ports"] = port_docs
     if unit_docs:
@@ -703,14 +709,12 @@ def generate(config_path: str, dry_run: bool = False,
              ) -> Dict[str, Any]:
     """Walk, then write: hardware.yaml regenerated, suite.yaml seeded
     only when absent. Returns the report and what was written."""
-    import yaml
-
     walker = walker or walk_ports
     unit_scanner = unit_scanner or scan_units
 
     from nxs.cam import port_state
     from nxs.suite.freeze import (_render_hardware, _split_entry, _write_atomic,
-                                  port_block)
+                                  port_block, render_seed)
     from nxs.suite.schema import hardware_path
 
     from nxs.generate_report import render_report, walk_data
@@ -744,15 +748,11 @@ def generate(config_path: str, dry_run: bool = False,
               "walk": walk_data(ports, units)}
     if dry_run:
         return result
-    directory = os.path.dirname(config_path)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
     hw = hardware_path(config_path)
     _write_atomic(hw, lambda f: f.write(_render_hardware(wiring)))
     result["hardware"] = hw
     if not exists and seed:
-        _write_atomic(config_path, lambda f: f.write(
-            _SEED_HEADER + yaml.safe_dump(seed, sort_keys=False)))
+        _write_atomic(config_path, lambda f: f.write(_SEED_HEADER + render_seed(seed)))
         result["seeded"] = config_path
     return result
 
@@ -760,7 +760,12 @@ def generate(config_path: str, dry_run: bool = False,
 def cmd_generate(args) -> int:
     from nxs.suite import default_config_path
 
+    from nxs.suite import stray_declaration
+
     config_path = getattr(args, "config", None) or default_config_path()
+    stray = stray_declaration(config_path)
+    if stray:
+        raise SystemExit(f"nxs generate: {stray}")
     try:
         result = generate(config_path, dry_run=bool(getattr(args, "dry_run", False)))
     except Exception as exc:        # no pack, a silent tree, an unwritable path

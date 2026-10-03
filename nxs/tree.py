@@ -6,6 +6,7 @@ hubs, units, and direct sensors on the leaf I2C buses; `render_tree` is the
 declaration against the rig, node by node. Neither writes a register; `--json`
 gives the surfaces."""
 
+import errno
 import json
 import os
 
@@ -21,7 +22,7 @@ SENSOR_ADDRESSES = (0x1A, 0x1D)
 def _scan_bus(bus: str, extra=()):
     """One leaf bus: hubs, units, and bare sensors found there; `extra` names
     unit addresses to probe beside the standard ones, and `readable` is False
-    when the bus could not be opened."""
+    when the bus could not be opened, with the `errno` of the refusal."""
     from nxs import _libnxs, _libnxs_unit
 
     found = {"hubs": [], "units": [], "sensors": [], "readable": True}
@@ -39,8 +40,8 @@ def _scan_bus(bus: str, extra=()):
     from nxs.suite.scan import I2C_ADDRESSES
     try:
         handle = _libnxs.Bus.open(path)
-    except OSError:
-        found["readable"] = False
+    except OSError as exc:
+        found["readable"], found["errno"] = False, exc.errno or errno.EIO
         return found
     with handle:
         for addr in sorted(set(I2C_ADDRESSES) | set(extra)):
@@ -67,33 +68,44 @@ def _scan_bus(bus: str, extra=()):
     return found
 
 
-def scan_payload():
-    """The `scan` surface: what every leaf bus answered."""
-    from nxs.schemas import CONTRACT
+def _sweep() -> list:
+    """Every leaf bus with what it answered."""
     from nxs.suite.scan import _i2c_buses
 
-    buses = []
-    for bus in _i2c_buses():
-        found = _scan_bus(bus)
+    return [(str(bus), _scan_bus(bus)) for bus in _i2c_buses()]
+
+
+def scan_payload(swept):
+    """The `scan` surface: what every leaf bus of a sweep answered, and the
+    buses that did not open, which it did not sweep, with the reason."""
+    from nxs.schemas import CONTRACT
+
+    buses, not_opened = [], []
+    for bus, found in swept:
+        if not found.get("readable", True):
+            not_opened.append({"bus": bus, "reason": os.strerror(found["errno"])})
+            continue
         unit_addrs = {a for a, _ in found["units"]}
         buses.append({
-            "bus": str(bus),
+            "bus": bus,
             "hubs": [{"addr": a, "kind": d} for a, d in found["hubs"]],
             "units": [{"addr": a, "serial": s} for a, s in found["units"]],
             "sensors": [a for a in found["sensors"] if a not in unit_addrs],
         })
-    return {"contract": CONTRACT, "buses": buses}
+    return {"contract": CONTRACT, "buses": buses, "not_opened": not_opened}
 
 
 def render_scan(as_json: bool = False) -> int:
     """Config-free discovery of every leaf bus (bare `nxs probe`)."""
-    payload = scan_payload()
+    swept = _sweep()
+    payload = scan_payload(swept)
     anything = any(b["hubs"] or b["units"] or b["sensors"]
                    for b in payload["buses"])
+    closed = _closed(swept)
     if as_json:
         print(json.dumps(payload, indent=2))
         return 0 if anything else 1
-    if not payload["buses"]:
+    if not swept:
         print("no I2C buses found")
         return 1
     for entry in payload["buses"]:
@@ -107,20 +119,51 @@ def render_scan(as_json: bool = False) -> int:
             print(f"{entry['bus']}:")
             for row in rows:
                 print(f"  {row}")
+    for line in closed:
+        print(line)
     if not anything:
-        print("no hubs, units, or sensors answered "
-              f"({len(payload['buses'])} buses swept)")
+        opened = sum(found.get("readable", True) for _bus, found in swept)
+        print(f"no hubs, units, or sensors answered "
+              f"({opened} bus{'' if opened == 1 else 'es'} swept)")
     print(_next_after_probe(anything))
     return 0 if anything else 1
 
 
+def _closed(swept) -> list:
+    """The lines for the buses of a sweep that did not open, which it did not
+    sweep: one per reason, and under a permission refusal the group that owns
+    the bus nodes, where the host has it."""
+    from nxs.suite.switch_cam import STATE_GROUP, _group_exists
+
+    by_errno: dict = {}
+    for bus, found in swept:
+        if not found.get("readable", True):
+            by_errno.setdefault(found["errno"], []).append(bus)
+    lines = []
+    for code, buses in by_errno.items():
+        lines.append(f"not opened ({os.strerror(code)}): {' '.join(buses)}")
+        if code == errno.EACCES and _group_exists(STATE_GROUP):
+            lines.append(f'  - sudo usermod -aG {STATE_GROUP} "$USER", then log in again')
+    return lines
+
+
 def _next_after_probe(anything: bool) -> str:
-    """The step after discovery: compare against the declaration when there is
-    one, write one from what answered when there is none."""
+    """The step after discovery: the camera buses when the host boots none
+    (the camera connectors answer on them alone), then compare against the
+    declaration when there is one, write one from what answered when there
+    is none."""
     import os
 
+    from nxs import host as host_layer
     from nxs.suite import default_config_path
 
+    from nxs.suite import stray_declaration
+
+    if host_layer.current().camera_bus_missing():
+        return "no camera bus is booted\n  - nxs switch"
+    stray = stray_declaration(default_config_path())
+    if stray:
+        return stray
     if os.path.exists(default_config_path()):
         return "declared-vs-actual: nxs status"
     if not anything:
@@ -129,17 +172,52 @@ def _next_after_probe(anything: bool) -> str:
     return "no suite.yaml yet — write down what answered: nxs generate"
 
 
-def _installed_personalities() -> int:
-    """How many personalities the store holds (a directory or a file pair
-    each)."""
+def _holds_descriptor(directory: str) -> bool:
+    """Whether a store directory is an installed personality: a unit's
+    carries its descriptor, as `locate` reads one, and a camera's the chip
+    directory beside its pack.yaml (`<name>/<name>.yaml`); Python's
+    bytecode cache carries neither."""
+    name = os.path.basename(directory)
+    if os.path.isfile(os.path.join(directory, name, f"{name}.yaml")):
+        return True
+    try:
+        return any(entry.endswith(".yaml") and entry != "pack.yaml"
+                   for entry in os.listdir(directory))
+    except OSError:
+        return False
+
+
+def _personality_counts() -> tuple[int, int]:
+    """(shipped, installed) in the personality store: the assets' sealed
+    personalities (`<name>.nxs`; the hub's and the serializer's images are
+    the host's programs, not counted), and the ones installed beside them
+    (a directory holding its descriptor, or a `.py`, each)."""
+    from nxs.image import HEADER_SIZE, ImageKind, peek_format
     from nxs.suite import PERSONALITY_DIR
 
     try:
         entries = os.listdir(PERSONALITY_DIR)
     except OSError:
-        return 0
-    return sum(1 for e in entries
-               if os.path.isdir(os.path.join(PERSONALITY_DIR, e)) or e.endswith(".py"))
+        return 0, 0
+    shipped = installed = 0
+    for entry in entries:
+        path = os.path.join(PERSONALITY_DIR, entry)
+        if os.path.isdir(path):
+            installed += _holds_descriptor(path)
+        elif entry.endswith(".py"):
+            installed += 1
+        elif entry.endswith(".nxs"):
+            try:
+                with open(path, "rb") as fh:
+                    kind = peek_format(fh.read(HEADER_SIZE))[2]
+            except (OSError, ValueError):
+                continue
+            shipped += kind != ImageKind.HUB
+    return shipped, installed
+
+
+#: The VM verdicts of a unit that does not run its personality.
+_VM_NOT_RUNNING = ("idle", "error", "no-probe", "probing")
 
 
 def _deviations(row) -> dict:
@@ -160,6 +238,31 @@ def _deviations(row) -> dict:
     return out
 
 
+def _unit_rows(cfg, held_buses, state):
+    """One `collect_status` row per declared unit, None for one not read.
+    A unit on a port's bus (it rides a link, or names the bus) is read
+    under the bus lock, waited for as the port's walk waits, and not at
+    all when the walk left its bus held or the lock outlasts the wait; a
+    unit on a bus of its own is read as it is."""
+    from nxs.cam import port_state
+    from nxs.suite.status import collect_status
+
+    port_buses = {port.bus for port in cfg.ports.values() if port.bus}
+    on_port = {u.name for u in cfg.units if any(l.bus in port_buses for l in u.links)}
+    alone = [u for u in cfg.units if u.name not in on_port]
+    rows = dict(zip((u.name for u in alone), collect_status(cfg, state, units=alone)))
+    locked = [u for u in cfg.units
+              if u.name in on_port and not any(l.bus in held_buses for l in u.links)]
+    if locked:
+        try:
+            with port_state.held_wait(), port_state.BusLock():
+                rows.update(zip((u.name for u in locked),
+                                collect_status(cfg, state, units=locked)))
+        except port_state.BusHeld:
+            pass
+    return [rows.get(u.name) for u in cfg.units]
+
+
 def tree_payload(cfg, path):
     """The `tree` surface: the declaration's verdict, the store, and every
     declared node, present or absent."""
@@ -168,7 +271,6 @@ def tree_payload(cfg, path):
     from nxs.schemas import CONTRACT
     from nxs.suite import PERSONALITY_DIR, default_state_path
     from nxs.suite.state import SuiteState
-    from nxs.suite.status import collect_status
 
     findings = check_manifest(path)
     by_node, rest = node_findings(findings)
@@ -185,6 +287,9 @@ def tree_payload(cfg, path):
         if loaded:
             topologies = {t.carrier.split("/")[-1]: t
                           for t in loaded[0].values()}
+        # The bus lock is one for every camera bus: a walk that met it held
+        # marks the ports after it held without waiting again.
+        bus_held = False
         for name in sorted(cfg.ports):
             port = cfg.ports[name]
             entry = {"name": name, "bus": port.bus,
@@ -195,10 +300,12 @@ def tree_payload(cfg, path):
             topology = topologies.get(name)
             if topology is not None:
                 try:
-                    entry["presence"] = cam_cli.presence_payload(topology)
+                    entry["presence"] = cam_cli.presence_payload(topology, held=bus_held)
+                    bus_held = bus_held or bool(entry["presence"].get("held"))
                     ok = ok and entry["presence"]["ok"]
                     hub = entry["presence"].get("hub")
-                    if port.hub_source and hub is not None and not hub["present"]:
+                    if (port.hub_source and hub is not None and not hub["present"]
+                            and not entry["presence"].get("held")):
                         # The wiring file's hub is gone: the walk that wrote
                         # it down is older than the cabling.
                         from nxs.suite.schema_ports import WIRING_ALTERNATIVE
@@ -214,6 +321,11 @@ def tree_payload(cfg, path):
                 except Exception as e:
                     entry["error"] = f"bus unavailable: {e}"
                     ok = False
+                # A followed pair whose gain nothing copies is the port's gap.
+                gap = cam_cli.follow_gap(topology, cam_cli.pair_gain(topology))
+                if gap is not None:
+                    entry["findings"].append(gap.to_dict())
+                    ok = False
             ports.append(entry)
 
     units = []
@@ -222,17 +334,31 @@ def tree_payload(cfg, path):
     rides = {link.unit.name: f"{name}/{link.name}" for name, port in cfg.ports.items()
              for link in port.links if link.unit}
     if cfg.units:
-        rows = collect_status(cfg, SuiteState.load(default_state_path()))
+        held = {e["bus"] for e in ports if e.get("presence", {}).get("held")}
+        if held:
+            held = {e["bus"] for e in ports}
+        rows = _unit_rows(cfg, held, SuiteState.load(default_state_path()))
         for unit, row in zip(cfg.units, rows):
             entry = {"name": unit.name,
                      "routes": [l.describe() for l in unit.links],
-                     "ok": row.up,
+                     "ok": row is not None and row.up,
                      "findings": as_data(by_node.get(f"units.{unit.name}", []))}
             if unit.name in rides:
                 entry["rides"] = rides[unit.name]
-            if not row.up:
+            if row is None:
+                entry["held"] = True
+            if not entry["ok"]:
                 ok = False
             else:
+                if unit.sensors and row.vm_state in _VM_NOT_RUNNING:
+                    # The declared personality does not run on a unit that
+                    # answers: the rig does not realize the declaration. The
+                    # unit's `vm` line says how it stands.
+                    off = Finding(f"units.{unit.name}", "its declared personality does not run",
+                                  ["nxs switch"])
+                    findings.append(off)
+                    entry["findings"].append(off.to_dict())
+                    ok = False
                 entry.update({"route": row.link, "serial": row.serial,
                               "fw": row.fw_version, "personality": row.driver,
                               "vm": row.vm_state, "sync": row.sync,
@@ -240,11 +366,12 @@ def tree_payload(cfg, path):
                               "samples": row.samples, "outputs": row.outputs,
                               "deviations": _deviations(row)})
             units.append(entry)
+    shipped, installed = _personality_counts()
     return {"contract": CONTRACT, "manifest": path, "ok": ok,
             "declaration": {"in_tune": not findings, "findings": as_data(findings),
                             "unplaced": as_data(rest)},
-            "personalities": {"dir": PERSONALITY_DIR,
-                              "installed": _installed_personalities()},
+            "personalities": {"dir": PERSONALITY_DIR, "shipped": shipped,
+                              "installed": installed},
             "ports": ports, "units": units}
 
 
@@ -263,7 +390,7 @@ def _render_port(entry, riders=()):
     # identity and its deviations print here and nowhere else. What it holds
     # is on the link's NXS rows above.
     if riders:
-        _render_units(riders, indent="    ", held=False)
+        _render_units(riders, indent="    ", personality=False)
     for finding in entry.get("findings", []):
         print(f"    ! {finding['text']}")
 
@@ -282,7 +409,9 @@ def _placement(units):
     return placed
 
 
-def _render_units(units, indent="  ", held=True):
+def _render_units(units, indent="  ", personality=True):
+    from nxs.cam.verbs.status import bus_held_text
+
     # One physical board may answer for several declared units; the serial
     # is the identity, so same-serial rows collapse.
     by_serial = {}
@@ -292,7 +421,9 @@ def _render_units(units, indent="  ", held=True):
     rendered = set()
     for u in units:
         if not u["ok"]:
-            print(f"{indent}{u['name']}  {'; '.join(u['routes'])}  NO ANSWER")
+            # Not read (the port's bus stayed another run's), or silent.
+            state = bus_held_text() if u.get("held") else "NO ANSWER"
+            print(f"{indent}{u['name']}  {'; '.join(u['routes'])}  {state}")
             for finding in u.get("findings", []):
                 print(f"{indent}  ! {finding['text']}")
             continue
@@ -303,8 +434,8 @@ def _render_units(units, indent="  ", held=True):
         if serial:
             rendered.add(serial)
         labels = {"fw": "fw", "personality": "sensor personality"}
-        extra = "  ".join(f"{labels[k]} {u[k]}" for k in (("fw", "personality") if held else ("fw",))
-                          if u.get(k) and u[k] != "-")
+        keys = ("fw", "personality") if personality else ("fw",)
+        extra = "  ".join(f"{labels[k]} {u[k]}" for k in keys if u.get(k) and u[k] != "-")
         ident = f"serial {serial}  " if serial else ""
         if len(names) > 1:
             routes = "; ".join(x["route"] for x in units
@@ -324,10 +455,13 @@ def _render_units(units, indent="  ", held=True):
 
 
 def render_tree(as_json: bool = False) -> int:
-    from nxs.suite import default_config_path
+    from nxs.suite import default_config_path, stray_declaration
     from nxs.suite.schema import ManifestError, load_suite_config
 
     path = default_config_path()
+    if (stray := stray_declaration(path)) is not None:
+        term.refusal_text(stray)
+        return 1
     if not os.path.exists(path):
         term.refusal(f"no suite manifest at {path}",
                      "nxs generate (writes one from what answers)",
@@ -356,14 +490,20 @@ def render_tree(as_json: bool = False) -> int:
         print(json.dumps(payload, indent=2))
         return 0 if payload["ok"] else 1
     findings = payload["declaration"]["findings"]
+    # The verdict line counts the declared units that do not answer, which
+    # print as NO ANSWER rows far below it.
+    silent = sum(1 for u in payload["units"] if not u["ok"] and not u.get("held"))
+    unanswered = (f", {silent} unit{'s do' if silent != 1 else ' does'} not answer"
+                  if silent else "")
     if findings:
-        print(f"declaration: OUT OF TUNE ({len(findings)} finding(s))")
+        print(f"declaration: OUT OF TUNE ({len(findings)} finding(s)){unanswered}")
         for finding in payload["declaration"]["unplaced"]:
             print(f"  ! {finding['text']}")
     else:
-        print("declaration: IN TUNE")
+        print(f"declaration: IN TUNE{unanswered}")
     store = payload["personalities"]
-    print(f"personalities: {store['dir']} ({store['installed']} installed)")
+    print(f"personalities: {store['dir']} ({store['shipped']} shipped, "
+          f"{store['installed']} installed)")
     if payload["ports"]:
         print("ports:")
         placed = _placement(payload["units"])

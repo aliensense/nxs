@@ -7,7 +7,8 @@ a CsiContract, and the capture layer validates the CsiContract against the DT.""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import math
+from dataclasses import dataclass, field, replace
 from typing import Dict, Optional, Tuple
 
 
@@ -81,12 +82,10 @@ class CsiContract:
 @dataclass(frozen=True)
 class RateRange:
     """The free-run rates a mode may run at in a port: the laws' floor and
-    ceiling narrowed to the shipped point the mode ships (``shipped``), or the
-    bare laws when it ships none; ``binds`` names the law that sets the ceiling."""
+    ceiling; ``binds`` names the law that sets the ceiling."""
 
     floor: float
     ceiling: float
-    shipped: bool
     binds: str
 
     #: Rates this close to an end (relative) are inside: a declared rate is
@@ -97,9 +96,33 @@ class RateRange:
         slack = self.TOLERANCE * max(self.ceiling, 1.0)
         return self.floor - slack <= float(fps) <= self.ceiling + slack
 
+    def shown(self) -> Tuple[float, float]:
+        """The ends to the hundredth and inside the range, the floor rounded
+        up and the ceiling down, so a rate copied from them is one the range
+        takes."""
+        return shown_rate(self.floor, up=True), shown_rate(self.ceiling)
+
     def text(self) -> str:
-        """`20–60 fps` (whole rates without decimals)."""
-        return f"{_rate_text(self.floor)}–{_rate_text(self.ceiling)} fps"
+        """`20–60 fps` (whole rates without decimals), the ends as `shown`."""
+        return "–".join(_rate_text(end) for end in self.shown()) + " fps"
+
+    def whole(self) -> Tuple[int, int]:
+        """The lowest and the highest whole rate inside the range, the
+        rates a refusal names."""
+        slack = self.TOLERANCE * max(self.ceiling, 1.0)
+        return math.ceil(self.floor - slack), math.floor(self.ceiling + slack)
+
+
+#: The decimals a rate in hundredths is rounded to before `shown_rate`
+#: rounds it to a whole hundredth: a rate that lands on one stays on it.
+SHOWN_DIGITS = 6
+
+
+def shown_rate(fps: float, up: bool = False) -> float:
+    """A rate to the hundredth as a person reads it, rounded down (up with
+    `up`)."""
+    scaled = round(float(fps) * 100, SHOWN_DIGITS)
+    return (math.ceil(scaled) if up else math.floor(scaled)) / 100
 
 
 def _rate_text(fps: float) -> str:
@@ -160,6 +183,12 @@ class LinkSpec:
         return self.sensor_compatible is not None
 
 
+#: The rate a port runs at when its declaration names none: a frame sync's
+#: generator, a free-running link (inside its lawful range), and the
+#: default of the port's capture table rows.
+FPS_DEFAULT = 30.0
+
+
 @dataclass(frozen=True)
 class SyncSpec:
     """Carrier-level sync: one generator, all links inherit."""
@@ -185,12 +214,21 @@ class Topology:
     # then writes nothing, so link walks are skipped and get/set refuse.
     camera_mode: Optional[str] = None  # declared mode token (suite.yaml)
     camera_fps: Optional[float] = None
-    camera_exposure_us: Optional[float] = None  # under frame sync, microseconds
+    camera_exposure_us: Optional[float] = None  # declared (us): refused where the pulse or the loop sets it
+    camera_gain_db: Optional[float] = None  # declared (dB): the camera links locked at it
     sync: SyncSpec = field(default_factory=SyncSpec)
     # The booted capture tree's node address per virtual channel, (vc, addr)
     # pairs: the address the kernel's per-frame controls for that channel
     # are written to. Empty when the tree is silent.
     node_addrs: Tuple[Tuple[int, int], ...] = ()
+    # The line the delivery check found a pair's head needs on this rig,
+    # (link, mode, HMAX in the head's clocks): the pair line law gives way
+    # to it for that mode. Empty on a port at the datasheet's line.
+    lines: Tuple[Tuple[str, str, int], ...] = ()
+    # The declaration the port is built from, one digest of every field that
+    # shapes it (`schema_ports.port_signature`); None for a port no manifest
+    # declares, and for one `on` brings up by hand away from its declaration.
+    declared: Optional[str] = None
 
     @property
     def camera_links(self) -> Tuple[LinkSpec, ...]:
@@ -200,6 +238,41 @@ class Topology:
     @property
     def is_dual(self) -> bool:
         return len(self.camera_links) > 1
+
+    @property
+    def cameras(self) -> int:
+        """The camera count the port's links make: 1 for one camera link
+        (or none), 2 for the pair; a link with a pod and no camera counts
+        for none."""
+        return 2 if self.is_dual else 1
+
+    def with_modes(self, modes: Dict[str, str]) -> "Topology":
+        """The port with each link `modes` names declared in its mode (link
+        name -> mode name or token), the others as they are: the laws a
+        pair's head is judged by read its partner's mode from the port."""
+        if not modes:
+            return self
+        return replace(self, links=tuple(
+            replace(l, mode=modes[l.name]) if l.name in modes else l for l in self.links))
+
+    def with_lines(self, lines: Dict[str, Tuple[str, int]]) -> "Topology":
+        """The port with each named link running its mode at the line found
+        for it on the rig (link name -> (mode, HMAX)); the others at the
+        line the laws give."""
+        return replace(self, lines=tuple((name, str(mode), int(hmax))
+                                         for name, (mode, hmax) in sorted(lines.items())))
+
+    @property
+    def synced_fps(self) -> float:
+        """The rate the port runs under a declared frame sync: `camera.mode@fps`,
+        else `sync.fps`, else the one rate its links declare, else
+        FPS_DEFAULT."""
+        if self.camera_fps is not None:
+            return float(self.camera_fps)
+        if self.sync.fps is not None:
+            return float(self.sync.fps)
+        rates = {float(l.fps) for l in self.camera_links if l.fps is not None}
+        return rates.pop() if len(rates) == 1 else FPS_DEFAULT
 
     def node_addr(self, vc: int) -> Optional[int]:
         """The booted capture node's address for a virtual channel; None
@@ -220,6 +293,22 @@ class Topology:
             if spec.name == name:
                 return spec
         raise ContractError(f"No link named {name!r} in topology")
+
+
+@dataclass(frozen=True)
+class FollowPlan:
+    """What the follower copies each frame on a synced pair that follows its
+    leader: the two links, each head's host address, the gain register as
+    (address, width in bytes, byte order `le` or `be`), the register hold as
+    (address, value on, value off), and the gain one register step is, in dB."""
+
+    leader: str
+    follower: str
+    leader_addr: int
+    follower_addr: int
+    register: Tuple[int, int, str]
+    hold: Tuple[int, int, int]
+    db_per_step: float
 
 
 @dataclass(frozen=True)

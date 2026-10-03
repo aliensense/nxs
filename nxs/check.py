@@ -45,14 +45,18 @@ def shape_findings(path: str) -> list:
     return schemas.findings(raw, schemas.SUITE, where=path)
 
 
-def check_config(cfg) -> list:
-    """Findings for a loaded SuiteConfig; empty means IN TUNE."""
+def check_config(cfg, booted: bool = True) -> list:
+    """Findings for a loaded SuiteConfig; empty means IN TUNE. With `booted`
+    False the findings that hold the declaration against the booted tree
+    (its lane count, its modes, its capture nodes) are left out: `nxs
+    switch` judges a declaration before it writes that tree."""
     findings = []
 
     for name in sorted(cfg.ports):
         port = cfg.ports[name]
         where = f"ports.{name}"
-        if (port.hub_compatible is not None or port.links) and port.csi_lanes_declared:
+        if (booted and (port.hub_compatible is not None or port.links)
+                and port.csi_lanes_declared):
             # The overlay fixed the capture side's lane count at boot; a port
             # programmed for another count gives no video.
             try:
@@ -89,6 +93,7 @@ def check_config(cfg) -> list:
         # Camera behavior is declared at the port or per link; a port
         # declaring none has nothing to judge.
         declared = (port.camera_mode is not None or port.camera_fps is not None
+                    or port.camera_exposure_us is not None or port.camera_gain_db is not None
                     or port.sync_source != "free_run"
                     or any(l.camera_mode for l in port.links))
         if (port.hub_compatible is None and not port.links) or not declared:
@@ -98,6 +103,7 @@ def check_config(cfg) -> list:
             from nxs.cam import topology as cam_topo
             from nxs.cam.contracts import InfeasibleConfig
             from nxs.cam.descriptors import resolve_mode
+            from nxs.cam.run import _resolve_modes
         except Exception as exc:
             findings.append(Finding(where, f"camera layer unavailable ({exc})"))
             continue
@@ -121,48 +127,59 @@ def check_config(cfg) -> list:
             continue
         # The port's mode token must name a mode of every link's sensor
         # (a mixed hub declares per-link modes in links.<name>.camera).
-        resolved = {}
+        declared_modes, refused = {}, False
         for link in cams:
             token = link.mode or port.camera_mode
+            if token is None:
+                continue
             try:
-                if token is None:
-                    # No mode declared for this link: `on` composes the
-                    # sensor's default mode.
-                    resolved[link.name] = pack.flows().default_mode(pack, link)
-                else:
-                    resolved[link.name] = resolve_mode(
-                        pack.descriptor(link.sensor_compatible), token)
+                declared_modes[link.name] = resolve_mode(
+                    pack.descriptor(link.sensor_compatible), token)
             except InfeasibleConfig as exc:
+                refused = True
                 findings.append(Finding(
                     f"{where}.camera.mode",
                     f"link {link.name} ({link.sensor_compatible}): {exc.reason}",
                     exc.alternatives))
-        if len(resolved) != len(cams):
+        if refused:
             continue
-        # The capture stack demosaics every mode of a node by one Bayer
-        # phase, so the port's boot table carries the rows of one phase.
+        # A link with no declared mode runs the highest mode the port's
+        # laws admit (`on` resolves it the same way); that mode is judged.
+        try:
+            resolved = _resolve_modes(pack.flows(), pack, list(cams), declared_modes, topology)
+        except InfeasibleConfig as exc:
+            findings.append(Finding.of(f"{where}.camera.mode", exc))
+            continue
+        # The capture stack takes a node's modes in its first mode's bit depth
+        # and Bayer phase, so the port's boot table carries one of each.
         from nxs.host import capture_table as tables
-        table_sensors = ([pack.descriptor(l.sensor_compatible).name for l in cams]
-                         if topology.is_direct else None)
-        left_out = {m.key: m for m in tables.excluded_rows(pack, table_sensors)}
+        left_out = {m.key: m for m in tables.excluded_rows(
+            pack, tables.port_sensors(pack, topology), **tables.table_layout(pack, topology))}
         if left_out:
-            phase = tables.table_phase(tables.capture_table(pack, table_sensors))
+            depth, phase = tables.table_format(tables.port_table(pack, topology))
             for link in cams:
                 sen = pack.descriptor(link.sensor_compatible)
                 geo = sen.modes[resolved[link.name]]["geometry"]
-                key = (sen.compatible, int(geo["width"]), int(geo["height"]),
-                       int(geo["bit_depth"]))
-                if key in left_out:
-                    findings.append(Finding(
-                        f"{where}.links.{link.name}",
-                        f"link {link.name}: {resolved[link.name]} ({left_out[key].pixel_phase}) "
-                        f"cannot share the port's boot table with its {phase} rows: the "
-                        f"capture stack demosaics every mode of a node by one Bayer phase",
-                        [f"declare a {phase} mode on the link"]))
+                row = left_out.get((sen.compatible, int(geo["width"]), int(geo["height"]),
+                                    int(geo["bit_depth"])))
+                if row is None:
+                    continue
+                if row.bit_depth != depth:
+                    fact = (f"{resolved[link.name]} (RAW{row.bit_depth}) cannot share the port's "
+                            f"boot table with its RAW{depth} rows: the capture stack captures "
+                            f"every mode of a node in one pixel format")
+                    alternative = f"declare a RAW{depth} mode on the link"
+                else:
+                    fact = (f"{resolved[link.name]} ({row.pixel_phase}) cannot share the port's "
+                            f"boot table with its {phase} rows: the capture stack demosaics "
+                            f"every mode of a node by one Bayer phase")
+                    alternative = f"declare a {phase} mode on the link"
+                findings.append(Finding(f"{where}.links.{link.name}",
+                                        f"link {link.name}: {fact}", [alternative]))
         try:
             from nxs import host as host_layer
             host = host_layer.current()
-            if host.booted_modes(topology.i2c_bus):
+            if booted and host.booted_modes(topology.i2c_bus):
                 for link in cams:
                     sen = pack.descriptor(link.sensor_compatible)
                     geo = sen.modes[resolved[link.name]]["geometry"]
@@ -186,39 +203,31 @@ def check_config(cfg) -> list:
         except Exception as exc:
             findings.append(Finding(where, f"the booted capture table could not be "
                                            f"checked: {exc}"))
-        synced_rate = None
         if port.sync_source == "fsync":
-            # The generator's pulse rate: `camera.mode@fps`, or the `sync.fps` a
-            # per-link freeze writes; `on` applies either the same way.
-            synced_rate = (port.camera_fps if port.camera_fps is not None
-                           else port.sync_fps)
-        if synced_rate is not None:
-            # A synced pair's fps is the generator's pulse rate: the trigger
-            # laws judge it, not the free-run ceiling.
-            label = "camera.mode" if port.camera_fps is not None else "sync.fps"
-            try:
-                kwargs = {"modes": resolved}
-                if port.camera_exposure_us is not None:
-                    kwargs["exposure_us"] = float(port.camera_exposure_us)
-                    label = "camera.exposure_us"
-                pack.flows().build_fsync(pack, topology, float(synced_rate), **kwargs)
-            except InfeasibleConfig as exc:
-                findings.append(Finding.of(f"{where}.{label}", exc))
-            except Exception as exc:  # a pack without the trigger overlay
-                findings.append(Finding.of(f"{where}.camera.sync", exc))
-        elif synced_rate is None and port.sync_source == "fsync":
+            # A synced pair runs the generator's rate, `synced_fps` as in `on`;
+            # the trigger laws judge it, not the free-run ceiling.
             declared = {l.name: l.fps for l in cams if l.fps is not None}
-            if len({round(r, 6) for r in declared.values()}) > 1:
+            if (port.camera_fps is None and port.sync_fps is None
+                    and len({round(r, 6) for r in declared.values()}) > 1):
                 rates = ", ".join(f"{n} {r:g}" for n, r in sorted(declared.items()))
                 findings.append(Finding(
                     f"{where}.links", f"under frame sync the pair runs one rate ({rates})",
                     ["declare one fps"]))
+            else:
+                label = ("camera.mode" if port.camera_fps is not None
+                         else "sync.fps" if port.sync_fps is not None
+                         else f"links.{min(declared)}.camera.fps" if declared else "sync")
+                try:
+                    pack.flows().build_fsync(pack, topology, topology.synced_fps, modes=resolved)
+                except InfeasibleConfig as exc:
+                    findings.append(Finding.of(f"{where}.{label}", exc))
+                except Exception as exc:  # a pack without the trigger overlay
+                    findings.append(Finding.of(f"{where}.camera.sync", exc))
         else:
             # Every link's declared rate (its own, else the port's) is
-            # judged by its resolved mode: the lawful range of the port's
-            # port (the laws, narrowed to the shipped shipped point), then the
-            # pack's timing law at that rate's VMAX (the same laws `on`
-            # composes with); free-running links keep their own frames.
+            # judged by its resolved mode: the lawful range on the port,
+            # then the pack's timing law at that rate's VMAX (the same laws
+            # `on` composes with); free-running links keep their own frames.
             from nxs.cam import timing as cam_timing
             for link in cams:
                 fps = link.fps if link.fps is not None else port.camera_fps
@@ -233,6 +242,24 @@ def check_config(cfg) -> list:
                 if refusal:
                     fact, alternatives = parse_refusal(refusal)
                     findings.append(Finding(f"{where}.{key}", f"{fact}{at}", alternatives))
+        synced = port.sync_source == "fsync"
+        if port.camera_exposure_us is not None and (synced or port.camera_gain_db is None):
+            # The finding names what sets the exposure: the pulse on a synced
+            # pair, the capture stack's loop unless a declared gain locks it.
+            from nxs.cam.verbs.sync import declared_exposure_fact
+            fact = declared_exposure_fact(topology, synced)
+            findings.append(Finding(f"{where}.camera.exposure_us", fact, ["drop the key"]))
+        if port.camera_gain_db is not None:
+            # The lock `on` writes, judged by the pack's laws.
+            lock = getattr(pack.flows(), "build_gain_lock", None)
+            if lock is None:
+                findings.append(Finding(f"{where}.camera.gain_db",
+                                        f"pack {pack.name} writes no gain lock", ["drop the key"]))
+            else:
+                try:
+                    lock(pack, topology, port.camera_gain_db, synced)
+                except InfeasibleConfig as exc:
+                    findings.append(Finding.of(f"{where}.camera.gain_db", exc))
 
     for unit in cfg.units:
         for i, spec in enumerate(unit.sensors or []):

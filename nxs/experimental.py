@@ -1,20 +1,18 @@
 # Copyright (c) 2026 Aliensense.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The experimental switch: `nxs --experimental …` unlocks three things.
+"""The experimental switch: `nxs --experimental …` reads a pack root and the
+experimental overlays ($NXS_CAM_DESCRIPTORS, $NXS_CAM_EXPERIMENTAL) and takes
+a development personality store.
 
-Without it the tool is the product: the shipped modes and their rates,
-the shipped pack. With it, the unshipped modes appear (marked), a pack
-root and the experimental overlays are read ($NXS_CAM_DESCRIPTORS,
-$NXS_CAM_EXPERIMENTAL). The flag sets `NXS_EXPERIMENTAL=1` so a daemon, an MCP
-subprocess and the pack loader in another process agree.
+Without it the tool is the product: the shipped pack and the release's
+store, every mode their programs carry. The flag sets `NXS_EXPERIMENTAL=1`
+so a daemon, an MCP subprocess and the pack loader in another process agree.
 """
 
 from __future__ import annotations
 
-import argparse
 import os
-from typing import Any
 
 ENV = "NXS_EXPERIMENTAL"
 FLAG = "--experimental"
@@ -40,30 +38,3 @@ def disable() -> None:
     global _enabled
     _enabled = False
     os.environ.pop(ENV, None)
-
-
-def refusal(what: str) -> str:
-    """The sentence a locked option or value is refused with."""
-    return (f"{what} is experimental — run: nxs {FLAG} <port> [<link>] "
-            f"<verb> …")
-
-
-class _Refuse(argparse.Action):
-    """A locked option: it parses (so the help stays honest about its
-    existence under the flag) and refuses by name."""
-
-    def __call__(self, parser, namespace, values, option_string=None):
-        parser.error(refusal(option_string or self.dest))
-
-
-def argument(parser: argparse.ArgumentParser, *flags: str, **kwargs: Any) -> None:
-    """Declare an option that exists only under the flag. Unlocked it is
-    the ordinary option; locked it is hidden from the help and refuses
-    with the sentence naming the flag."""
-    if enabled():
-        parser.add_argument(*flags, **kwargs)
-        return
-    dest = kwargs.get("dest")
-    parser.add_argument(*flags, action=_Refuse, nargs="?",
-                        help=argparse.SUPPRESS, default=kwargs.get("default"),
-                        **({"dest": dest} if dest else {}))

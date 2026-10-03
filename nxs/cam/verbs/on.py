@@ -1,9 +1,12 @@
-"""`on` and `off`: bring a port's links up through the plan, verify the lock and the sensors, park the port."""
+"""`on` and `off`: bring a port's links up through the plan, verify the lock and the sensors, build the capture
+stack's configuration the booted table lacks, verify the delivery, park the port."""
 
 from __future__ import annotations
 
 import argparse
-from typing import Any, Callable, Dict, List
+import dataclasses
+import functools
+from typing import Callable, Dict, List, Optional
 
 
 from nxs import term
@@ -16,9 +19,11 @@ from nxs.cam import viewers
 from nxs.cam import run as cam_run
 from nxs.cam import identity as cam_identity
 from nxs.cam.identity import _declared_camera, _require_nxs_hub, _verify_hub_identity, detect_sensor, sensor_identity_line
-from nxs.cam.run import TRAIN_ROUNDS, _accepted, _compose_from, _mode_arg, _port_links, _rates_arg, _resolve_modes, unit_program_refusal
+from nxs.cam.run import TRAIN_ROUNDS, _compose_from, _mode_arg, _port_links, _rates_arg, _resolve_modes, unit_program_refusal
 from nxs.cam.select import _declare, _pack_for, _port_name, _refuse, select_port_links
-from nxs.cam.verbs.sync import _fsync_plan, _hints_by_link, _port_viewer_hint, _record_sync, plan_text
+from nxs.cam.verbs import verify
+from nxs.cam.verbs.sync import (_fsync_plan, _hints_by_link, _pair_ae, _port_viewer_hint, _record_sync,
+                                declared_exposure_fact, plan_text)
 
 
 def _prepare_hub(pack, flows, topology, links) -> None:
@@ -74,6 +79,8 @@ def cmd_up(args: argparse.Namespace) -> int:
     pack = _pack_for(topology)
     topology, links, modes = _declare(pack, topology, links, args)
     modes = _declared_camera(pack, topology, links, modes, args)
+    declared_ports = _manifest_ports(topology)
+    topology = _as_recorded(topology, links, args)
     flows = pack.flows()
     host = host_layer.current()
     port = _port_name(topology)
@@ -104,27 +111,63 @@ def cmd_up(args: argparse.Namespace) -> int:
     # node for the channel it rides; a gap regenerates the port's overlay
     # from the pack and asks for the reboot.
     planned = _resolve_modes(flows, pack, cameras, modes, topology)
+    # A mode the port's table boots no row for is refused here, before the
+    # overlay is written: the table carries one pixel format, chosen by the
+    # declaration, so regenerating it carries the same rows.
+    from nxs.host import capture_table as tables
+    partial = len(links) < len(topology.links)
+    chosen = f" {' '.join(l.name for l in links)}" if partial else ""
+    for link in cameras:
+        if link.name in planned:
+            tables.refuse_without_row(pack, topology, link, pack.descriptor(link.sensor_compatible),
+                                      planned[link.name], port, f"nxs {port}{chosen} on")
     vcs = {link.name: int(vc.vc) for link, vc in zip(cameras, csi.virtual_channels)
            if vc is not None}
-    from nxs.host.cli import capture_stack_state, reboot_rule
-    reboot = reboot_rule(host, pack, topology, cameras, planned,
-                         install_overlays=True, vcs=vcs)
+    from nxs.host.cli import BootTableRefused, capture_stack_state, reboot_rule
+    try:
+        reboot = reboot_rule(host, pack, topology, cameras, planned,
+                             install_overlays=True, vcs=vcs, declared=declared_ports)
+    except BootTableRefused as exc:
+        # Nothing was installed: the gap, then why, and no reboot to ask for.
+        term.refusal_text("\n".join(exc.gap + [str(exc)]))
+        return 1
     if reboot:
         print(f"REBOOT NEEDED:\n{reboot}")
         return 3
-    # The capture stack's configuration is built for the booted table by
-    # nxsd after the reboot, or by `nxs switch`; `on` never builds it. A
-    # pod alone streams no video and needs none.
+    # The capture stack's configuration for the booted table is built after
+    # the walk, once the heads stream (`_build_capture_stack`); a build in
+    # another run holds the port meanwhile. A pod alone streams no video
+    # and needs none.
     state = capture_stack_state(host, port, topology) if cameras else "ready"
     if state == "preparing":
         term.refusal(f"{port}: preparing the capture stack",
-                     "wait for nxsd, then run this command again")
-        return 1
-    if state == "missing":
-        term.refusal(f"{port}: the capture stack's configuration for the "
-                     f"booted table is not built", "nxs switch")
+                     "wait for the build, then run this command again")
         return 1
     running = _resolve_modes(flows, pack, cameras, modes, topology)
+    # A declared trigger is the port's whole-port behaviour: a solo on a
+    # declared fsync port runs free.
+    declared_fsync = topology.sync.source == "fsync" and not partial and bool(cameras)
+    # A declared gain locks the camera links brought up; a solo on a declared
+    # fsync port runs its own loop.
+    locked = (bool(cameras) and topology.camera_gain_db is not None
+              and (declared_fsync or topology.sync.source != "fsync"))
+    if topology.camera_exposure_us is not None and (declared_fsync or not locked):
+        # A declared exposure is refused before the bus: the pulse sets it on a
+        # synced pair, the link's own loop unless a declared gain locks it.
+        raise InfeasibleConfig(
+            f"ports.{port}.camera.exposure_us: "
+            + declared_exposure_fact(topology, declared_fsync),
+            alternatives=["drop the key"])
+    lock = _gain_lock(pack, flows, _port_links(topology, links), declared_fsync) if locked else None
+    overlay = plan = None
+    if declared_fsync:
+        # The trigger overlay is composed and its rate judged before the first
+        # bus write, at the one rate the bring-up asks, else the declaration's.
+        asked = _rates_arg(args, links) or {}
+        fps = (float(next(iter(asked.values()))) if len(set(asked.values())) == 1
+               else topology.synced_fps)
+        overlay = flows.build_fsync(pack, topology, fps=fps, method="manual", modes=running)
+        plan = _fsync_plan(flows, pack, topology, fps, running)
     if args.dry_run:
         # The plan's summary: what the port would be, no write stream.
         for line in _port_lines(pack, links, running, csi):
@@ -149,33 +192,24 @@ def cmd_up(args: argparse.Namespace) -> int:
 
         def bring_up() -> bool:
             return cam_run.run_graph(pack, topology, links, running, rates, images, "up")
-    with port_state.BusLock():
-        if not topology.is_direct:
-            _prepare_hub(pack, flows, topology, links)
-        ok = bring_up()
+    try:
+        with port_state.BusLock():
+            if not topology.is_direct:
+                _prepare_hub(pack, flows, topology, links)
+            ok = bring_up()
+    except cam_run.WalkStopped as exc:
+        return _walk_stopped(pack, topology, links, partial, str(exc))
     names = "+".join(l.name for l in links)
+    record = functools.partial(_record_up, pack, flows, topology, links, csi, running, args)
     if ok:
-        rates = dict(getattr(csi, "rates", None) or {})
-        save_port(topology, links, csi,
-                   viewer=(_port_viewer_hint(pack, flows, topology, links,
-                                             _mode_arg(args), rates=rates or None)
-                           if cameras else None),
-                   viewers=(_hints_by_link(pack, flows,
-                                           _port_links(topology, links),
-                                           links, running or None,
-                                           rates=rates or None)
-                            if cameras else None),
-                   modes=running, rates=rates or None)
-        port_state.set_sync("free_run", topology=topology)
+        record()
+        port_state.set_sync("free_run", topology=topology,
+                            ae=_pair_ae(pack, flows, topology, "free_run"))
         for line in _port_lines(pack, links, running, csi):
             term.info(line)
     print(f"up {names}: {'ok' if ok else 'HAD ERRORS'}")
-    # A declared trigger is the port's whole-port behaviour: a solo on a
-    # declared fsync port runs free.
-    partial = len(links) < len(topology.links)
-    declared_fsync = topology.sync.source == "fsync" and not partial and bool(cameras)
-    verify = getattr(flows, "video_locked", None)
-    if ok and cameras and verify is not None and not declared_fsync:
+    video_locked = getattr(flows, "video_locked", None)
+    if ok and cameras and video_locked is not None and not declared_fsync:
         # A byte-perfect program can land on a sensor holding stale state and
         # produce no video: follow the des lock.
         dead = _dead_pipes(pack, flows, topology, csi, links)
@@ -185,7 +219,10 @@ def cmd_up(args: argparse.Namespace) -> int:
             # after it.
             term.info(f"video did not lock on pipe {'+'.join(dead)}; recovering "
                       f"the links")
-            dead = _relock(pack, flows, topology, csi, links, bring_up)
+            try:
+                dead = _relock(pack, flows, topology, csi, links, bring_up)
+            except cam_run.WalkStopped as exc:
+                return _walk_stopped(pack, topology, links, partial, str(exc))
         if dead:
             port = _port_name(topology)
             silent = ([l for l, p in sorted(csi.pipes.items()) if p in dead]
@@ -205,33 +242,137 @@ def cmd_up(args: argparse.Namespace) -> int:
                   f"port, {names} runs free\n  - nxs {_port_name(topology)} on "
                   f"(the trigger needs every link)")
     if ok and declared_fsync:
-        # One rate asked of the bring-up is the generator's; else the manifest's.
-        asked = _rates_arg(args, links) or {}
-        if len(set(asked.values())) == 1:
-            fps = float(next(iter(asked.values())))
-        else:
-            fps = float(topology.camera_fps or topology.sync.fps or 30.0)
-        exposure = topology.camera_exposure_us
-        kwargs: Dict[str, Any] = {"fps": fps, "method": "manual"}
-        if exposure is not None:
-            if "exposure_us" not in _accepted(flows.build_fsync):
-                raise InfeasibleConfig(
-                    "the declared frame sync names an exposure this pack's "
-                    "frame sync does not take")
-            kwargs["exposure_us"] = exposure
-        overlay = flows.build_fsync(pack, topology, **kwargs)
-        plan = _fsync_plan(flows, pack, topology, fps, exposure, None)
         with port_state.BusLock():
             ok = cam_run._execute_split(overlay, topology, "fsync", guard=(pack, topology))
         if ok:
             _record_sync(pack, flows, topology, "fsync", fps, plan=plan)
             print(f"declared sync: {plan_text(plan) if plan else f'fsync {fps:g} fps'}")
+    if ok and lock is not None:
+        # Once, over the converted heads and before the count: the sessions the
+        # count opens run their loops locked at the gain the heads carry.
+        with port_state.BusLock():
+            ok = cam_run._execute_split(lock, topology, "gain-lock", guard=(pack, topology))
+        if ok:
+            print(f"declared gain: {float(topology.camera_gain_db):.1f} dB on "
+                  + " and ".join(l.name for l in cameras))
+    if ok and cameras and state == "missing":
+        # The build's sessions open each head through the kernel driver at
+        # the host address the walk's translation gives it: the build
+        # follows the walk, and the count follows the build.
+        ok = _build_capture_stack(host, topology, links, f"nxs {port}{chosen} on")
     if ok and cameras:
+        # The port is up once every camera link delivers the rate it runs; a
+        # hub pair finds the line its line memory carries on the way.
+        retry = f"nxs {port}{chosen} on --fps {{fps}}"
+        try:
+            if _finds_its_line(flows, topology, cameras):
+                verify.search(pack, topology, cameras, retry, record)
+            else:
+                verify.check(pack, topology, cameras, retry=retry)
+        except InfeasibleConfig as exc:
+            port_state.mark_unknown(topology, links)
+            term.refusal(exc.reason, *exc.alternatives)
+            return 2
+    if ok and not getattr(args, "inner", False):
+        # The operator's own `on` names the next verb; `switch` and nxsd go on with theirs.
         sel = " ".join(l.name for l in links)
-        print(f"next: nxs {port} {sel} stream")
-    elif ok:
-        print("next: nxs status")
+        print(f"next: nxs {port} {sel} stream" if cameras else "next: nxs status")
     return 0 if ok else 1
+
+
+def _walk_stopped(pack, topology: Topology, links: List[LinkSpec], partial: bool,
+                  line: str) -> int:
+    """A walk that stopped under way parks what it started, then ends on
+    its line and the port's status under it, the last lines `nxsd` reads
+    its verdict from. A pod run still live is aborted, and for the whole
+    port the host's park program stands every head by and each pod whose
+    run ended parks its own: no sensor is left streaming, no pod left
+    running. The links stay unknown, so the next `on`, the watch and a
+    reload bring them up again."""
+    port = _port_name(topology)
+    port_state.mark_unknown(topology, links)
+    cam_run.abort_pods(topology, links)
+    if not partial:
+        ok = _park(pack, topology)
+        term.info(f"{port}: parked after the stopped bring-up" if ok else "park HAD ERRORS")
+    term.refusal(line, f"nxs {port} status")
+    return 1
+
+
+def _manifest_ports(topology: Topology) -> Optional[List[str]]:
+    """The ports the manifest declares when this port is one of them (it
+    carries the declaration's digest); None for a port brought up by hand,
+    whose boot entry keeps every port it names."""
+    if topology.declared is None:
+        return None
+    from nxs.suite import default_config_path
+    from nxs.suite.schema import ManifestError, load_suite_config
+
+    try:
+        return sorted(load_suite_config(default_config_path()).ports)
+    except (ManifestError, OSError):
+        return None
+
+
+def _as_recorded(topology: Topology, links: List[LinkSpec], args: argparse.Namespace) -> Topology:
+    """The port as `on` records it: carrying the manifest's declaration
+    (`declared`) only when the bring-up runs it as declared. A flag that
+    declares by hand (`--sensor`, `--mode`, `--fps`) or some of the port's
+    links alone records none, so `switch` and a reload of nxsd bring the
+    port back to its declaration."""
+    by_hand = any(getattr(args, flag, None) for flag in ("sensor", "mode", "fps"))
+    if by_hand or len(links) < len(topology.links):
+        return dataclasses.replace(topology, declared=None)
+    return topology
+
+
+def _gain_lock(pack, flows, topology: Topology, synced: bool):
+    """The pack's program writing the declared `camera.gain_db` to the heads of
+    the port's camera links, composed and judged before the first bus write.
+
+    Raises:
+        InfeasibleConfig: The pack's refusal, or a pack that writes no gain
+            lock, under the declaration's key.
+    """
+    gain_db = topology.camera_gain_db
+    where = f"ports.{_port_name(topology)}.camera.gain_db"
+    hook = getattr(flows, "build_gain_lock", None)
+    if hook is None:
+        raise InfeasibleConfig(f"{where}: pack {pack.name} writes no gain lock",
+                               alternatives=["drop the key"])
+    try:
+        return hook(pack, topology, float(gain_db), synced)
+    except InfeasibleConfig as exc:
+        raise InfeasibleConfig(f"{where}: {exc.reason}", alternatives=exc.alternatives) from exc
+
+
+def _record_up(pack, flows, topology: Topology, links: List[LinkSpec], csi,
+               running: Dict[str, str], args: argparse.Namespace,
+               line: Optional[Dict[str, int]] = None) -> Topology:
+    """Record the port up, each camera link's capture caps derived at
+    `line` (HMAX by link, the pair's line the delivery check found; the
+    datasheet's when None) with its part in the free-running port's
+    exposure and gain; the port at that line."""
+    cameras = [l for l in links if l.has_camera]
+    port = topology.with_lines({name: (running[name], hmax) for name, hmax in (line or {}).items()})
+    rates = dict(getattr(csi, "rates", None) or {}) or None
+    save_port(topology, links, csi,
+              viewer=(_port_viewer_hint(pack, flows, port, links, _mode_arg(args), rates=rates)
+                      if cameras else None),
+              viewers=(_hints_by_link(pack, flows, _port_links(port, links), links,
+                                      running or None, rates=rates,
+                                      ae=_pair_ae(pack, flows, topology, "free_run"))
+                       if cameras else None),
+              modes=running, rates=rates, line=line)
+    return port
+
+
+def _finds_its_line(flows, topology: Topology, cameras: List[LinkSpec]) -> bool:
+    """A pair behind a hub whose pack reads the line-memory overflow and
+    retimes the pair: its line is found on the rig; a solo and a direct
+    port run the datasheet's."""
+    return (not topology.is_direct and len(cameras) == 2
+            and all(hasattr(flows, hook) for hook in ("line_overflow", "build_timing")))
 
 
 def _dead_pipes(pack, flows, topology: Topology, csi, links: List[LinkSpec]) -> List[str]:
@@ -267,6 +408,37 @@ def _relock(pack, flows, topology: Topology, csi, links: List[LinkSpec],
         if not bring_up():
             return ["Y"]
     return _dead_pipes(pack, flows, topology, csi, links)
+
+
+def _build_capture_stack(host, topology: Topology, links: List[LinkSpec], retry: str) -> bool:
+    """The capture stack's configuration for the booted table, built (or
+    installed from the store) once the walk has the heads streaming: the
+    build's sessions open each head through the kernel driver at the host
+    address the walk's translation gives it, and a hub that lost power
+    lost the translation, so a build before the walk finds no head and
+    times out. `status` reads `preparing the capture stack` meanwhile. A
+    build that fails is refused with the fact and `retry`, the links left
+    unknown as after a failed count. True when the stack is ready."""
+    from nxs.host.cli import TuningRefused, ensure_tuning, preparing_marker
+
+    port = _port_name(topology)
+    marker = preparing_marker(port)
+    try:
+        marker.write_text("")
+        done = ensure_tuning(host, topology, log=print)
+    except TuningRefused as exc:
+        port_state.mark_unknown(topology, links)
+        term.refusal(f"{port}: {exc.fact}", *exc.alternatives)
+        return False
+    except (RuntimeError, PermissionError) as exc:
+        port_state.mark_unknown(topology, links)
+        term.refusal(f"{port}: the capture stack's configuration was not built ({exc})", retry)
+        return False
+    finally:
+        marker.unlink(missing_ok=True)
+    if done:
+        print(done)
+    return True
 
 
 def _port_lines(pack, links: List[LinkSpec], running: Dict[str, str],
@@ -357,15 +529,12 @@ def cmd_down(args: argparse.Namespace) -> int:
 
 def park_port(topology: Topology, selected: List[LinkSpec]) -> int:
     """Stop the selected links' viewers and, for the whole port, run the pack's
-    park program; takes the port itself, so a caller can park a declaration
-    the manifest does not carry."""
+    park program, then each pod's park action; takes the port itself, so a
+    caller can park a declaration the manifest does not carry."""
     for stopped in viewers.stop_viewers(topology, selected):
         print(f"viewer for link {stopped} stopped")
     if len(selected) == len(topology.links) and topology.links:
-        pack = _pack_for(topology)
-        cfg = pack.flows().build_park(pack, topology)
-        with port_state.BusLock():
-            ok = cam_run._execute(cfg.to_dict(), topology.i2c_bus, "down", guard=(pack, topology))
+        ok = _park(_pack_for(topology), topology)
         if ok:
             port_state.mark_parked(topology, selected)
         print("port parked (sensors in standby)"
@@ -374,3 +543,13 @@ def park_port(topology: Topology, selected: List[LinkSpec]) -> int:
     return 0
 
 
+def _park(pack, topology: Topology) -> bool:
+    """The pack's park program on the whole port, then each pod's park
+    action: the host's program stood the sensors by, and each pod parks its
+    own head too, so the unit's last run is a park."""
+    cfg = pack.flows().build_park(pack, topology)
+    with port_state.BusLock():
+        ok = cam_run._execute(cfg.to_dict(), topology.i2c_bus, "down", guard=(pack, topology))
+        if ok:
+            cam_run.park_pods(pack, topology)
+    return ok

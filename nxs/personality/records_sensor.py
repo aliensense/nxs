@@ -1,4 +1,4 @@
-"""The records a sensor declares about itself: its identity, its modes and shipped points, its triggers, run parameters, status probes and control rows."""
+"""The records a sensor declares about itself: its identity, its modes, its triggers, run parameters, status probes and control rows."""
 
 from __future__ import annotations
 
@@ -9,11 +9,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from nxs.cam.descriptors import Descriptor, to_int
 from nxs.personality.records_fields import (
     CONTROL_IDS, MAX_COMPATIBLE, MAX_NAME, MODE_PARAM, TRIGGER_PARAM,
-    RecordError, _CAMERA_COUNTS, _CONTROL_NAMES, _CONTROL_ROW,
-    _IDENTITY_FLAG_TAKES_TRIGGER, _IDENTITY_HEAD, _MODES_HEAD,
+    RecordError, _CONTROL_NAMES, _CONTROL_ROW,
+    _IDENTITY_FLAG_PULSE_EXPOSURE, _IDENTITY_FLAG_TAKES_TRIGGER,
+    _IDENTITY_HEAD, _MODES_HEAD,
     _MODE_FLAG_DEFAULT, _MODE_FLAG_SERIALIZER_CSI, _MODE_FLAG_TRIGGERABLE,
     _MODE_HEAD, _NONE_U16, _NONE_U8, _RETIRED_TIMING, _RUN_PARAM,
-    _RUN_PARAMS_HEAD, _SHIPPED_POINT, _TIMING_FIELDS, _TRIGGERS_HEAD,
+    _RUN_PARAMS_HEAD, _TIMING_FIELDS, _TRIGGERS_HEAD,
     _family_name, _fixed, _number, _read_text, _register, _register_spec,
     _text, _u, _unit_modes, _unpack)
 from nxs.cam.contracts import ContractError
@@ -137,29 +138,6 @@ def _encode_status(descriptor: Descriptor) -> Optional[bytes]:
             buf += _text(str(text), MAX_NAME, f"{name} decode text")
     return bytes(buf)
 
-def _encode_shipped(descriptor: Descriptor, modes: List[str]) -> Optional[bytes]:
-    """The SHIPPED record, None when the descriptor ships no point."""
-    by_mode = descriptor.shipped_points() if hasattr(descriptor, "shipped_points") else {}
-    if not any(by_mode.get(name) for name in modes):
-        return None
-    entries = bytearray()
-    count = 0
-    for value, name in enumerate(modes):
-        for point in by_mode.get(name) or []:
-            cameras = int(point["cameras"])
-            if cameras not in _CAMERA_COUNTS:
-                raise RecordError(f"{descriptor.name}: cameras {cameras!r}")
-            entries += _SHIPPED_POINT.pack(
-                _u(value, 8, "shipped point mode"),
-                cameras,
-                _u(point["csi_lanes"], 8, f"{name} csi_lanes"),
-                _fixed(point["fps"]["floor"], f"{name} fps floor"),
-                _fixed(point["fps"]["ceiling"], f"{name} fps ceiling"),
-                _u(point["hmax"], 16, f"{name} hmax"),
-                _u(point.get("trigger_vmax") or 0, 32, f"{name} trigger_vmax"))
-            count += 1
-    return struct.pack("<B", _u(count, 8, "shipped points")) + bytes(entries)
-
 def _alive_register(descriptor: Descriptor) -> Optional[int]:
     """The register the alive poll reads: the family's alive register for a
     generic part, STANDBY for a Sony one, None when neither is declared."""
@@ -176,17 +154,23 @@ def _alive_register(descriptor: Descriptor) -> Optional[int]:
 def _encode_identity(descriptor: Descriptor, modes: List[str]) -> bytes:
     meta = descriptor.raw("meta") or {}
     sync = descriptor.raw("sync") or {}
+    timing = (descriptor.raw("trigger") or {}).get("timing") or {}
     default = str(descriptor.raw("default_mode"))
     if default not in modes:
         raise RecordError(f"{descriptor.name}: default_mode {default!r} is not "
                           f"a mode the unit runs")
     id_reg = meta.get("device_id_reg")
     alive = _alive_register(descriptor)
+    flags = 0
+    if sync.get("takes_trigger"):
+        flags |= _IDENTITY_FLAG_TAKES_TRIGGER
+    if timing.get("pulse_width_is_exposure"):
+        flags |= _IDENTITY_FLAG_PULSE_EXPOSURE
     head = _IDENTITY_HEAD.pack(
         _u(meta.get("i2c_addr", 0x1A), 8, "meta.i2c_addr"),
         _u(meta.get("reg_bits", 16), 8, "meta.reg_bits"),
         _u(meta.get("val_bits", 8), 8, "meta.val_bits"),
-        _IDENTITY_FLAG_TAKES_TRIGGER if sync.get("takes_trigger") else 0,
+        flags,
         _NONE_U16 if id_reg is None else _u(id_reg, 16, "meta.device_id_reg"),
         _u(meta.get("device_id_width", 1), 8, "meta.device_id_width"),
         0 if id_reg is None else _u(meta.get("device_id", 0), 16, "meta.device_id"),
@@ -322,6 +306,7 @@ def _decode_identity(payload: bytes) -> Dict[str, Any]:
     compatible, _ = _read_text(payload, pos)
     return {"i2c_addr": addr, "reg_bits": reg_bits, "val_bits": val_bits,
             "takes_trigger": bool(flags & _IDENTITY_FLAG_TAKES_TRIGGER),
+            "pulse_width_is_exposure": bool(flags & _IDENTITY_FLAG_PULSE_EXPOSURE),
             "device_id_reg": None if id_reg == _NONE_U16 else id_reg,
             "device_id_width": id_width, "device_id": device_id,
             "alive_reg": None if alive == _NONE_U16 else alive,
@@ -407,33 +392,6 @@ def _mode_entry(m: Dict[str, Any]) -> Dict[str, Any]:
     if m.get("serializer_csi"):
         entry["serializer_csi"] = True
     return entry
-
-def _decode_shipped(payload: bytes, modes: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    """The shipped points by mode name, in the yaml's shape."""
-    if not payload:
-        raise RecordError("SHIPPED record empty")
-    count = payload[0]
-    pos = 1
-    out: Dict[str, List[Dict[str, Any]]] = {}
-    for _ in range(count):
-        if pos + _SHIPPED_POINT.size > len(payload):
-            raise RecordError("SHIPPED record truncated")
-        (mode_index, cameras, lanes, floor, ceiling, hmax,
-         trigger_vmax) = _SHIPPED_POINT.unpack_from(payload, pos)
-        pos += _SHIPPED_POINT.size
-        if mode_index >= len(modes):
-            raise RecordError(f"SHIPPED record names mode index {mode_index} "
-                              f"past the {len(modes)} modes")
-        if cameras not in _CAMERA_COUNTS:
-            raise RecordError(f"SHIPPED camera count {cameras}")
-        point: Dict[str, Any] = {
-            "cameras": int(cameras), "csi_lanes": int(lanes),
-            "fps": {"floor": _number(floor), "ceiling": _number(ceiling)},
-            "hmax": int(hmax)}
-        if trigger_vmax:
-            point["trigger_vmax"] = int(trigger_vmax)
-        out.setdefault(modes[mode_index]["name"], []).append(point)
-    return out
 
 def _decode_status(payload: bytes, registers: Dict[str, Any]) -> List[Dict[str, Any]]:
     """The status probes back in the yaml's shape. A probe's register joins

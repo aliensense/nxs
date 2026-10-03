@@ -237,7 +237,12 @@
         "exposure_us": {
           "type": "number",
           "exclusiveMinimum": 0,
-          "description": "Under frame sync, the integration time in microseconds: the generator runs a multiple of the frame rate and the sensors take every n-th pulse, so the exposure lands on the nearest step."
+          "description": "An integration time in microseconds. Under frame sync it is refused with the fact that sets the exposure, the trigger pulse's low time plus the sensor's trigger offset at the port's rate. In free run it locks the camera links' exposure together with `gain_db`, and without `gain_db` it is refused naming the capture stack's exposure loop. `nxs status` names it."
+        },
+        "gain_db": {
+          "type": "number",
+          "minimum": 0,
+          "description": "An analog gain in dB that locks the camera links, written to the heads once by `on`: a frame-synced pair of one sensor kind, or in free run every camera link together with `exposure_us`. A gain past the sensor's ceiling or off its step is refused naming the gains that fit."
         }
       }
     },

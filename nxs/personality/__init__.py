@@ -9,6 +9,7 @@ the installed pack."""
 
 from __future__ import annotations
 
+import importlib.machinery
 import importlib.util
 import os
 import re
@@ -41,6 +42,29 @@ class Personality:
 
 class PersonalityError(Exception):
     """A personality the tool cannot read as one; the message names why."""
+
+
+class _Uncached(importlib.machinery.SourceFileLoader):
+    """A source file loaded with no `__pycache__` written beside it."""
+
+    def set_data(self, path, data, *, _mode=0o666):
+        """The cache is the one thing the loader would write: dropped."""
+
+
+def load_source(module_name: str, path: str):
+    """The module `path` defines, run as `module_name` and registered so its
+    classes find their sibling descriptor. An import that fails leaves
+    nothing registered and raises as it failed."""
+    spec = importlib.util.spec_from_file_location(module_name, path,
+                                                  loader=_Uncached(module_name, path))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
 
 
 HOST_VERBS = ('check', 'install')
@@ -228,14 +252,9 @@ def _unit_findings(personality: Personality) -> List[str]:
     if personality.py_path is None:
         problems.append(f"{personality.name}.py: missing beside {personality.yaml_path}")
         return problems
-    spec = importlib.util.spec_from_file_location(
-        f"nxs_local_drivers.{personality.name}", personality.py_path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = mod
     try:
-        spec.loader.exec_module(mod)
+        mod = load_source(f"nxs_local_drivers.{personality.name}", personality.py_path)
     except Exception as e:
-        sys.modules.pop(spec.name, None)
         return problems + [f"{personality.py_path}: import failed: {e}"]
     classes = [obj for obj in vars(mod).values()
                if isinstance(obj, type) and issubclass(obj, SensorDriver)
@@ -308,10 +327,8 @@ def _mode_tables(doc: dict) -> Dict[str, str]:
 
 
 def _bench(personality: Personality) -> str:
-    """The bring-up line of a camera personality: a pair without a shipped
-    point runs under the experimental surface."""
-    flag = "" if personality.doc.get("shipped") else "--experimental "
-    return f"nxs {flag}<port> <link> on --sensor {personality.name}"
+    """The bring-up line of a camera personality."""
+    return f"nxs <port> <link> on --sensor {personality.name}"
 
 
 def _referenced_blobs(doc: dict) -> set:
@@ -421,7 +438,8 @@ def _store_writable(store: str) -> bool:
 def _place_as_root(stage: str, store: str, dest: str) -> None:
     """Put a staged personality into a root-owned store through sudo (a terminal is
     asked for the password, elsewhere sudo refuses); the copy lands root-owned."""
-    prefix = ["sudo"] + ([] if sys.stdin.isatty() else ["-n"])
+    from nxs.host.root import as_root
+
     # The copy and the ownership change land on a sibling first, so a
     # failure in either leaves the installed personality as it was.
     staged = f"{dest}.incoming"
@@ -434,13 +452,13 @@ def _place_as_root(stage: str, store: str, dest: str) -> None:
              ["mv", staged, dest])
     for argv in steps:
         try:
-            proc = subprocess.run(prefix + argv, capture_output=True, text=True)
+            proc = subprocess.run(as_root(argv), capture_output=True, text=True)
         except OSError as e:
-            subprocess.run(prefix + ["rm", "-rf", staged], capture_output=True)
+            subprocess.run(as_root(["rm", "-rf", staged]), capture_output=True)
             raise PersonalityError(f"cannot write {store}: {e}") from None
         if proc.returncode != 0:
             why = (proc.stderr or "").strip() or "sudo refused"
-            subprocess.run(prefix + ["rm", "-rf", staged], capture_output=True)
+            subprocess.run(as_root(["rm", "-rf", staged]), capture_output=True)
             raise PersonalityError(f"cannot write {store}: {why}")
 
 

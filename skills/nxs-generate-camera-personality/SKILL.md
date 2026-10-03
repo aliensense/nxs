@@ -35,7 +35,7 @@ find docs -name nxs-camera-personalities.md    # prints the file to read, wherev
 
 From `$ARGUMENTS`: the part number and the module it sits on. Two inputs:
 
-1. **The datasheet.** The I²C address; the register address and value widths; the identity register and its value, or without one a register that answers as soon as the core is out of reset; the stream gate; the readout modes with geometry, bit depth, lane count, link rate and top frame rate; the Bayer origin; the input clock; the timing, shutter and gain registers with their units and ranges; whether the clock lane is gated between bursts; whether the part takes an external trigger.
+1. **The datasheet.** The I²C address; the register address and value widths; the identity register and its value, or without one a register that answers as soon as the core is out of reset; the stream gate; the readout modes with geometry, bit depth, lane count, link rate and top frame rate, and for a `sony_imx` part each mode's row of the register lists (the recommended frame length, the line length, the rate at them, the section); the Bayer origin; the input clock; the timing, shutter and gain registers with their units and ranges; whether the clock lane is gated between bursts; whether the part takes an external trigger.
 2. **The vendor setting file.** The register sequence that programs each mode: the vendor driver's mode tables, an application note's setting list, or a capture of a working chain.
 
 A published kernel driver stands in for both inputs when the part has no datasheet in hand: its register defines and their comments carry the addresses, widths, units and ranges, its mode tables are the setting file, and the host's devicetree binding for the module carries the lane count, link rate, pixel clock, line length and frame length per mode. Take the facts only from what the source states; a value the source leaves out is `limits_source: driver` with the judgement call in a YAML comment, and a register the source never names does not exist. `meta.provenance` names each file with its repository, tag and licence.
@@ -166,11 +166,13 @@ modes:
   mode_full:
     geometry: {width: 1920, height: 1080, bit_depth: 10, lanes: 4, rate_mbps: 1188}
     timing: {hmax: 600, min_frame_length: 1250}
+    sony: {vmax: 1250, hmax: 600, max_fps: 96.0, section: "7.3.2"}
     mipi: {data_type: RAW10, trigger_input: XTRIG, embedded_lines: 0}
     table: cam2_mode_full.yaml
   mode_roi:
     geometry: {width: 1280, height: 720, bit_depth: 10, lanes: 4, rate_mbps: 1188}
     timing: {hmax: 600, min_frame_length: 850}
+    sony: {vmax: 850, hmax: 600, max_fps: 141.2, section: "7.3.3"}
     mipi: {data_type: RAW10, trigger_input: XTRIG, embedded_lines: 0}
     table: cam2_mode_roi.yaml
 
@@ -222,10 +224,11 @@ status:
 runtime_forbidden: []
 ```
 
-- Every `limits` entry has a `limits_source` (`datasheet`, `driver` or `measured`).
+- Every `limits` entry has a `limits_source`: `datasheet`, or `driver` where the vendor driver is the only public source. A number neither states stays out of the YAML; a bench measurement survives as a comment beside the fact it concerns.
 - `inck_hz` is the clock `HMAX` counts, `1H = HMAX / inck_hz`, which is not always the INCK pin's frequency: the datasheet's line-period formula names it.
-- A mode's `timing.hmax` is its line in that clock's counts and `timing.min_frame_length` the frame the datasheet recommends for it; the ceiling is `inck_hz / (hmax × min_frame_length)`. The capture row states neither `line_length` nor `max_fps`: the family derives them, `line_length = hmax × pix_clk_hz / inck_hz`, so `pix_clk_hz` is a whole multiple of `inck_hz`.
-- `trigger` presets carry the full register values of each conversion (`freerun`, `fast`), `mipi.trigger_input` names the pin the pulse arrives on, and `sync.takes_trigger` says the head takes the hub's pulse. A part without a trigger input has no `trigger:` block, no `trigger_input`, and `takes_trigger: false`.
+- A mode's `sony:` row is its line of the datasheet's register lists, copied as printed: `vmax` the recommended frame length V_TR, at which the datasheet guarantees the imaging characteristics, `hmax` the line length, `max_fps` the rate the datasheet states at them, `section` the list that states them. The family reads V_TR from the row (`sony_imx.recommended_frame_length`): the range's ceiling at the port's line, `inck_hz / (line × V_TR)`, the trigger frame under frame sync, and the rate below which `caps` marks the frame as longer than the datasheet's. A row without `vmax`, `hmax` or `section` is refused at load; a mode without a row takes V_TR from `timing.min_frame_length`.
+- A mode's `timing.hmax` is its line in that clock's counts, the row's `hmax`, and `timing.min_frame_length` the frame the datasheet recommends for it, the row's `vmax`. The capture row states neither `line_length` nor `max_fps`: the family derives them, `line_length = hmax × pix_clk_hz / inck_hz`, so `pix_clk_hz` is a whole multiple of `inck_hz`.
+- `trigger` presets carry the full register values of each conversion (`freerun`, `fast`), `mipi.trigger_input` names the pin the pulse arrives on, and `sync.takes_trigger` says the head takes the hub's pulse. A part without a trigger input has no `trigger:` block, no `trigger_input`, and `takes_trigger: false`. Set `trigger.timing.pulse_width_is_exposure: true` when the datasheet's fast-trigger timing makes the exposure the pulse width plus a fixed offset and ignores the shutter register; the trailer carries it, and under frame sync the host states the exposure as the pulse's low time from it. Leave it out otherwise.
 - `program` carries the settles, in ms after the write, of each standby-wrapped program; `stop_ms` is the park settle. The values come from the vendor's launch script or the datasheet's settling figures; where neither states one, use 200 after standby, 50 after release, 600 after the start.
 - `shs_floor` is the shutter's minimum over the offered modes, `integration_offset_us` the exposure offset, `gain_max` the register ceiling, `gain_reg_per_db` register steps per dB, as a number or as `[numerator, denominator]`.
 - `serializer_csi` stays out: the host composes the pod's serializer from the mode's contract.
@@ -355,7 +358,17 @@ from nxs.personality.records import (ACTION_PARAM, ACTIONS, FRAME_LENGTH_PARAM,
 
 _FACTS = yaml.safe_load(Path(__file__).with_name("cam2.yaml").read_text())
 _REG = {name: int(str(spec["addr"]), 0) for name, spec in _FACTS["registers"].items()}
-_MODES = [(name, str(mode["table"]), int(mode["timing"]["min_frame_length"]))
+
+
+def _readout_frame(mode):
+    # The recommended frame V_TR: the datasheet row's, else the declared one.
+    row = mode.get("sony") or {}
+    if row.get("vmax") is not None:
+        return int(row["vmax"])
+    return int(mode["timing"]["min_frame_length"])
+
+
+_MODES = [(name, str(mode["table"]), _readout_frame(mode))
           for name, mode in _FACTS["modes"].items() if "table" in mode]
 _TRIGGER = _FACTS["trigger"]
 _SETTLE = _FACTS["program"]
@@ -369,7 +382,7 @@ _DEFAULT = _FACTS["modes"][_FACTS["default_mode"]]["timing"]
 _LINE_MIN = min(int(_FACTS["modes"][n]["timing"]["hmax"]) for n, *_ in _MODES) * _DEN // _NUM
 _LINE_MAX = _HMAX_MAX * _DEN // _NUM
 _LINE_DEFAULT = round(int(_DEFAULT["hmax"]) * _DEN / _NUM)
-_PERIOD_DEFAULT = int(_DEFAULT["min_frame_length"]) * _LINE_DEFAULT
+_PERIOD_DEFAULT = _readout_frame(_FACTS["modes"][_FACTS["default_mode"]]) * _LINE_DEFAULT
 _PERIOD_MAX = 4_000_000_000
 #: How long the head gets to answer after its reset line is released.
 ALIVE_TIMEOUT_MS = 1500
@@ -450,12 +463,13 @@ class Cam2(CameraSensor):
         self.select("mode", {i: (lambda v=frame: self._fast(v))
                              for i, (_, _, frame) in enumerate(_MODES)})
 
-    def _fast(self, trigger_vmax):
+    def _fast(self, v_tr):
         # Through the free-running preset first: fast trigger entered from a
-        # triggered state stalls the part.
+        # triggered state stalls the part. The trigger frame is the mode's
+        # recommended frame V_TR (the `sony:` row's `vmax`).
         self._trigger("freerun", _SETTLE["trigger_switch"])
-        self._trigger("fast", _SETTLE["fast_trigger"], vmax=trigger_vmax)
-        self.store_param(FRAME_LENGTH_PARAM, trigger_vmax)
+        self._trigger("fast", _SETTLE["fast_trigger"], vmax=v_tr)
+        self.store_param(FRAME_LENGTH_PARAM, v_tr)
 
     def _trigger(self, preset, settle, vmax=None):
         values = _TRIGGER[preset]
@@ -483,7 +497,7 @@ nxs upload ./<name>/<name>.py -o <name>.nxs
 
 1. `check` judges the shape against the schema and names the file and key of anything wrong, a mode table that is missing included. It passes with `personality <name>: camera · <compatible> · <N> mode(s)` and `ok`.
 2. The compile prints the budget: bytes per block, the dispatch overhead per `select()`, the trailer. Bytecode sits under 4096 B and the trailer under 2048 B. Over the cap: drop the least useful mode with its table and say so on the card; never trim a table.
-3. Arithmetic, by hand, per mode: `lanes × rate_mbps × 10^6 ≥ width × height × bit_depth × fps × 1.15`; the datasheet's top rate is at or above the mode's; table-only, `pix_clk_hz / (line_length × max_fps) ≥ height`; `sony_imx`, `inck_hz / (hmax × min_frame_length)` reproduces the datasheet's rate within 1 % and `pix_clk_hz` is a whole multiple of `inck_hz`. A miss is a transcription error in the YAML, never a reason to change a table.
+3. Arithmetic, by hand, per mode: `lanes × rate_mbps × 10^6 ≥ width × height × bit_depth × fps × 1.15`; the datasheet's top rate is at or above the mode's; table-only, `pix_clk_hz / (line_length × max_fps) ≥ height`; `sony_imx`, `inck_hz / (hmax × vmax)` of the `sony:` row reproduces the row's `max_fps` within 1 %, `timing.hmax` equals the row's `hmax`, and `pix_clk_hz` is a whole multiple of `inck_hz`. A miss is a transcription error in the YAML, never a reason to change a table.
 4. Every offered mode has a table, every table row fits `reg_bits` and `val_bits`, and the identity value has `device_id_width` bytes.
 
 ## Step 5: Report
@@ -504,12 +518,12 @@ nxs personality: <name> — camera
   nxs personality check ./<name>
   nxs upload ./<name>/<name>.py -o <name>.nxs
   nxs personality install ./<name>
-  nxs --experimental <port> <link> on --sensor <name>
+  nxs <port> <link> on --sensor <name>
   nxs <port> status
   nxs <port> <link> capture --frames 60
 ```
 
-`<fps>` is `timing.fps` for a table-only part and `inck_hz / (hmax × min_frame_length)` for a `sony_imx` one. The last three lines are the bench: a mode without a `shipped` point runs under `--experimental` until a capture proves its rate; the point then goes into the YAML by hand (the camera reference, §3.1) and the pair is installed again.
+`<fps>` is `timing.fps` for a table-only part and the `sony:` row's `max_fps` for a `sony_imx` one. The last three lines are the bench: every mode the pair's program carries runs without a flag, and `on` counts two seconds of frames and refuses a rate the rig does not deliver, naming the rate delivered, so the capture after it proves the mode on this rig. The YAML carries no proof.
 
 When the part is not expressible, print this card instead, write no file, and end the run:
 

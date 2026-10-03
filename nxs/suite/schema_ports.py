@@ -3,6 +3,7 @@
 """The manifest's camera ports: a port's declaration, its links and the units
 riding them, and the generated wiring laid under the hand-written intent."""
 
+import hashlib
 import math
 import os
 from dataclasses import dataclass, field
@@ -13,7 +14,7 @@ from nxs.suite.schema_base import ManifestError, _parse_int, _require_keys
 HUB_DRIVERS = ("nxs", "kernel")
 
 _PORT_KEYS = {"bus", "hub", "csi_lanes", "sync", "links", "camera"}
-_PORT_CAMERA_KEYS = {"mode", "sync", "sensor", "exposure_us"}
+_PORT_CAMERA_KEYS = {"mode", "sync", "sensor", "exposure_us", "gain_db"}
 # A link's `camera` is the sensor compatible (string) or a mapping
 # {sensor, mode}; the port's `camera.sensor` is the default.
 _LINK_CAMERA_KEYS = {"sensor", "mode", "fps"}
@@ -72,12 +73,32 @@ class PortSpec:
     ## fps that context interprets (free_run timing, or the fsync rate).
     camera_mode: Optional[str] = None
     camera_fps: Optional[float] = None
-    ## The integration time under frame sync, microseconds (the generator
-    ## plan quantizes it).
+    ## A declared exposure, microseconds: `check` and `on` refuse it with
+    ## what sets the exposure (the trigger pulse under frame sync, the
+    ## capture stack's loop in free run without `camera_gain_db`).
     camera_exposure_us: Optional[float] = None
+    ## A declared analog gain, dB: the camera links locked at it, a synced
+    ## pair, or free-running links with `camera_exposure_us`.
+    camera_gain_db: Optional[float] = None
     ## The port's default sensor (compatible) for links that name none.
     camera_sensor: Optional[str] = None
     links: List[PortLinkSpec] = field(default_factory=list)
+
+
+def port_signature(port: PortSpec) -> str:
+    """Every declared field that shapes the port's construction, as one
+    digest: nxsd reconverges a port on a reload when it changed, and `nxs
+    switch` brings a port up again when its record carries another."""
+    fields = (port.bus, port.hub_compatible, port.hub_addr, port.hub_driver,
+              port.csi_lanes, port.csi_lanes_declared,
+              port.camera_mode, port.camera_fps, port.camera_sensor,
+              port.camera_exposure_us, port.camera_gain_db, port.sync_source, port.sync_fps,
+              tuple((l.name, l.camera, l.camera_mode, l.camera_fps, l.inck_hz, l.ser,
+                     l.ser_addr, l.sensor_addr, l.tca_addr, l.des_window, l.csi_vc,
+                     l.capture_id,
+                     (l.unit.name, l.unit.alias, l.unit.target) if l.unit else None)
+                    for l in port.links))
+    return hashlib.sha256(repr(fields).encode()).hexdigest()
 
 
 def _parse_link_camera(raw, port_default: Optional[str], where: str):
@@ -238,6 +259,16 @@ def _parse_port(name, raw, where: str) -> PortSpec:
                 raise ManifestError(f"{where}.camera.exposure_us: must be a finite "
                                     f"positive number")
             port.camera_exposure_us = exposure
+        if camera.get("gain_db") is not None:
+            try:
+                gain = float(camera["gain_db"])
+            except (TypeError, ValueError):
+                raise ManifestError(
+                    f"{where}.camera.gain_db: {camera['gain_db']!r} is not a number") from None
+            if not (math.isfinite(gain) and gain >= 0):
+                raise ManifestError(f"{where}.camera.gain_db: must be a finite number of dB, "
+                                    f"0 or more")
+            port.camera_gain_db = gain
         if "sync" in camera:
             # camera.sync supersedes the port-level sync key.
             port.sync_source = str(camera["sync"])

@@ -18,24 +18,29 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Collection, Dict, List, Optional, Tuple
 
 from . import Host
 from . import capture_table as tables
 from . import jetson_dt as dt
 from . import jetson_overlay as gen
-from .jetson_boot import (GMSL_OVERLAY_SUFFIX, blessed_dtb, companion_overlays, default_label, label_fdt,
-                       label_overlay_order, label_overlays, template_label, with_label)
+from .jetson_boot import (FDT_ALTERNATIVE, GMSL_OVERLAY_SUFFIX, LABEL_MARKER, blessed_dtb, carried_overlays,
+                          companion_overlays, default_label, fdtoverlay_result, label_fdt, label_overlay_order,
+                          label_overlays, mux_overlay, on_disk, overlay_port, template_label,
+                          undeclared_overlays, with_label)
+from .root import as_root
 
 DT_BASE = "/proc/device-tree"
 RELEASE_FILE = "/etc/nv_tegra_release"
+#: The running kernel's command line, under the host's root.
+CMDLINE = "proc/cmdline"
 BOOT_DTBO_DIR = Path("/boot/camera-dtbos")
 #: Where a JetPack 6 flash puts the one `kernel_*.dtb` blessed for this module SKU.
 BOOT_DTB_DIR = Path("/boot/dtb")
 #: Where a JetPack 7 image leaves the vendor base DTBs of every module SKU.
 BASE_DTB_DIR = Path("/boot")
 EXTLINUX = Path("/boot/extlinux/extlinux.conf")
-#: `put` as root: the same sibling-temp-then-rename, in the shell sudo runs.
+#: `put` as root: the same sibling-temp-then-rename, in a shell run as root.
 _PUT_AS_ROOT = (
     'd=$(dirname "$1") && mkdir -p "$d" && t=$(mktemp "$d/.nxs-put.XXXXXX") '
     '&& cat > "$t" && if [ -e "$1" ]; then chmod --reference="$1" "$t" '
@@ -68,10 +73,9 @@ def kernel_modules_missing(kernel: str, lib_modules: str = LIB_MODULES) -> bool:
     d = Path(lib_modules, kernel, KERNEL_MODULES_SUBDIR)
     return not all((d / m).is_file() for m in KERNEL_MODULES)
 
-#: Measured capture budgets (MP/s of RAW pixels the host delivers with
-#: viewers running), by device-tree model.
-CAPTURE_BUDGET_MPIX_S = {"NVIDIA Jetson Orin Nano": 190.0}
-
+#: The capture daemon has a configuration mode (the tuning build) from L4T 39
+#: on; L4T 36's Argus has none and streams on its built-in tuning.
+TUNING_L4T_MAJOR = 39
 #: From L4T 39 on, the capture daemon's configuration mode (the tuning
 #: build) needs NVIDIA's camera hotfix, which delivers these files; a
 #: stock image refuses the mode.
@@ -164,6 +168,22 @@ TUNING_BADGE_CHARS = 31
 TUNING_DAEMON_SETTLE_S = 3.0
 TUNING_SESSION_S = 15
 
+#: The Argus source's white-balance modes a fixed picture runs: off for a
+#: developer's locked one, auto on each link of a synced pair.
+WB_OFF, WB_AUTO = 0, 1
+
+
+def _fixed_props(exposure_ns: Optional[int], wbmode: int, gain: Optional[float] = None) -> str:
+    """The Argus source's properties for a picture the ISP leaves alone: the
+    exposure pinned at `exposure_ns` (none when None), no digital gain,
+    noise reduction or edge enhancement, white balance `wbmode`; with `gain`
+    the exposure loop locked at that linear gain."""
+    props = [f'exposuretimerange="{exposure_ns} {exposure_ns}"'] if exposure_ns is not None else []
+    props += ['ispdigitalgainrange="1 1"', f"wbmode={int(wbmode)}", "tnr-mode=0", "ee-mode=0"]
+    if gain is not None:
+        props += ["aelock=true", f'gainrange="{gain:g} {gain:g}"']
+    return " ".join(props)
+
 
 class JetsonHost(Host):
     name = "jetson"
@@ -180,6 +200,11 @@ class JetsonHost(Host):
         self._root = root
 
     # --- the capture stack's prerequisite ----------------------------------
+    def tuning_required(self) -> bool:
+        """From L4T 39 on; a release file the host cannot read takes the build."""
+        release = l4t_release(self._release_file)
+        return release is None or int(release.split(".")[0]) >= TUNING_L4T_MAJOR
+
     def tuning_prerequisite_missing(self) -> Optional[str]:
         release = l4t_release(self._release_file)
         if release is None or release.split(".")[0] != HOTFIX_L4T_MAJOR:
@@ -219,6 +244,72 @@ class JetsonHost(Host):
     def bus_rules(self) -> Optional[Path]:
         return Path(__file__).with_name(BUS_RULES)
 
+    def connector_lanes(self, port: str) -> Optional[int]:
+        return gen.PORTS[port]["lanes"] if port in gen.PORTS else None
+
+    def camera_bus_missing(self) -> bool:
+        return not self.camera_buses()
+
+    def camera_bus_package_missing(self) -> Optional[str]:
+        if mux_overlay(BOOT_DTBO_DIR) is None:
+            return f"no camera kernel package for {platform.release()}"
+        return None
+
+    def install_camera_buses(self, fdt: Optional[str] = None, dry_run: bool = False) -> List[str]:
+        """The generated label with the camera package's mux overlay first and
+        the label's other overlays kept, made the DEFAULT; [] when the DEFAULT
+        label already boots it, its base DTB (`fdt`'s, when given) and every
+        overlay on disk. A stock label names no overlay, and the connectors'
+        buses exist only under the mux. A RuntimeError when that label booted
+        (the command line carries its marker) and brought up no bus: another
+        reboot would boot the same."""
+        mux = mux_overlay(BOOT_DTBO_DIR)
+        if mux is None:
+            raise RuntimeError(f"{self.camera_bus_package_missing()}\n  - {self.kernel_package_next()}")
+        text = EXTLINUX.read_text() if EXTLINUX.exists() else ""
+        default = default_label(text)
+        current = carried_overlays(text, GENERATED_LABEL)
+        kept = [entry for entry in current if Path(entry).name != Path(mux).name]
+        base = label_fdt(text, GENERATED_LABEL)
+        # The launcher applies overlays only under an FDT line it can read: a
+        # label without one boots no bus, whatever it lists.
+        if (default == GENERATED_LABEL and len(kept) < len(current)
+                and on_disk(base) is not None and fdt in (None, base)
+                and all(Path(entry).is_file() for entry in current)):
+            if self._booted_label() == GENERATED_LABEL and self.camera_bus_missing():
+                raise RuntimeError(self._overlays_dropped(base, mux))
+            return []
+        named, carried = self._boot_fdt(text, GENERATED_LABEL, fdt)
+        if dry_run:
+            return [f"would install the camera bus mux under {GENERATED_LABEL} (FDT {named or carried})"]
+        reports = self.install_many([], GENERATED_LABEL, select=True, overlays=[mux] + kept, fdt=fdt)
+        return ([f"camera bus mux installed under {GENERATED_LABEL} (FDT {named or carried})"]
+                + [line for line in reports if line.startswith("dropped ")])
+
+    def _booted_label(self) -> Optional[str]:
+        """The label the running kernel booted, by the marker its APPEND
+        carries; None when the command line names none."""
+        try:
+            args = Path(self._root, CMDLINE).read_text(errors="replace").split()
+        except OSError:
+            return None
+        named = [arg.split("=", 1)[1] for arg in args if arg.startswith(f"{LABEL_MARKER}=")]
+        return named[-1] if named else None
+
+    def _overlays_dropped(self, base: str, mux: str) -> str:
+        """The generated label booted with no bus: the fact, what fdtoverlay
+        says of the mux on the label's base DTB, and the flag that names
+        another base DTB (this module's pick, where it is another file)."""
+        booted = board_compatible(self._dt_base)
+        try:
+            pick: Optional[str] = str(blessed_dtb(BOOT_DTB_DIR, BASE_DTB_DIR, booted[0] if booted else None))
+        except RuntimeError:
+            pick = None
+        alternative = FDT_ALTERNATIVE if pick in (None, base) else FDT_ALTERNATIVE.replace("<dtb>", pick)
+        said = fdtoverlay_result(base, mux)
+        return "\n".join([f"the boot entry {GENERATED_LABEL} booted without its overlays"]
+                         + ([said] if said else []) + [f"  - {alternative}"])
+
     # --- the booted tree ----------------------------------------------------
     def installed_overlay(self, name: str) -> Optional[bytes]:
         path = BOOT_DTBO_DIR / name
@@ -246,9 +337,13 @@ class JetsonHost(Host):
     # --- the generated contract ------------------------------------------
     def overlay(self, pack, port: str, lanes: int,
                 sensors: Optional[List[str]] = None, direct: bool = False,
-                node_addr: Optional[int] = None) -> str:
-        table = tables.capture_table(pack, sensors)
-        return gen.overlay_dts(port, int(lanes), table, tables.pool_sensors(pack, sensors),
+                node_addr: Optional[int] = None, fps: Optional[float] = None,
+                bit_depth: Optional[int] = None) -> str:
+        # A port without a hub tops its rows out at the sensor's own ceiling.
+        layout = {"lanes": None if direct else int(lanes), "default_fps": fps,
+                  "bit_depth": bit_depth}
+        table = tables.capture_table(pack, sensors, **layout)
+        return gen.overlay_dts(port, int(lanes), table, tables.pool_sensors(pack, sensors, **layout),
                                direct=direct, node_addr=node_addr)
 
     def compile(self, dts: str, out: Path) -> Path:
@@ -272,51 +367,71 @@ class JetsonHost(Host):
                      fdt: Optional[str] = None,
                      base_dtb_dir: Optional[Path] = None) -> List[str]:
         """Settle the label's base DTB, copy every overlay into the boot directory,
-        then write the boot label once, with one backup of the original
-        extlinux.conf; returns one line per file and one for the label. `fdt` names
-        the base DTB instead of the search. ``boot_dir`` / ``extlinux`` /
-        ``dtb_dir`` / ``base_dtb_dir`` are test seams."""
+        then write the boot label once; the first install keeps the original
+        extlinux.conf beside it, and a later one leaves that copy alone. Returns
+        one line per file, one per carried overlay the label drops and one for
+        the label. `fdt` names the base DTB instead of the search. ``boot_dir``
+        / ``extlinux`` / ``dtb_dir`` / ``base_dtb_dir`` are test seams."""
         boot_dir = Path(boot_dir or BOOT_DTBO_DIR)
         extlinux = Path(extlinux or EXTLINUX)
         text = extlinux.read_text() if extlinux.exists() else ""
         backup = extlinux.with_suffix(extlinux.suffix + ".bak-nxs")
-        # The launcher applies OVERLAYS only under an FDT line, and JetPack's
-        # stock label names none: the generated label names the module's DTB,
-        # keeping the one an earlier install gave it.
-        carried = label_fdt(text, template_label(text, label))
-        if fdt is None:
-            fdt = label_fdt(text, label)
-        if fdt is None and carried is None:
-            booted = board_compatible(self._dt_base)
-            try:
-                fdt = str(blessed_dtb(Path(dtb_dir or BOOT_DTB_DIR),
-                                      Path(base_dtb_dir or BASE_DTB_DIR),
-                                      booted[0] if booted else None))
-            except RuntimeError as exc:
-                raise SystemExit(f"nxs host: {exc}")
-        targets = []
-        for dtbo in dtbos:
-            target = boot_dir / Path(dtbo).name
-            self.put(target, Path(dtbo).read_bytes())
-            targets.append(target)
+        fdt, carried = self._boot_fdt(text, label, fdt, dtb_dir, base_dtb_dir)
+        targets = [boot_dir / Path(dtbo).name for dtbo in dtbos]
+        # The launcher applies OVERLAYS as one: a file it cannot read and it
+        # boots none of them, so a carried entry that is not on disk goes.
+        mine = {str(target) for target in targets}
+        names: List[str] = []
+        dropped: List[str] = []
+        for entry in overlays or []:
+            if entry in mine or Path(entry).is_file():
+                names.append(entry)
+            else:
+                dropped.append(entry)
         # The caller's order is meaning (a port's GMSL overlay follows the
         # universal ones): keep a target where the list has it, else append.
-        names = list(overlays or [])
         for target in targets:
             if str(target) not in names:
                 names.append(str(target))
-        if text:
+        for dtbo, target in zip(dtbos, targets):
+            self.put(target, Path(dtbo).read_bytes())
+        kept = backup.exists()
+        if text and not kept:
             self.put(backup, text.encode())
         self.put(extlinux, with_label(text, label, names, select, fdt).encode())
         lines = [f"installed {target}" for target in targets]
+        lines += [f"dropped {entry} from {label}: no such file (a label naming a missing "
+                  f"overlay boots none)" for entry in dropped]
         if fdt is not None:
             lines.append(f"FDT {fdt} named in {label}: the boot entry it copies names "
                          + (carried if carried is not None else
                             "no device tree, and overlays apply only under one"))
         lines.append(f"boot label {label}" + (" (DEFAULT)" if select else "")
                      + " written; reboot to apply: sudo reboot"
-                     + (f"; previous extlinux.conf at {backup}" if text else ""))
+                     + (f"; original extlinux.conf at {backup}" if text or kept else ""))
         return lines
+
+    def _boot_fdt(self, text: str, label: str, fdt: Optional[str] = None,
+                  dtb_dir: Optional[Path] = None,
+                  base_dtb_dir: Optional[Path] = None) -> Tuple[Optional[str], Optional[str]]:
+        """(the FDT the label is written with, None to copy its template's;
+        the FDT that template names). Raises RuntimeError when `fdt` names no
+        file or no base DTB can be picked."""
+        dtbs, base = Path(dtb_dir or BOOT_DTB_DIR), Path(base_dtb_dir or BASE_DTB_DIR)
+        if fdt is not None and not Path(fdt).is_file():
+            raise RuntimeError(f"--fdt {fdt}: no such file, and the boot entry names only a base DTB "
+                               f"on disk\n  - ls {dtbs} {base}/*.dtb")
+        # OVERLAYS apply only under an FDT the launcher can read: the label keeps its own or
+        # its template's while that file is on disk, else it names this module's DTB.
+        template = template_label(text, label)
+        own = on_disk(label_fdt(text, label))
+        carried = own if template == label else on_disk(label_fdt(text, template))
+        if fdt is None:
+            fdt = own
+        if fdt is None and carried is None:
+            booted = board_compatible(self._dt_base)
+            fdt = str(blessed_dtb(dtbs, base, booted[0] if booted else None))
+        return fdt, carried
 
     def install(self, dtbo: Path, label: str = GENERATED_LABEL,
                 select: bool = False, boot_dir: Optional[Path] = None,
@@ -329,18 +444,18 @@ class JetsonHost(Host):
     def put(self, path: Path, data: bytes) -> None:
         """Write a file atomically (a sibling temp file, fsynced, renamed over the
         target with its mode kept); a path root owns is written the same way
-        through `sudo -n`, and a sudo wanting a password is a PermissionError."""
+        through sudo, which asks a terminal for the password, and a sudo that
+        refuses is a PermissionError naming its answer."""
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             self._replace(path, data)
             return
         except PermissionError:
             pass
-        proc = subprocess.run(
-            ["sudo", "-n", "sh", "-c", _PUT_AS_ROOT, "nxs-put", str(path)],
-            input=data, capture_output=True, check=False)
+        proc = subprocess.run(as_root(["sh", "-c", _PUT_AS_ROOT, "nxs-put", str(path)]),
+                              input=data, capture_output=True, check=False)
         if proc.returncode != 0:
-            reason = proc.stderr.decode(errors="replace").strip() or "sudo -n refused"
+            reason = proc.stderr.decode(errors="replace").strip() or "sudo refused"
             raise PermissionError(f"{path}: {reason}")
 
     @staticmethod
@@ -367,26 +482,30 @@ class JetsonHost(Host):
         entry = default_label(text)
         return {"entry": entry, "overlays": label_overlays(text, entry) if entry else []}
 
+    def boot_entry_ports(self) -> List[str]:
+        try:
+            text = EXTLINUX.read_text() if EXTLINUX.exists() else ""
+        except OSError:
+            return []
+        return sorted({port for port in map(overlay_port, carried_overlays(text, GENERATED_LABEL))
+                       if port is not None})
+
     def install_records(self, records: List[Dict[str, Any]], label: Optional[str],
                         select: bool, keep_other_ports: bool = True,
-                        fdt: Optional[str] = None) -> List[str]:
-        """Install compiled overlays under a boot label: the other ports'
-        overlays of the current DEFAULT label ride along, this port's are
-        replaced, and the package's mux and GMSL overlays take their places."""
+                        fdt: Optional[str] = None,
+                        declared: Optional[Collection[str]] = None) -> List[str]:
+        """Install compiled overlays under a boot label: the other declared
+        ports' overlays of the current DEFAULT label ride along, an undeclared
+        port's are dropped with a line each, this port's are replaced, and the
+        package's mux and GMSL overlays take their places. ``declared`` None
+        declares every port the label names."""
         for record in records:
             if not record["dtbo"]:
                 raise RuntimeError("nothing compiled to install — "
                                    "sudo apt install device-tree-compiler")
         text = EXTLINUX.read_text() if EXTLINUX.exists() else ""
-        default = default_label(text)
         target_label = label or GENERATED_LABEL
-        # Installs accumulate before the reboot: an existing label keeps what
-        # earlier installs put there; only a new label starts from the DEFAULT's list.
-        current: List[str] = []
-        if keep_other_ports:
-            current = label_overlays(text, target_label)
-            if not current and default:
-                current = label_overlays(text, default)
+        current = carried_overlays(text, target_label) if keep_other_ports else []
         port = records[0]["port"]
         companions = companion_overlays(port, BOOT_DTBO_DIR)
         if records[0].get("direct"):
@@ -395,13 +514,16 @@ class JetsonHost(Host):
             companions.pop("gmsl", None)
             current = [o for o in current
                        if not Path(o).name.endswith(f"{port}{GMSL_OVERLAY_SUFFIX}")]
+        dropped = undeclared_overlays(current, port, declared)
         carried = label_overlay_order(current, port,
                                       [Path(r["dtbo"]).name for r in records],
-                                      BOOT_DTBO_DIR, companions)
+                                      BOOT_DTBO_DIR, companions, declared)
         # Every file first, the label once: one backup of the original
         # extlinux.conf, and the label never names a missing file.
-        return self.install_many([Path(r["dtbo"]) for r in records], target_label,
-                                 select=select, overlays=carried, fdt=fdt)
+        return ([f"dropped {entry} from {target_label}: port {owner} is not declared"
+                 for entry, owner in dropped.items()]
+                + self.install_many([Path(r["dtbo"]) for r in records], target_label,
+                                    select=select, overlays=carried, fdt=fdt))
 
     def platform_warnings(self) -> List[str]:
         """An L4T release the modules were never built for, and a carrier the
@@ -425,6 +547,9 @@ class JetsonHost(Host):
         self.put(target, Path(path).read_bytes())
         return target
 
+    def tuning_badge(self, port: str) -> str:
+        return self._badge(port)
+
     def tuning_state(self, port: str) -> Optional[str]:
         try:
             badge = self._badge(port)
@@ -445,8 +570,7 @@ class JetsonHost(Host):
         `overrides`, by compatible) is placed where the daemon folds it in,
         or removed when the sensor names none. The knob set is written when
         the session starts, so no mode has to stream. Raises RuntimeError
-        when a mode got no knob set, and PermissionError when `sudo -n`
-        wants a password."""
+        when a mode got no knob set, and PermissionError when sudo refuses."""
         badge = self._badge(port)
         # The tree lists a port's table once per capture node: one session
         # per mode index serves the module, whichever node names it.
@@ -472,9 +596,10 @@ class JetsonHost(Host):
             sleep(TUNING_DAEMON_SETTLE_S)
             # The consumer opens a session on any mode the table carries; the
             # knob set is written as the session starts, frames or not. The
-            # session asks for the mode's own top rate: a rate the mode cannot
-            # do is refused at the caps and no session starts.
-            rate = max(1, int(float(mode.get("max_fps") or 30)))
+            # session asks for the row's default rate, the one the port runs:
+            # a rate the mode cannot do is refused at the caps and no session
+            # starts, and a row's top rate is the lanes', not the sensor's.
+            rate = max(1, int(float(mode.get("default_fps") or mode.get("max_fps") or 30)))
             self._sudo(run, ["timeout", str(TUNING_SESSION_S), "gst-launch-1.0",
                              "nvarguscamerasrc", f"sensor-id={int(sensor_id)}",
                              f"sensor-mode={n}", "num-buffers=2", "!",
@@ -512,9 +637,10 @@ class JetsonHost(Host):
 
     @staticmethod
     def _sudo(run, argv: List[str], check: bool = True):
-        """Run a command as root through `sudo -n`; a sudo wanting a password
-        is a PermissionError, any other failure a RuntimeError when checked."""
-        proc = run.run(["sudo", "-n", *argv], capture_output=True)
+        """Run a command as root (`root.as_root`: sudo asks a terminal for the
+        password); a sudo that refuses is a PermissionError, any other failure
+        a RuntimeError when checked. The output stays bytes."""
+        proc = run.run(as_root(argv), capture_output=True)
         if proc.returncode != 0:
             err = (proc.stderr or b"").decode(errors="replace").strip()
             if "password" in err:
@@ -584,13 +710,27 @@ class JetsonHost(Host):
         return f'exposuretimerange="{low} {high}"'
 
     def locked_props(self, exposure_ns: int, gain: int) -> str:
-        return (f'wbmode=0 aelock=true exposuretimerange="{exposure_ns} {exposure_ns}" '
-                f'gainrange="{gain} {gain}" ispdigitalgainrange="1 1" '
-                "tnr-mode=0 ee-mode=0")
+        return _fixed_props(int(exposure_ns), WB_OFF, float(gain))
+
+    def pair_props(self, role: str, exposure_us: Optional[float],
+                   gain_db: Optional[float] = None) -> str:
+        """Argus takes its exposure in nanoseconds and its gain as a linear
+        factor: the `gain_db` of a locked link or a follower is 10^(dB/20),
+        what the driver's decibel gain control converts back; a follower
+        without one runs at unity."""
+        ns = None if exposure_us is None else int(round(float(exposure_us) * 1000))
+        if role == "leader":
+            return _fixed_props(ns, WB_AUTO)
+        if role == "follower" and gain_db is None:
+            return _fixed_props(ns, WB_AUTO, 1.0)
+        if role in ("follower", "locked") and gain_db is not None:
+            return _fixed_props(ns, WB_AUTO, 10 ** (float(gain_db) / 20))
+        raise ValueError(f"no source properties for a pair's {role!r} link"
+                         + (" without its gain" if role == "locked" else ""))
 
     def viewer_pipeline(self, capture_id: int, mode_index: int, props: str, caps: str,
                         crop_bottom: int, geometry: Dict[str, int]) -> str:
-        # videocrop removes a triggered pair's filler tail; it needs system
+        # videocrop removes a triggered pair's filler rows; it needs system
         # memory, so the buffers are handed back to NVMM for nv3dsink.
         crop = (f"{self.convert()} ! videocrop bottom={int(crop_bottom)} ! nvvidconv ! "
                 f"video/x-raw(memory:NVMM),format=NV12 ! " if crop_bottom else "")
@@ -615,13 +755,12 @@ class JetsonHost(Host):
     def restart_capture_daemon(self, run=subprocess, sleep=time.sleep) -> None:
         """Bounce nvargus-daemon and wait for it to be back: a wedged daemon
         takes its stop timeout to die, so the wait is for `active`, then a
-        settle for its camera providers. When sudo -n wants a password, say
-        so and skip the wait."""
-        result = run.run(["sudo", "-n", "systemctl", "restart", "nvargus-daemon"],
-                         capture_output=True)
+        settle for its camera providers. When sudo refuses, say what it
+        answered and skip the wait."""
+        result = run.run(as_root(["systemctl", "restart", "nvargus-daemon"]), capture_output=True)
         if result.returncode != 0:
-            print("cannot restart nvargus-daemon (sudo needs a password) — "
-                  "run: sudo systemctl restart nvargus-daemon")
+            why = (result.stderr or b"").decode(errors="replace").strip() or f"exit {result.returncode}"
+            print(f"cannot restart nvargus-daemon: {why}\n  - sudo systemctl restart nvargus-daemon")
             return
         waited = 0.0
         while waited < DAEMON_READY_S:
@@ -641,16 +780,12 @@ class JetsonHost(Host):
         return [f"installed {blacklist} (apport stays quiet about nvargus-daemon)"]
 
     # --- identity ---------------------------------------------------------
+    def keeps_system_declaration(self) -> bool:
+        return True
+
     def stack(self) -> str:
         release = l4t_release(RELEASE_FILE)
         return f"l4t-{release}" if release else super().stack()
-
-    def capture_budget_mpix_s(self) -> Optional[float]:
-        model = _read(Path(self._dt_base, "model")) or ""
-        for key, value in CAPTURE_BUDGET_MPIX_S.items():
-            if key in model:
-                return value
-        return None
 
     def describe(self) -> str:
         model = (_read(Path(self._dt_base, "model")) or "Jetson").strip()

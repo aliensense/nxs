@@ -113,8 +113,8 @@ def generate(dry_run: bool = True) -> dict:
     wiring names and nothing answers for is `unanswered`. With `dry_run`
     (the default) nothing is written; without it hardware.yaml, the report
     of what answered, is written from the walk, suite.yaml is seeded when
-    there is none, and a unit running nothing is named by trying every
-    personality on it."""
+    there is none, and a unit on a bare bus running nothing is named by
+    trying every personality on it."""
     argv = ["generate", "--json"]
     if dry_run:
         argv.append("--dry-run")
@@ -154,9 +154,9 @@ def status(port: Optional[str] = None, link: Optional[str] = None) -> dict:
 
 
 def caps(port: str, link: Optional[str] = None) -> dict:
-    """What the port's sensor offers on this port: the shipped modes with
-    their fps ranges and the proof's stamp, the knob names, the trigger
-    modes. No register is touched."""
+    """What the port's sensor offers on this port: every mode with its fps
+    range (one the unit's program does not carry marked), the knob names,
+    the trigger modes. No register is touched."""
     return _call_json(_node(port, link, "caps", "--json"))
 
 
@@ -165,9 +165,11 @@ def on(port: str, link: Optional[str] = None, mode: Optional[str] = None,
        sensor: Optional[str] = None) -> str:
     """Bring a port up: one link's, or with `link` omitted the whole port's (every
     declared link together). `mode` is a mode token (WxH, WxH-rawN, or a mode name)
-    among the shipped modes `caps` lists, `fps` a rate inside the mode's shipped
-    range (the ceiling without one), `sensor` names the pack sensor; dry_run prints
-    the plan without touching the bus."""
+    among the modes `caps` lists, `fps` a rate inside the mode's lawful range (the
+    declared rate without one, else 30 fps inside the range), `sensor` names the
+    pack sensor; dry_run prints the plan without touching the bus. The port is up
+    once two seconds of frames counted on every camera link arrive at its rate; a
+    link that delivers less is refused naming the rates delivered."""
     argv = _node(port, link, "on")
     if sensor:
         argv += ["--sensor", sensor]
@@ -182,9 +184,11 @@ def on(port: str, link: Optional[str] = None, mode: Optional[str] = None,
 
 def off(port: str) -> str:
     """Park the whole port: stop its viewers, put every sensor in standby,
-    close the CSI gate. There is no one-link park (the gate and the park
-    program are port-wide); a single viewer closes from its own window."""
-    return _call(_node(port, None, "off"), timeout=60.0)
+    close the CSI gate, then have each pod park its head. There is no
+    one-link park (the gate and the park program are port-wide); a single
+    viewer closes from its own window."""
+    # The park program, then up to a unit run's 30 s for each pod's park.
+    return _call(_node(port, None, "off"), timeout=120.0)
 
 
 def capture(port: str, link: str, frames: int = 4,
@@ -199,7 +203,8 @@ def capture(port: str, link: str, frames: int = 4,
 
 def get(port: str, link: str, knob: str) -> str:
     """Read a knob back: the port's `sync`, a sensor knob (fps, exposure,
-    gain) on an up link, else the link's unit's parameter."""
+    gain) on an up link, else the link's unit's parameter. A synced link's
+    exposure reads as the fact that sets it, the trigger pulse's low time."""
     return _call(_node(port, link, "get", knob))
 
 
@@ -208,10 +213,14 @@ def set_knob(port: str, link: Optional[str], knob: str, value: str,
              exposure_us: Optional[float] = None) -> str:
     """Change a knob under the pack's laws; an infeasible value is refused
     naming the lawful alternatives. `sync` is the port's frame sync (`link`
-    omitted): `fsync` starts the hub's generator at `fps` with the synced
-    sensors on their trigger and `exposure_us` under it, `free_run` returns
-    to free run. dry_run prints the write stream. Refused on a live sibling
-    link."""
+    omitted): `fsync` starts the hub's generator at `fps`, one pulse per
+    frame, with the synced sensors on their trigger, `free_run` returns to
+    free run. Under frame sync the exposure is the trigger pulse's low time
+    at the rate, so `exposure_us` is refused with that fact: a shorter
+    exposure needs a higher rate. A new sync or `fps` is counted for two
+    seconds on the links it changes; one they do not deliver is refused
+    naming the rates delivered, and the previous sync or rate comes back.
+    dry_run prints the write stream. Refused on a live sibling link."""
     argv = _node(port, link, "set", knob, str(value))
     if fps is not None:
         argv += ["--fps", str(float(fps))]
@@ -237,7 +246,8 @@ def suite_schema() -> dict:
     """The rig's rules as JSON Schema (2020-12): the manifest schema narrowed
     by the nodes on this rig. Each port lists the keys its nodes bring, each
     link the sensors its port's pack serves, each sensor its modes and each
-    mode the rates it ships at; a unit's personality lists its config keys.
+    mode the rates the laws give it on the port; a unit's personality lists
+    its config keys.
     Validate a declaration against it before writing it. It is necessary,
     not sufficient: `status` judges the arithmetic across nodes."""
     return _call_json(["tune", "--schema", "--json"])
@@ -353,8 +363,8 @@ TOOLS: List[ToolSpec] = [
              "dry_run?",
              "walks every camera port and bus; with dry_run false it writes "
              "hardware.yaml (the report of what answered), seeds suite.yaml when "
-             "there is none, and names a unit running nothing by trying every "
-             "personality on it",
+             "there is none, and names a unit on a bare bus running nothing by "
+             "trying every personality on it",
              "no pack and no camera port; the wiring file is not writable"),
     ToolSpec("status", status, "the declaration against the rig; a port's "
                                "presence and health",
@@ -373,11 +383,12 @@ TOOLS: List[ToolSpec] = [
              "no descriptor pack covers the chip", read_only=True),
     ToolSpec("on", on, "bring a link or the whole port up",
              "port, link?, sensor?, mode?, fps?, dry_run?",
-             "writes the program, trains links, follows video lock",
-             "the mode or rate is not shipped; hub does not answer; video "
-             "did not lock"),
+             "writes the program, trains links, follows video lock, counts two "
+             "seconds of frames on every camera link",
+             "the laws refuse the mode or rate; hub does not answer; video "
+             "did not lock; the links do not deliver the rate"),
     ToolSpec("off", off, "park the whole port", "port",
-             "sensors to standby, CSI gate closed, viewers stopped",
+             "sensors to standby, CSI gate closed, viewers stopped, each pod's head parked",
              "kernel-owned hub"),
     ToolSpec("capture", capture, "headless delivery proof", "port, link, frames?, timeout_s?",
              "opens a capture session on the up link",
@@ -389,8 +400,10 @@ TOOLS: List[ToolSpec] = [
     ToolSpec("set", set_knob, "change a knob under the laws; sync is the port's "
                               "frame sync",
              "port, link?, knob, value, dry_run?, fps?, exposure_us?",
-             "writes sensor registers; sync starts or stops the hub's generator",
-             "an unlawful value, with the lawful alternatives; live sibling link; "
+             "writes sensor registers; sync starts or stops the hub's generator; "
+             "a sync or fps change counts two seconds of frames",
+             "an unlawful value, with the lawful alternatives; a sync or rate the "
+             "links do not deliver, the previous one restored; live sibling link; "
              "port not up"),
     ToolSpec("suite_get", suite_get, "the declaration as options", "—",
              "none", "no camera port on the host and no manifest",

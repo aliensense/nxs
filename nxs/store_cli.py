@@ -97,12 +97,11 @@ def cmd_store_clear(t, args):
     return 0
 
 def cmd_cycle(t, args):
-    from nxs.client import await_driver_up
+    from nxs.time_sync import cycle_driver
     old_slot = t.read_active_slot()
-    t.cycle()
     # The cycled slot re-loads and re-probes asynchronously; a fixed sleep
     # either reports a stale slot or waits longer than the probe needs.
-    await_driver_up(t)
+    cycle_driver(t)
     new_slot = t.read_active_slot()
     runner = RunnerStates.RunnerState._NAMES.get(t.read_runner_state(), "?")
     print(f"Cycled: slot {old_slot} → {new_slot}  state={runner}")
@@ -115,7 +114,7 @@ def add_store_parser(sub) -> None:
     store_sub = p_store.add_subparsers(dest='store_cmd', required=True)
     store_sub.add_parser('ls', help='List populated slots')
     p_save = store_sub.add_parser(
-        'save', help='Save the running personality to a flash slot')
+        'save', help='Save the last upload to a flash slot')
     p_save.add_argument('slot', type=int, nargs='?', default=None,
                         help='Slot index (default: next free)')
     p_store_rm = store_sub.add_parser('rm', help='Delete a slot')

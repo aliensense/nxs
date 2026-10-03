@@ -1,15 +1,17 @@
-"""`caps`: what the port's sensor offers, the shipped points and the knobs."""
+"""`caps`: what the port's sensor offers, every mode with its range, and the knobs."""
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 from typing import Any, Dict, List, Optional
 
 
-from nxs import experimental
-
-from nxs.cam.contracts import LinkSpec, Topology
+from nxs.cam import port_state
+from nxs.cam import timing as cam_timing
+from nxs.cam.contracts import InfeasibleConfig, LinkSpec, Topology
+from nxs.cam.descriptors import mode_token
 from nxs.cam.select import _link_descriptor, _pack_for, _port_name, _refuse_pod_only, select_port_links
 from nxs.host import capture_table as tables
 
@@ -55,82 +57,123 @@ def _knob_names(pack, link: LinkSpec) -> List[str]:
         return list(fn(pack))
 
 
-def _mode_token(send, name: str) -> str:
-    """The token `--mode` takes for a mode: its geometry, or the geometry
-    with the depth when another mode shares it (WxH-rawN)."""
-    geo = send.modes[name].get("geometry") or {}
-    token = f"{geo.get('width')}x{geo.get('height')}"
-    shared = [n for n, m in send.modes.items()
-              if f"{(m.get('geometry') or {}).get('width')}x"
-                 f"{(m.get('geometry') or {}).get('height')}" == token]
-    if len(shared) > 1:
-        token += f"-raw{geo.get('bit_depth')}"
-    return token
+def _cameras_label(cameras: int) -> str:
+    """`1 camera` or `2 cameras`."""
+    return f"{int(cameras)} camera{'s' if int(cameras) > 1 else ''}"
 
 
-def caps_payload(topology: Topology, pack, link: LinkSpec) -> Dict[str, Any]:
+def _runs_alone(pack, topology: Topology, alone: Topology, link: LinkSpec, name: str) -> bool:
+    """On a pair, whether the range law refuses `name` for the pair (the
+    pair's program does not carry it) while one camera runs it on the port
+    `alone`."""
+    try:
+        cam_timing.lawful_range(pack, topology, link, name)
+    except InfeasibleConfig:
+        pass
+    else:
+        return False
+    try:
+        return cam_timing.lawful_range(pack, alone, link, name) is not None
+    except InfeasibleConfig:
+        return False
+
+
+def _own_ceiling(module, name: str) -> Optional[float]:
+    """The sensor's own ceiling for a mode the port does not run."""
+    try:
+        return round(float(module.fps_ceiling(name)), 2)
+    except Exception:
+        return None
+
+
+def caps_payload(topology: Topology, pack, link: LinkSpec,
+                 port: Optional[Topology] = None) -> Dict[str, Any]:
     """The `caps` surface: what the link's sensor offers on this port, from
-    the pack and the unit's records. Without --experimental the modes are
-    the shipped ones alone, each with its range; the flag adds the other
-    modes, marked experimental."""
+    the pack and the unit's records. A mode runs on the port when the unit's
+    program carries it, the table the port boots carries its row (one pixel
+    format per table, `capture_row`) and, on a pair, the pair's program
+    carries it: such a mode lists its range, on a pair its line, and the
+    whole rates frame sync runs it at. A mode the unit's program does not
+    carry is marked `offered: false` with the sensor's own ceiling, one the
+    pair's program does not carry `runs_alone` and one the table boots no
+    row for `capture_row: false`, each without a range or a line. ``port``
+    is the whole port whose table the host boots, where ``topology`` is
+    narrowed to the links judged together."""
     from nxs.schemas import CONTRACT
 
-    from nxs.cam import timing as cam_timing
-    from nxs.cam import shipped
+    from nxs.cam.contracts import shown_rate
 
     send = _link_descriptor(pack, topology, link)
+    # The line the laws give, where the port runs one the delivery check found.
+    plain = (_link_descriptor(pack, dataclasses.replace(topology, lines=()), link)
+             if topology.lines else send)
+    guarantee = getattr(pack.flows(), "frame_guarantee", None)
     module = pack.chip_module(link.sensor_compatible.split(",")[-1])
-    cameras = shipped.cameras(topology.links)
-    unlocked = experimental.enabled()
+    cameras = topology.cameras
+    if port is None:
+        port = topology
+    narrow = getattr(pack.flows(), "port_links", None)
+    alone_port = (narrow(topology, [link]) if narrow is not None
+                  else dataclasses.replace(topology, links=(link,)))
     modes = []
+    together = []
     for name, mode in send.modes.items():
         geo = mode["geometry"]
         offered = name in send.program_modes()
-        point = shipped.entry(send, name, cameras, int(topology.csi_lanes)) if offered else None
-        if point is None and not unlocked:
-            continue
+        index = tables.port_index(pack, port, send, name)
+        # A descriptor without capture rows has no table to judge.
+        capture_row = (index is not None) if send.raw("capture") else None
+        alone = offered and cameras > 1 and _runs_alone(pack, topology, alone_port, link, name)
+        runs = offered and capture_row is not False and not alone
+        if runs:
+            together.append(name)
         hmax = (mode.get("timing") or {}).get("hmax")
         line_ns = (round(float(module.line_time_us(int(hmax))) * 1000)
-                   if hmax is not None and hasattr(module, "line_time_us") else None)
-        # The mode's lawful range on this port (the shipped point where the
-        # mode ships one); the sensor's own ceiling for a mode without a program.
-        floor = None
-        try:
-            rates = cam_timing.lawful_range(pack, topology, link, name) if offered else None
-        except Exception:
-            rates = None
-        if rates is not None:
-            ceiling, floor = round(rates.ceiling, 2), round(rates.floor, 2)
-        else:
+                   if runs and hmax is not None and hasattr(module, "line_time_us") else None)
+        # The mode's lawful range on this port; the sensor's own ceiling for
+        # a mode without a program.
+        floor = ceiling = rates = None
+        if runs:
             try:
-                ceiling = round(float(module.fps_ceiling(name)), 2)
+                rates = cam_timing.lawful_range(pack, topology, link, name)
             except Exception:
-                ceiling = None
+                rates = None
+            if rates is not None:
+                floor, ceiling = rates.shown()
+            else:
+                ceiling = _own_ceiling(module, name)
+        elif not offered:
+            ceiling = _own_ceiling(module, name)
+        # A slower rate stretches the frame past the datasheet's guaranteed one.
+        guaranteed = (guarantee(pack, topology, link, name)
+                      if guarantee is not None and rates is not None else None)
         modes.append({
-            "name": name, "token": _mode_token(send, name),
+            "name": name, "token": mode_token(send, name),
             "width": int(geo["width"]), "height": int(geo["height"]),
             "data_type": str(mode["mipi"]["data_type"]),
             "lanes": int(geo["lanes"]), "rate_mbps": int(geo["rate_mbps"]),
             "fps_ceiling": ceiling, "fps_floor": floor,
+            "fps_guaranteed": shown_rate(guaranteed) if guaranteed is not None else None,
             "line_time_ns": line_ns,
-            "line_source": (None if point is None
-                            else "pair" if point.get("derived") else "shipped"),
-            "experimental": point is None,
+            # A program mode runs the datasheet's line (the sensor's, or the
+            # pair line law's), or the delivery check's longer one on the rig.
+            "line_source": (("found" if hmax != (plain.modes[name].get("timing") or {}).get("hmax")
+                             else "datasheet") if line_ns is not None else None),
             "offered": offered,
-            "sensor_mode": tables.mode_index(pack, send, name,
-                                             [send.name] if topology.is_direct else None),
+            "runs_alone": alone,
+            "capture_row": capture_row,
+            "sensor_mode": index,
         })
     trig = send.raw("trigger") or {}
     knobs = _camera_knobs(pack, link, topology)
     pairs = []
-    if len(topology.links) > 1:
-        for name in send.program_modes():
-            record = shipped.entry(send, name, 2,
-                                             int(topology.csi_lanes))
-            if record is not None and shipped.synced(record):
-                pairs.append({"mode": name, "token": _mode_token(send, name),
-                              "fps_floor": float(record["fps"]["floor"]),
-                              "fps_ceiling": float(record["fps"]["ceiling"])})
+    if cameras > 1:
+        for name in together:
+            rates = cam_timing.synced_rates(pack, topology, name)
+            if rates:
+                pairs.append({"mode": name, "token": mode_token(send, name),
+                              "fps_floor": float(min(rates)),
+                              "fps_ceiling": float(max(rates))})
     payload = {
         "contract": CONTRACT,
         "port": _port_name(topology), "link": link.name,
@@ -149,48 +192,59 @@ def caps_payload(topology: Topology, pack, link: LinkSpec) -> Dict[str, Any]:
     return payload
 
 
+def _rate_text(fps) -> str:
+    return f"{fps:.10g}" if float(fps).is_integer() else f"{fps:.2f}"
+
+
 def _range_text(floor, ceiling) -> str:
-    def one(v):
-        return f"{v:.10g}" if float(v).is_integer() else f"{v:.2f}"
     if floor is None and ceiling is None:
         return "no lawful rate"
     if floor is None:
-        return f"<= {one(ceiling)} fps"
-    return f"{one(floor)}–{one(ceiling)} fps"
+        return f"<= {_rate_text(ceiling)} fps"
+    return f"{_rate_text(floor)}–{_rate_text(ceiling)} fps"
 
 
 def cmd_caps(args: argparse.Namespace) -> int:
     """What a link may run on the port the selection makes: one link named
     is one camera, the port form the pair."""
-    from nxs.cam import shipped
-
     topology, selected = select_port_links(args)
     pack = _pack_for(topology)
+    # A pair's modes run at the line the delivery check found for the port.
+    topology = port_state.with_found_lines(topology)
+    # The table is the whole port's, whichever links the selection judges.
+    port = topology
     narrow = getattr(pack.flows(), "port_links", None)
     if selected and narrow is not None:
         topology = narrow(topology, selected)
     link = selected[0] if selected else topology.links[0]
     if not link.has_camera:
         raise _refuse_pod_only(topology, link, "caps")
-    payload = caps_payload(topology, pack, link)
+    payload = caps_payload(topology, pack, link, port=port)
     if getattr(args, "json", False):
         print(json.dumps(payload, indent=2))
         return 0
+    section = getattr(pack.flows(), "GUARANTEED_FRAME_SECTION", None)
     print(f"{payload['port']} ({payload['csi_lanes']} CSI lanes, "
-          f"{shipped.label(payload['cameras'])})")
+          f"{_cameras_label(payload['cameras'])})")
     print(f"link {link.name}  {payload['sensor']}")
-    if not payload["modes"]:
-        print("  no shipped mode for this port: the unit's shipped points carry none "
-              f"({experimental.FLAG} lists the unshipped ones)")
     for mode in payload["modes"]:
         geometry = f"{mode['width']}x{mode['height']}"
-        line = f"  {geometry:<10} {mode['data_type']:<6} {_range_text(mode['fps_floor'], mode['fps_ceiling'])}"
-        if mode["experimental"]:
-            why = ("no unit program" if not mode["offered"] else "unshipped")
-            line += f"  [experimental: {why}]"
-        elif mode.get("line_source") == "pair":
-            line += f"  [pair line {mode['line_time_ns']} ns]"
+        line = f"  {geometry:<10} {mode['data_type']:<6} "
+        if not mode["offered"]:
+            line += f"{_range_text(mode['fps_floor'], mode['fps_ceiling'])}  [no unit program]"
+        elif mode["runs_alone"]:
+            line += "[runs alone on the port]"
+        elif mode["capture_row"] is False:
+            line += "[no capture row]"
+        else:
+            line += _range_text(mode["fps_floor"], mode["fps_ceiling"])
+            if payload["cameras"] > 1 and mode.get("line_source"):
+                found = ", found" if mode["line_source"] == "found" else ""
+                line += f"  [pair line {mode['line_time_ns']} ns{found}]"
         print(line)
+        if mode.get("fps_guaranteed") is not None:
+            print(f"    below {_rate_text(mode['fps_guaranteed'])} fps: beyond the datasheet's "
+                  f"guaranteed frame" + (f" ({section})" if section else ""))
     if payload["sync_pairs"]:
         print("sync pairs (fsync, one rate):")
         for pair in payload["sync_pairs"]:

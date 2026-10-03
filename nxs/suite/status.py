@@ -9,10 +9,10 @@ from typing import List, Optional
 from nxs._generated_constants import RunnerStates
 from nxs.client import exc_detail
 from nxs.suite.drift import detect_unit_drift
-from nxs.suite.schema import SuiteConfig
+from nxs.suite.schema import SuiteConfig, UnitSpec
 from nxs.suite.state import SuiteState
 from nxs._generated_constants import VmStates
-from nxs.transports import open_client
+from nxs import transports
 
 _VM_STATES = {v: n.lower() for v, n in VmStates.VmState._NAMES.items()}
 
@@ -36,9 +36,13 @@ class UnitStatus:
 
 
 def collect_status(cfg: SuiteConfig, state: SuiteState,
-                   opener=open_client, drivers_dir: "str | None" = None) -> List[UnitStatus]:
+                   opener=None, drivers_dir: "str | None" = None,
+                   units: Optional[List[UnitSpec]] = None) -> List[UnitStatus]:
+    """One row per declared unit, or per unit of `units`, read now. The
+    opener defaults to the one `nxs.transports` holds at the call."""
+    opener = opener or transports.open_client
     rows = []
-    for unit in cfg.units:
+    for unit in cfg.units if units is None else units:
         row = UnitStatus(name=unit.name, link=unit.links[0].describe())
         # Probe every declared link: the first that answers serves the reads;
         # any other link staying silent marks the row degraded.
@@ -114,18 +118,16 @@ def _serial_verdict(unit, state: SuiteState, transport) -> str:
 
 
 def _vm_verdict(transport) -> str:
-    """The VM column: the VM's own state, except that a running VM reports its
-    runner when the runner is not measuring: `no-probe` for a parked
-    PROBE_FAILED, `probing` while it is still trying."""
-    label = _VM_STATES.get(_try(transport.read_vm_state, -1), "?")
-    if label != "running":
-        return label
+    """The VM column: the VM's own state, except where the runner tells more:
+    `no-probe` for a runner parked in PROBE_FAILED, whose VM the unit idles,
+    and `probing` while a running VM is still trying."""
     # Wrapped so the attribute lookup happens inside the guard too: a
     # transport with no runner surface keeps the plain VM verdict.
     runner = _try(lambda: transport.read_runner_state(), None)
     if runner == RunnerStates.RunnerState.PROBE_FAILED:
         return "no-probe"
-    if runner == RunnerStates.RunnerState.PROBING:
+    label = _VM_STATES.get(_try(transport.read_vm_state, -1), "?")
+    if label == "running" and runner == RunnerStates.RunnerState.PROBING:
         return "probing"
 
     return label

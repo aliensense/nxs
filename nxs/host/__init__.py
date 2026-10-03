@@ -2,10 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """The host capture layer: the booted capture contract (lane count, capture
-ids, mode table), its generation and installation, the capture consumer, the
-capture daemon, and the capture budget. Everything the camera verbs need
-from the platform goes through one `Host`; a port implements a subclass and
-a detector. The SerDes pack and the sensor plugins never name a host."""
+ids, mode table), its generation and installation, the capture consumer and
+the capture daemon. Everything the camera verbs need from the platform goes
+through one `Host`; a port implements a subclass and a detector. The SerDes
+pack and the sensor plugins never name a host."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import os
 import platform
 import subprocess
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Collection, Dict, List, Optional
 
 
 #: The camera port aliases the bus rules create, one per connector.
@@ -112,13 +112,42 @@ class Host:
         """The udev rules naming this host's camera buses; None without."""
         return None
 
+    def connector_lanes(self, port: str) -> Optional[int]:
+        """The CSI lane count the port's connector wires, the count a port
+        takes where neither the declaration nor the booted tree names one;
+        None when the host does not say."""
+        del port
+        return None
+
+    def camera_bus_missing(self) -> bool:
+        """Whether the booted tree carries no camera bus where this host boots
+        them from its boot configuration (`install_camera_buses`); False here."""
+        return False
+
+    def camera_bus_package_missing(self) -> Optional[str]:
+        """The fact line when the package the camera buses boot from is absent;
+        None when it is there, or on a host that boots its buses by itself."""
+        return None
+
+    def install_camera_buses(self, fdt: Optional[str] = None, dry_run: bool = False) -> List[str]:
+        """Make the boot configuration boot the camera buses, `fdt` naming the
+        base tree; the lines to report, [] when it already does. The buses
+        appear after the reboot; a RuntimeError names what the host can tell
+        when that configuration booted and brought up none."""
+        del fdt, dry_run
+        raise NotImplementedError(f"{self.name}: no camera bus installer")
+
     # --- generating and installing the contract --------------------------
     def overlay(self, pack, port: str, lanes: int,
                 sensors: Optional[List[str]] = None, direct: bool = False,
-                node_addr: Optional[int] = None) -> str:
+                node_addr: Optional[int] = None, fps: Optional[float] = None,
+                bit_depth: Optional[int] = None) -> str:
         """The contract source for a port; ``direct`` for a port whose
         sensor is wired straight to the host, ``node_addr`` the address
-        that sensor answers at when it is not the descriptor's own."""
+        that sensor answers at when it is not the descriptor's own, ``fps``
+        the rate the port runs at (the rows' default rate), ``bit_depth``
+        the bit depth its declaration runs (None: the depth of the row
+        with the longest exposure)."""
         raise NotImplementedError(f"{self.name}: no capture contract generator")
 
     def compile(self, dts: str, out: Path) -> Path:
@@ -126,9 +155,12 @@ class Host:
 
     def install_records(self, records: List[Dict[str, Any]], label: Optional[str],
                         select: bool, keep_other_ports: bool = True,
-                        fdt: Optional[str] = None) -> List[str]:
+                        fdt: Optional[str] = None,
+                        declared: Optional[Collection[str]] = None) -> List[str]:
         """Install compiled contract files under the boot configuration, `fdt` naming
-        the base tree; one report line per file and one for the entry."""
+        the base tree; the entry keeps the contract files of the ports in
+        `declared` (None: of every port it names) and drops the others. One
+        report line per file, per dropped file and one for the entry."""
         raise NotImplementedError(f"{self.name}: no contract installer")
 
     def boot_state(self) -> Dict[str, Any]:
@@ -136,6 +168,11 @@ class Host:
         name) and `overlays` (the contract files it applies), {} when the
         host has none."""
         return {}
+
+    def boot_entry_ports(self) -> List[str]:
+        """The camera ports whose contract files the boot entry the installer
+        writes names; [] when the host installs none."""
+        return []
 
     def kernel_package_missing(self) -> Optional[str]:
         """The fact line when this host's camera kernel package is absent for
@@ -153,6 +190,11 @@ class Host:
         return []
 
     # --- the capture stack's tuning -----------------------------------------
+    def tuning_required(self) -> bool:
+        """Whether the capture stack needs a tuning file built for the booted
+        table before a head streams; False here."""
+        return False
+
     def tuning_prerequisite_missing(self) -> Optional[str]:
         """The fact line when this host cannot build a tuning file until
         something is installed; None when it can, or takes none."""
@@ -166,6 +208,12 @@ class Host:
         """Install a head's tuning file for a port where this host's capture
         stack looks for it; returns the path written."""
         raise NotImplementedError(f"{self.name}: its capture stack takes no tuning file")
+
+    def tuning_badge(self, port: str) -> str:
+        """The module name a port's tuning file is made under: a file serves
+        the badge it was made under and no other. The port's own name on a
+        host whose capture stack names none."""
+        return port
 
     def tuning_state(self, port: str) -> Optional[str]:
         """The tuning file the capture stack holds for a port, None when none."""
@@ -243,6 +291,20 @@ class Host:
         del exposure_ns, gain
         return ""
 
+    def pair_props(self, role: str, exposure_us: Optional[float],
+                   gain_db: Optional[float] = None) -> str:
+        """Source properties for a link of a synced pair, one exposure and one
+        gain on both heads: `leader`, whose loop decides the pair's gain;
+        `follower`, its loop locked at `gain_db` (the leader's gain as the
+        session starts, unity without one) while its head takes the leader's
+        gain; `locked`, the loop locked at the declared `gain_db`. The
+        exposure is pinned at `exposure_us` where the port fixes one, and the
+        ISP adds no digital gain, noise reduction or edge enhancement, each
+        link keeping its own white balance. Empty where the source takes
+        none."""
+        del role, exposure_us, gain_db
+        return ""
+
     def viewer_pipeline(self, capture_id: int, mode_index: int, props: str, caps: str,
                         crop_bottom: int, geometry: Dict[str, int]) -> str:
         """The plain viewer: the source into a window at `geometry`."""
@@ -277,9 +339,11 @@ class Host:
         return []
 
     # --- identity ---------------------------------------------------------
-    def capture_budget_mpix_s(self) -> Optional[float]:
-        """The measured capture budget in MP/s with the viewers painting; None when unmeasured."""
-        return None
+    def keeps_system_declaration(self) -> bool:
+        """Whether the host's one declaration is the system file nxsd reads,
+        whoever runs the verb (a camera host); False here, where a user
+        keeps a per-user one until the system file exists."""
+        return False
 
     def stack(self) -> str:
         """The capture stack this host runs, as the ledger names it: the

@@ -2,18 +2,20 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """The host capture table, generated from the sensor descriptors and free of
-any platform: one row per entry of every sensor's ``capture.table`` in pack
-order, each row's line length and top rate from the mode the unit program
-runs, and per sensor the bus identity and the control rows a generic kernel
-driver interprets. A platform's contract generator lays this out in its own
-device-tree shape."""
+any platform: one row per entry of every sensor's ``capture.table`` of the
+port's bit depth and Bayer phase, each row's line length from the mode the
+unit program runs and its rates the port's (the lane law's ceiling on its
+lanes, the rate it runs at by default), and per sensor the bus identity and
+the control rows a generic kernel driver interprets. A platform's contract
+generator lays this out in its own device-tree shape."""
 
 from __future__ import annotations
 
 import dataclasses
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from nxs.cam.descriptors import to_int
+from nxs.cam.contracts import FPS_DEFAULT, InfeasibleConfig
+from nxs.cam.descriptors import mode_label, mode_token, resolve_mode, to_int
 
 #: The register map a node serves when its descriptors are silent.
 REG_BITS_DEFAULT = 16
@@ -61,20 +63,24 @@ class CaptureMode:
     def key(self) -> tuple:
         return (self.pool, self.width, self.height, self.bit_depth)
 
-    def exposure_ceiling_us(self) -> int:
-        """The row's longest exposure: the frame at the row's rate less the
-        shutter margin, or the sensor's own limit when that is lower. An
-        exposure past the frame makes the driver stretch the frame length
-        the unit programmed, and the port's framing breaks."""
-        rate = self.default_fps if self.default_fps is not None else self.max_fps
+    def exposure_ceiling_us(self, rate: Optional[float] = None) -> int:
+        """The row's longest exposure: the frame at `rate` (the row's
+        default rate when None) less the shutter margin, or the sensor's
+        own limit when that is lower. An exposure past the frame makes the
+        driver stretch the frame length the unit programmed, and the port's
+        framing breaks."""
+        if rate is None:
+            rate = self.default_fps if self.default_fps is not None else self.max_fps
         line_us = self.line_length * 1e6 / self.pix_clk_hz
         frame_lines = int(self.pix_clk_hz / (self.line_length * float(rate)))
         return min(int(self.exposure["max_us"]),
                    int((frame_lines - EXPOSURE_MARGIN_LINES) * line_us))
 
 
-def _rows(pack, desc) -> List[CaptureMode]:
-    """A descriptor's capture rows as the host's table carries them."""
+def _rows(pack, desc, lanes: Optional[int] = None,
+          default_fps: Optional[float] = None) -> List[CaptureMode]:
+    """A descriptor's capture rows as the host's table carries them, on a
+    port of `lanes` CSI lanes that runs at `default_fps` (`derived_rows`)."""
     from nxs.cam.capture_facts import derived_rows
 
     cap = desc.raw("capture")
@@ -97,64 +103,182 @@ def _rows(pack, desc) -> List[CaptureMode]:
                        if cap.get("lane_polarity") is not None else None),
         embedded_lines=int(entry.get("embedded_lines", 0) or 0),
         clock_noncontinuous=bool(cap.get("clock_noncontinuous")),
-    ) for entry in derived_rows(pack, desc)]
+    ) for entry in derived_rows(pack, desc, lanes, default_fps)]
 
 
-def capture_table(pack, sensors: Optional[Iterable[str]] = None) -> List[CaptureMode]:
+def capture_table(pack, sensors: Optional[Iterable[str]] = None,
+                  lanes: Optional[int] = None,
+                  default_fps: Optional[float] = None,
+                  bit_depth: Optional[int] = None) -> List[CaptureMode]:
     """The host capture table: every entry of every sensor's
-    ``capture.table`` that shares the port's Bayer phase, sensors by their
-    compatible (or in the order given), each row's line length and top
-    rate derived from the mode the unit program runs
-    (`nxs.cam.capture_facts`), the pack's own sensors' rows in the order
-    of their exposure ceilings, an extension's after them. The capture
-    stack demosaics every mode of a node by the phase of the node's first
-    row, so the table carries one phase: the phase of the row with the
-    longest exposure, the row the exposure rule ends the table on
+    ``capture.table`` of the port's bit depth and Bayer phase, sensors by
+    their compatible (or in the order given), each row's line length derived
+    from the mode the unit program runs and its rates from the port's
+    `lanes` and `default_fps` (`nxs.cam.capture_facts`), the pack's own
+    sensors' rows in the order of their exposure ceilings, an extension's
+    after them. The capture stack takes every mode of a node in the bit
+    depth and the Bayer phase of the node's first row, so the table
+    carries one of each (`table_format`): the depth `bit_depth` names (the
+    port's declaration, `table_layout`), else the depth of the row with the
+    longest exposure, the row the exposure rule ends the table on, and
+    within that depth the phase of its row with the longest exposure
     (`excluded_rows` names the rest). The order is a function of the
-    sensors alone, so every tool and host that holds the same sensors
-    derives the same table, whatever order a pack or a store lists them."""
-    own, extensions = _ordered_rows(pack, sensors)
-    phase = table_phase(own, extensions)
-    return [m for m in own + extensions if m.pixel_phase == phase]
+    sensors and the port's layout alone, so every tool and host that holds
+    the same sensors derives the same table for a port, whatever order a
+    pack or a store lists them."""
+    own, extensions = _ordered_rows(pack, sensors, lanes, default_fps)
+    carried = table_format(own, extensions, bit_depth)
+    return [m for m in own + extensions if (m.bit_depth, m.pixel_phase) == carried]
 
 
-def excluded_rows(pack, sensors: Optional[Iterable[str]] = None) -> List[CaptureMode]:
-    """The sensors' rows the port's table leaves out: those of another
-    Bayer phase than the table's."""
-    own, extensions = _ordered_rows(pack, sensors)
-    phase = table_phase(own, extensions)
-    return [m for m in own + extensions if m.pixel_phase != phase]
+def table_layout(pack, topology, lanes: Optional[int] = None) -> Dict[str, Any]:
+    """The `lanes`, `default_fps` and `bit_depth` a port's table is laid
+    out at: the port's CSI lanes (`lanes` where the caller fixes others),
+    none on a port without a hub; the rate the port runs at
+    (`Topology.synced_fps`; FPS_DEFAULT without a port); and the bit depth
+    its declaration runs (None without a port)."""
+    direct = topology is not None and topology.is_direct
+    if lanes is None and topology is not None:
+        lanes = int(topology.csi_lanes)
+    rates = {"lanes": None if direct else lanes,
+             "default_fps": topology.synced_fps if topology is not None else FPS_DEFAULT}
+    return {**rates, "bit_depth": (_declared_depth(pack, topology, **rates)
+                                   if topology is not None else None)}
 
 
-def table_phase(own: Sequence[CaptureMode],
-                extensions: Sequence[CaptureMode] = ()) -> Optional[str]:
-    """The Bayer phase a table carries: its last own row's, the row with
-    the longest exposure; an extension's only when no own row exists."""
+def port_sensors(pack, topology) -> Optional[List[str]]:
+    """The sensors a port's table carries: a port without a hub boots its
+    own sensor's rows alone, a hub's port every sensor the pack serves."""
+    if not topology.is_direct:
+        return None
+    return [pack.descriptor(link.sensor_compatible).name for link in topology.camera_links]
+
+
+def port_table(pack, topology) -> List[CaptureMode]:
+    """The capture table a port boots: its sensors' rows at its lanes, the
+    rate it runs at and the bit depth its declaration runs
+    (`table_layout`). Every caller that names a mode by its index takes
+    the table from here, so the indexes agree."""
+    return capture_table(pack, port_sensors(pack, topology), **table_layout(pack, topology))
+
+
+def port_index(pack, topology, descriptor, mode: str) -> Optional[int]:
+    """The ``modeN`` index a descriptor's program mode lands on in the
+    table the port boots (`port_table`); None for a mode it carries no row
+    for."""
+    geo = descriptor.modes[mode]["geometry"]
+    return table_index(port_table(pack, topology), descriptor.compatible, int(geo["width"]),
+                       int(geo["height"]), int(geo["bit_depth"]))
+
+
+def refuse_without_row(pack, topology, link, descriptor, mode: str,
+                       port: str, command: str) -> None:
+    """Refuse `mode` where the table the port boots (`port_table`) carries
+    no row for it: the table carries one pixel format (`table_format`),
+    the depth the declaration runs and the phase of that depth's row with
+    the longest exposure, so a row of another depth or phase boots on no
+    node. A descriptor without capture rows has nothing to judge.
+
+    Raises:
+        InfeasibleConfig: Naming the port's link and the mode, the table's
+            format, the declaration that would carry the mode where its
+            depth differs, and `command` with each mode the table carries.
+    """
+    if not descriptor.raw("capture") or port_index(pack, topology, descriptor, mode) is not None:
+        return
+    depth, phase = table_format(port_table(pack, topology))
+    geo = descriptor.modes[mode]["geometry"]
+    alternatives = []
+    if int(geo["bit_depth"]) != depth:
+        carried = f"RAW{depth}"
+        alternatives.append(f"ports.{port}.camera.mode: {mode_token(descriptor, mode)} in "
+                            f"suite.yaml (every link), then nxs switch and the reboot")
+    else:
+        carried = f"RAW{depth} {phase}"
+    alternatives += [f"{command} --mode {mode_token(descriptor, name)}"
+                     for name in descriptor.program_modes()
+                     if port_index(pack, topology, descriptor, name) is not None]
+    raise InfeasibleConfig(
+        f"{port}/{link.name}: {mode_label(descriptor, mode)} boots on no row of this port's "
+        f"table (the table carries one pixel format, {carried}, chosen by the declaration)",
+        alternatives=alternatives)
+
+
+def excluded_rows(pack, sensors: Optional[Iterable[str]] = None,
+                  lanes: Optional[int] = None,
+                  default_fps: Optional[float] = None,
+                  bit_depth: Optional[int] = None) -> List[CaptureMode]:
+    """The sensors' rows the port's table leaves out: those of another bit
+    depth or another Bayer phase than the table's."""
+    own, extensions = _ordered_rows(pack, sensors, lanes, default_fps)
+    carried = table_format(own, extensions, bit_depth)
+    return [m for m in own + extensions if (m.bit_depth, m.pixel_phase) != carried]
+
+
+def table_format(own: Sequence[CaptureMode],
+                 extensions: Sequence[CaptureMode] = (),
+                 bit_depth: Optional[int] = None) -> Tuple[Optional[int], Optional[str]]:
+    """The bit depth and the Bayer phase a table carries: the depth
+    `bit_depth` names, else its last own row's, the row with the longest
+    exposure; and the phase of the last own row of that depth. An
+    extension's rows count only where no own row does."""
     rows = own or extensions
-    return rows[-1].pixel_phase if rows else None
+    depth = bit_depth if bit_depth is not None else (rows[-1].bit_depth if rows else None)
+    of_depth = ([m for m in own if m.bit_depth == depth]
+                or [m for m in extensions if m.bit_depth == depth])
+    return depth, (of_depth[-1].pixel_phase if of_depth else None)
 
 
-def _ordered_rows(pack, sensors: Optional[Iterable[str]] = None
+def _declared_depth(pack, topology, lanes: Optional[int] = None,
+                    default_fps: Optional[float] = None) -> Optional[int]:
+    """The bit depth a port's declaration runs: the depth of the modes its
+    camera links run, each its declared mode (its own, else the port's) or
+    the highest mode the port's laws admit, as `on` resolves them, in the
+    table at `lanes` and `default_fps`. Where the links run two depths the
+    row with the longest exposure sets it, and `check` names the other
+    link's mode. None where no link runs a mode with a row."""
+    from nxs.cam.run import _resolve_modes
+
+    cams = list(topology.camera_links)
+    if not cams:
+        return None
+    declared = {link.name: resolve_mode(pack.descriptor(link.sensor_compatible),
+                                        str(link.mode or topology.camera_mode))
+                for link in cams if link.mode or topology.camera_mode}
+    modes = _resolve_modes(pack.flows(), pack, cams, declared, topology)
+    runs = set()
+    for link in cams:
+        if link.name in modes:
+            sen = pack.descriptor(link.sensor_compatible)
+            geo = sen.modes[modes[link.name]]["geometry"]
+            runs.add((sen.compatible, int(geo["width"]), int(geo["height"]), int(geo["bit_depth"])))
+    own, extensions = _ordered_rows(pack, port_sensors(pack, topology), lanes, default_fps)
+    rows = [m for m in own if m.key in runs] or [m for m in extensions if m.key in runs]
+    return rows[-1].bit_depth if rows else None
+
+
+def _ordered_rows(pack, sensors: Optional[Iterable[str]] = None,
+                  lanes: Optional[int] = None, default_fps: Optional[float] = None
                   ) -> Tuple[List[CaptureMode], List[CaptureMode]]:
     """Every sensor's rows in the table's order, the pack's own and the
-    extensions', before the phase rule."""
+    extensions', before the table keeps one bit depth and one phase."""
     chips = (list(sensors) if sensors is not None
              else sorted(pack.sensors(), key=lambda c: pack.descriptor(c).compatible))
     own: List[Tuple[int, CaptureMode]] = []
     extensions: List[CaptureMode] = []
     for chip in chips:
         desc = pack.descriptor(chip)
-        rows = _rows(pack, desc)
+        rows = _rows(pack, desc, lanes, default_fps)
         if getattr(pack, "is_extension", lambda _name: False)(desc.name):
             extensions += rows
             continue
         # An experimental overlay moves a row's ceiling; the row keeps the
-        # place the shipped table gives it, so the indexes agree with a
+        # place the product's table gives it, so the indexes agree with a
         # host booted without the flag.
-        as_shipped = ({m.key: m.exposure_ceiling_us()
-                       for m in _rows(pack, pack.shipped_descriptor(desc.name))}
+        as_product = ({m.key: m.exposure_ceiling_us()
+                       for m in _rows(pack, pack.shipped_descriptor(desc.name), lanes, default_fps)}
                       if desc.name in getattr(pack, "overlays", {}) else {})
-        own += [(as_shipped.get(m.key, m.exposure_ceiling_us()), m) for m in rows]
+        own += [(as_product.get(m.key, m.exposure_ceiling_us()), m) for m in rows]
     # The capture stack's source validates a consumer's exposure range
     # against the node's last row, whatever mode the consumer names, and
     # hands a mode given no range that row's: the table ends on the row
@@ -196,15 +320,19 @@ def control_table(descriptor) -> List[Tuple[str, List[int]]]:
     return rows
 
 
-def pool_sensors(pack, sensors: Optional[Iterable[str]] = None) -> List[PoolSensor]:
-    """The sensors of a node's pool, in the table's order: every sensor
-    that contributes a row, with its identity and control rows. The order
-    follows the table, never the order the sensors are named in, so the
-    overlay two callers generate is one and the same."""
+def pool_sensors(pack, sensors: Optional[Iterable[str]] = None,
+                 lanes: Optional[int] = None,
+                 default_fps: Optional[float] = None,
+                 bit_depth: Optional[int] = None) -> List[PoolSensor]:
+    """The sensors of a node's pool, in the order of the table at `lanes`,
+    `default_fps` and `bit_depth`: every sensor that contributes a row,
+    with its identity and control rows. The order follows the table, never
+    the order the sensors are named in, so the overlay two callers
+    generate is one and the same."""
     chips = list(sensors) if sensors is not None else list(pack.sensors())
     by_compatible = {pack.descriptor(chip).compatible: chip for chip in chips}
     ordered: List[str] = []
-    for mode in capture_table(pack, sensors):
+    for mode in capture_table(pack, sensors, lanes, default_fps, bit_depth):
         if mode.pool in by_compatible and mode.pool not in ordered:
             ordered.append(mode.pool)
     pool: List[PoolSensor] = []
@@ -233,12 +361,14 @@ def table_index(table: Sequence[CaptureMode], pool: str, width: int,
 
 
 def mode_index(pack, descriptor, mode: str,
-               sensors: Optional[Iterable[str]] = None) -> Optional[int]:
+               sensors: Optional[Iterable[str]] = None,
+               lanes: Optional[int] = None,
+               default_fps: Optional[float] = None) -> Optional[int]:
     """The ``modeN`` index a descriptor's program mode lands on in the pack's
-    capture table, the index a capture session names it by; None for a
-    mode the table carries no row for. ``sensors`` is the table's sensor
-    set when it is not the whole pack's (a direct port boots its one
-    sensor's rows alone)."""
+    capture table at `lanes` and `default_fps`, the index a capture session
+    names it by; None for a mode the table carries no row for. ``sensors``
+    is the table's sensor set when it is not the whole pack's (a direct
+    port boots its one sensor's rows alone)."""
     geo = descriptor.modes[mode]["geometry"]
-    return table_index(capture_table(pack, sensors), descriptor.compatible, int(geo["width"]),
-                       int(geo["height"]), int(geo["bit_depth"]))
+    return table_index(capture_table(pack, sensors, lanes, default_fps), descriptor.compatible,
+                       int(geo["width"]), int(geo["height"]), int(geo["bit_depth"]))

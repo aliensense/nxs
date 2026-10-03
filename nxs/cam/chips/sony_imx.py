@@ -3,20 +3,22 @@
 
 """The Sony image-sensor family: standby-wrapped programs over STANDBY and
 XMSTA, REGHOLD-wrapped live knobs, and the frame, exposure, and gain laws,
-every constant read from the descriptor.
+every constant read from the descriptor or stated by the family's
+datasheet with its section.
 
-The frame-length law a mode is judged by follows the facts it declares: the
-datasheet's frame (`timing.min_frame_length`, else the rows plus the blanking
-delta from `timing.delta_kind` through the wait-register formula, or from
-`limits.min_frame_length_delta`) binds on every transport; on the pixel
-transport the serializer's tail law adds its rows (delivered = VMAX - tail),
-and an experimental overlay's measured clean frame and jump threshold stand in for
-both where a bench declared them. A rate is the law at the mode's own line
+The frame-length law a mode is judged by is the datasheet's recommended
+frame V_TR: the register list's row `sony.vmax`, else
+`timing.min_frame_length`, else the rows plus the blanking delta from
+`timing.delta_kind` through the wait-register formula, or from
+`limits.min_frame_length_delta`. A rate is the law at the mode's own line
 length: VMAX = INCK / (HMAX x fps), the same arithmetic the capture stack's
-frame-rate control runs. Exposure needs the shutter register,
-`integration_offset_us`, `min_integration_lines`, and a floor (`shs_floor`,
-or the `shs_floor_regs` waits); gain needs `gain_max`, gain in dB
-`gain_reg_per_db`; the black level per bit depth is `program.blklevel`.
+frame-rate control runs; the fastest is V_TR's, the slowest the longest
+frame the register holds or the capture stack's `capture.framerate.min_fps`.
+Exposure needs the shutter register, `integration_offset_us`,
+`min_integration_lines`, and a floor (`shs_floor`, or the `shs_floor_regs`
+waits); a fast-trigger frame's output delay needs a `fast` preset and the
+GMRWT and GMTWT waits; gain needs `gain_max`, gain in
+dB `gain_reg_per_db`; the black level per bit depth is `program.blklevel`.
 Programs need their sleep set under `program:`; a knob whose facts are
 absent is not offered."""
 
@@ -42,6 +44,11 @@ VINT_BITS = 0x03
 VINT_MODE_SHIFT = 2
 #: The kernel's trigger control slots, in order.
 TRIGGER_SLOTS = (FREERUN, "fast", "sequential")
+#: The fast trigger's data output delay (datasheet 20.7.3):
+#: t_TGDLY = 0.42 us + 4H + GMRWT + GMTWT, the waits in lines.
+OUTPUT_DELAY_US = 0.42
+OUTPUT_DELAY_LINES = 4
+OUTPUT_DELAY_WAITS = ("GMRWT", "GMTWT")
 
 
 class SonyImx(_KnobMixin):
@@ -93,6 +100,11 @@ class SonyImx(_KnobMixin):
     def _delta_formula_facts(self) -> bool:
         limits = self._d.limits
         return "captured_waits" in limits and "frame_length_delta_const" in limits
+
+    def _output_delay_facts(self) -> bool:
+        waits = self._d.limits.get("captured_waits") or {}
+        return ("fast" in self._trigger_presets()
+                and all(reg in waits for reg in OUTPUT_DELAY_WAITS))
 
     def _gain_db_law(self) -> Optional[Tuple[int, int]]:
         """Register steps per dB as (numerator, denominator)."""
@@ -179,24 +191,6 @@ class SonyImx(_KnobMixin):
             embedded_lines=int(m["mipi"].get("embedded_lines", 0)),
         )
 
-    def _shortest_frame(self, mode: str,
-                        tail_rows: Optional[int] = None) -> Tuple[int, str]:
-        """The shortest frame a mode delivers whole and the fact that
-        binds it: a measured clean frame where an overlay declares
-        one; else the datasheet's frame, stretched to the rows plus the
-        serializer's tail when the caller hands the tail in (the pixel
-        transport eats that many rows off every frame)."""
-        timing = self._timing(mode)
-        if timing.get("vmax_clean") is not None:
-            return int(timing["vmax_clean"]), "the measured clean frame"
-        frame = self.recommended_frame_length(mode)
-        if tail_rows is not None:
-            height = int(self._d.modes[mode]["geometry"]["height"])
-            with_tail = height + int(tail_rows)
-            if with_tail > frame:
-                return with_tail, f"the rows plus the {int(tail_rows)}-row tail"
-        return frame, "the datasheet frame"
-
     def vmax_capacity(self) -> int:
         """The longest frame the register holds: `limits.vmax_max` where
         the datasheet bounds it, else the register's width."""
@@ -206,24 +200,22 @@ class SonyImx(_KnobMixin):
         width = int(self._d.registers["VMAX"].get("width", 1))
         return (1 << (8 * width)) - 1
 
-    def fps_ceiling(self, mode: str, tail_rows: Optional[int] = None) -> float:
-        """The highest free-run rate: the timing law at the shortest whole
-        frame (`_shortest_frame`, the tail counted when given)."""
+    def fps_ceiling(self, mode: str) -> float:
+        """The highest free-run rate: the timing law at the mode's
+        recommended frame V_TR and its line, INCK / (HMAX x V_TR)."""
         hmax = int(self._timing(mode)["hmax"])
-        frame, _ = self._shortest_frame(mode, tail_rows)
-        return self._inck() / (hmax * frame)
+        return self._inck() / (hmax * self.recommended_frame_length(mode))
 
     def fps_floor(self, mode: Optional[str] = None) -> float:
         """The lowest free-run rate: the timing law at the longest frame
-        the register holds, raised to an experimental overlay's `min_fps` where one
-        was measured (the datasheet guarantees no frame above the
-        recommended one; a shipped floor is the customer's)."""
+        the register holds, raised to the capture stack's minimum rate
+        (`capture.framerate.min_fps`, the vendor driver's)."""
         mode = mode or self.default_mode()
         hmax = int(self._timing(mode)["hmax"])
         floor = self._inck() / (hmax * self.vmax_capacity())
-        measured = self._d.limits.get("min_fps")
-        if measured is not None:
-            floor = max(floor, float(measured))
+        framerate = (self._d.raw("capture") or {}).get("framerate") or {}
+        if framerate.get("min_fps") is not None:
+            floor = max(floor, float(framerate["min_fps"]))
         return floor
 
     def vmax_for_fps(self, fps: float, hmax: int) -> int:
@@ -234,13 +226,6 @@ class SonyImx(_KnobMixin):
     def line_time_us(self, hmax: int) -> float:
         """One line period in microseconds at the given HMAX."""
         return hmax * 1e6 / self._inck()
-
-    def rows_delivered(self, vmax: int, tail_rows: Optional[int] = None) -> Optional[int]:
-        """Rows that survive the pixel-mode frame-tail truncation; None when
-        the caller derived no tail (the serializer owns that number)."""
-        if tail_rows is None:
-            return None
-        return vmax - int(tail_rows)
 
     def frame_length_delta_formula(self, kind: str) -> int:
         """Minimum blanking from the captured wait registers:
@@ -283,77 +268,69 @@ class SonyImx(_KnobMixin):
         height = int(self._d.modes[mode]["geometry"]["height"])
         return height + self._frame_length_delta(mode, color)[0]
 
+    def _recommended(self, mode: str, color: Optional[bool] = None) -> Tuple[int, str]:
+        """V_TR of a mode and the fact that states it: the register list's
+        row with its section, else the declared frame, else the rows plus
+        the blanking law (`color` picks the variant of a blanking table)."""
+        row = self._d.modes[mode].get("sony") or {}
+        if row.get("vmax") is not None:
+            return int(row["vmax"]), f"datasheet {row['section']}"
+        timing = self._timing(mode)
+        if timing.get("min_frame_length") is not None:
+            return int(timing["min_frame_length"]), "the declared min_frame_length"
+        height = int(self._d.modes[mode]["geometry"]["height"])
+        delta, law = self._frame_length_delta(mode, color)
+        return height + delta, f"active {height} + {law} {delta}"
+
     def recommended_frame_length(self, mode: str) -> int:
-        """The frame length a mode's register list notes: a declared
+        """The frame length V_TR a mode's register list notes: the
+        datasheet row's (`sony.vmax`), else a declared
         `timing.min_frame_length`, else rows plus the blanking law. The
         datasheet guarantees the imaging characteristics at it."""
-        return self._native_minimum(mode)
+        return self._recommended(mode)[0]
 
-    def trigger_frame_length(self, mode: str,
-                             tail_rows: Optional[int] = None) -> int:
+    def trigger_frame_length(self, mode: str) -> int:
         """The frame length the fast-trigger program fixes for a mode: a
-        declared `timing.trigger_vmax` (an experimental overlay), else the readout's
-        own minimum (rows plus the blanking law) stretched to the rows plus
-        the serializer's tail when the caller hands the tail in: the
-        shortest frame that still reads the whole picture under a
-        trigger."""
+        declared `timing.trigger_vmax` (an experimental overlay's), else
+        its recommended frame V_TR, which reads the whole picture."""
         declared = self._timing(mode).get("trigger_vmax")
         if declared is not None:
             return int(declared)
-        frame = self._native_minimum(mode)
-        if tail_rows is not None:
-            height = int(self._d.modes[mode]["geometry"]["height"])
-            frame = max(frame, height + int(tail_rows))
-        return frame
+        return self.recommended_frame_length(mode)
 
-    def validate_vmax(self, vmax: int, mode: str, color: Optional[bool] = None,
-                      transport: str = "native",
-                      tail_rows: Optional[int] = None) -> None:
-        """The frame-length law for a transport.
-
-        The datasheet's frame (a declared `min_frame_length`, else the rows
-        plus the blanking delta) binds on every transport. On the pixel
-        transport the serializer's tail law adds its rows (delivered =
-        VMAX - tail), a measured clean frame stands in for both
-        where an overlay declares one, and a measured jump threshold
-        refuses the frames above it. The register's capacity bounds the
-        frame above.
+    def data_output_delay_lines(self, mode: str, hmax: int) -> int:
+        """How many lines late a fast-trigger frame's valid pixels arrive,
+        rounded up to whole lines: t_TGDLY = 0.42 us + 4H + GMRWT + GMTWT
+        (datasheet 20.7.3) at the line `hmax`, the waits the captured ones.
+        A capture window of the mode's rows ends in that many lines of
+        filler.
 
         Raises:
-            InfeasibleConfig: If VMAX violates the law for the transport.
+            InfeasibleConfig: For a mode whose frame does not follow from
+                the captured waits (one declared whole runs its own).
         """
-        timing = self._timing(mode)
-        height = int(self._d.modes[mode]["geometry"]["height"])
-        if transport == "pixel":
-            minimum, binds = self._shortest_frame(mode, tail_rows)
-            if vmax < minimum:
-                delivered = (f"delivers ~{vmax - int(tail_rows)} rows of {height} "
-                             f"(delivered = VMAX - {int(tail_rows)})"
-                             if tail_rows is not None and binds.endswith("tail")
-                             else "comes up short")
-                raise InfeasibleConfig(
-                    f"VMAX {vmax} < {minimum} ({binds} for {mode} in pixel "
-                    f"mode): the frame {delivered}",
-                    alternatives=[f"vmax {minimum} ({binds})"])
-            jump = timing.get("vmax_jump_threshold")
-            if jump is not None and vmax >= int(jump):
-                raise InfeasibleConfig(
-                    f"VMAX {vmax} >= {int(jump)}: frames alternate full/short "
-                    "in pixel mode, the picture jumps (measured)",
-                    alternatives=[f"vmax {minimum} ({binds})"])
-        else:
-            if timing.get("min_frame_length") is not None:
-                minimum = int(timing["min_frame_length"])
-                source = f"min_frame_length for {mode}"
-            else:
-                delta, law = self._frame_length_delta(mode, color)
-                minimum = height + delta
-                source = f"active {height} + {law} {delta}"
-            if vmax < minimum:
-                raise InfeasibleConfig(
-                    f"VMAX {vmax} < {minimum} ({source}): the frame comes up "
-                    "short below the minimum vertical blanking",
-                    alternatives=[f"vmax {minimum} (the mode minimum)"])
+        if self._timing(mode).get("delta_kind") is None:
+            raise InfeasibleConfig(
+                f"{self._d.compatible} {mode}: its frame does not follow from the "
+                f"captured waits, so the laws carry no output delay for it")
+        waits = self._d.limits["captured_waits"]
+        lines = OUTPUT_DELAY_LINES + sum(int(waits[reg]) for reg in OUTPUT_DELAY_WAITS)
+        return lines + math.ceil(OUTPUT_DELAY_US / self.line_time_us(hmax))
+
+    def validate_vmax(self, vmax: int, mode: str, color: Optional[bool] = None) -> None:
+        """The frame-length law: no shorter than the mode's recommended
+        frame V_TR (`_recommended`, whose fact the refusal names), no
+        longer than the register holds.
+
+        Raises:
+            InfeasibleConfig: If VMAX is outside the law.
+        """
+        minimum, source = self._recommended(mode, color)
+        if vmax < minimum:
+            raise InfeasibleConfig(
+                f"VMAX {vmax} < {minimum} (the recommended frame of {mode}, {source}): "
+                "the frame comes up short below the minimum vertical blanking",
+                alternatives=[f"vmax {minimum} (the recommended frame, {source})"])
         capacity = self.vmax_capacity()
         if vmax > capacity:
             raise InfeasibleConfig(
@@ -389,21 +366,11 @@ class SonyImx(_KnobMixin):
             inck = self._inck()
             lines.append(f"-> sensor rate ~= {inck / (hmax * vmax):.1f} fps "
                          "(INCK/(HMAX*VMAX))")
-            tail_us = readings.get("pixel_tail_us")
-            if tail_us and self._pixel_delivery():
-                tail_rows = math.ceil(float(tail_us) * inck / hmax / 1e6)
-                lines.append(f"-> pixel-mode delivery ~= {vmax - tail_rows} rows "
-                             "(delivered = VMAX - tail)")
         shs = readings.get("shs")
         if shs is not None and vmax and self._exposure_facts():
             lines.append(f"-> SHS {shs} vs VMAX {vmax}"
                          + (" (SHS >= VMAX: near-zero exposure!)" if shs >= vmax else ""))
         return lines
-
-    def _pixel_delivery(self) -> bool:
-        """Whether pixel-mode delivery is the tail-truncated frame: the part
-        is judged by the blanking law, not by a declared minimum frame."""
-        return self._timing(self.default_mode()).get("min_frame_length") is None
 
     def knob_readback(self, readings: Dict[str, int]) -> Dict[str, str]:
         """Derived knob values from raw probe readings: fps from the timing
@@ -435,7 +402,7 @@ class SonyImx(_KnobMixin):
         names = ["descriptor", "default_mode", "export_mipi_contract",
                  "fps_ceiling", "fps_floor", "vmax_for_fps", "vmax_capacity",
                  "validate_vmax", "recommended_frame_length",
-                 "trigger_frame_length", "line_time_us", "rows_delivered",
+                 "trigger_frame_length", "line_time_us",
                  "derive_status", "knob_readback"]
         if self._adbit_facts():
             names.append("adbit_monosel")
@@ -461,6 +428,8 @@ class SonyImx(_KnobMixin):
                     names.append("knob_sync")
         if self._delta_formula_facts():
             names.append("frame_length_delta_formula")
+        if self._output_delay_facts():
+            names.append("data_output_delay_lines")
         if self._has("REGHOLD"):
             if self._has("VMAX"):
                 names.append("knob_fps")

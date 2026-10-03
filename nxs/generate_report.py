@@ -125,6 +125,8 @@ def walk_data(ports: List[PortFinding], units: List[UnitFinding]) -> Dict[str, A
                     node["unit"]["serial"] = link.unit_serial
                 if link.unit_fw:
                     node["unit"]["fw"] = link.unit_fw
+                if link.unit_driver:
+                    node["unit"]["personality"] = link.unit_driver
             entry["links"].append(node)
         out_ports.append(entry)
     out_units = [{k: v for k, v in (("route", u.route), ("serial", u.serial), ("fw", u.fw),

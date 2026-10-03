@@ -13,7 +13,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 from nxs import host as host_layer
 
@@ -120,15 +120,12 @@ def consumer_pipeline(capture_id: int, sensor_mode: int, width: int,
                       framerate: Optional[list] = None,
                       snapshot_dir: Optional[str] = None,
                       encoder: str = DEFAULT_ENCODER,
-                      exposure_us: Optional[float] = None,
-                      exposure_min_us: Optional[float] = None,
-                      exposure_max_us: Optional[float] = None) -> list:
+                      props: str = "") -> list:
     """The viewers' source and caps with a counting tail: a fakesink, or with
     ``snapshot_dir`` a JPEG writer producing ``frame-NNNN.jpg`` per frame
-    (``encoder`` names the element, the host's own by default);
-    ``exposure_us`` pins the capture stack's exposure (a triggered pair's),
-    else ``exposure_min_us``..``exposure_max_us`` bounds its own loop to
-    the frame."""
+    (``encoder`` names the element, the host's own by default); ``props``
+    are the source's properties for the link's caps
+    (`viewers.source_props`)."""
     host = host_layer.current()
     if snapshot_dir:
         location = shlex.quote(f"{snapshot_dir}/frame-%04d.jpg")
@@ -138,12 +135,7 @@ def consumer_pipeline(capture_id: int, sensor_mode: int, width: int,
                 f"multifilesink location={location}")
     else:
         tail = "identity silent=false ! fakesink"
-    if exposure_us is not None:
-        props = f" {host.exposure_props(exposure_us)}"
-    elif exposure_max_us is not None:
-        props = f" {host.ae_props(exposure_min_us, exposure_max_us)}"
-    else:
-        props = ""
+    props = f" {props}" if props else ""
     pipeline = (
         f"{host.source(capture_id, sensor_mode)}{props} "
         f"num-buffers={frames} ! "
@@ -151,6 +143,18 @@ def consumer_pipeline(capture_id: int, sensor_mode: int, width: int,
         f"{tail}"
     )
     return ["gst-launch-1.0", "-v", "-e", *shlex.split(pipeline)]
+
+
+def _open_gate(gate, procs, timeout_s: float) -> None:
+    """Open the gate behind consumers already started; a gate that does not
+    open (the bus held past the lock's wait, a control-bus fault) stops them
+    before its refusal goes on, so none waits on a closed output."""
+    try:
+        gate(True)
+    except BaseException:
+        for proc in procs:
+            _stop(proc, timeout_s)
+        raise
 
 
 def headless_capture(
@@ -162,19 +166,19 @@ def headless_capture(
     run=subprocess,
     snapshot_dir: Optional[str] = None,
     encoder: str = DEFAULT_ENCODER,
+    port: Optional[str] = None,
 ) -> CaptureResult:
     """Capture `frames` frames headlessly with the CSI-gate choreography; a
     failed verdict restarts the capture daemon and rolls once more. `hints` are the
-    resolved caps, `gate(enable)` toggles the CSI gate; `.ok` is the verdict."""
+    resolved caps of a link of `port`, `gate(enable)` toggles the CSI gate; `.ok`
+    is the verdict."""
     if timeout_s is None:
         timeout_s = 20.0 + frames / 5.0
 
     cmd = consumer_pipeline(capture_id, hints["sensor_mode"], hints["width"],
                             hints["height"], frames, hints.get("framerate"),
                             snapshot_dir=snapshot_dir, encoder=encoder,
-                            exposure_us=hints.get("exposure_us"),
-                            exposure_min_us=hints.get("exposure_min_us"),
-                            exposure_max_us=hints.get("exposure_max_us"))
+                            props=viewers.source_props(hints, port=port))
 
     result = None
     for attempt in range(1, ATTEMPTS + 1):
@@ -186,7 +190,7 @@ def headless_capture(
         proc = run.Popen(cmd, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True)
         time.sleep(CAPTURE_SETTLE_S)
-        gate(True)
+        _open_gate(gate, [proc], timeout_s)
         try:
             output, _ = proc.communicate(timeout=timeout_s)
             rc = proc.returncode
@@ -212,42 +216,43 @@ def headless_capture(
 
 
 
-def headless_pair(hints_by_id: Dict[int, Dict[str, Any]], gate, frames: int,
-                  timeout_s: Optional[float] = None, run=subprocess
-                  ) -> Dict[int, str]:
-    """Capture several links at once with one gate choreography: every
-    consumer starts, the gate opens once, each runs to its frame count.
+def headless_pair(hints_by_id: Dict[int, Dict[str, Any]], gate,
+                  frames: Union[int, Dict[int, int]], timeout_s: Optional[float] = None,
+                  run=subprocess, port: Optional[str] = None) -> Dict[int, str]:
+    """Capture several links of `port` at once with one gate choreography:
+    every consumer starts, the gate opens once, each runs to its frame count
+    (`frames`: one count for every capture id, or a count per id).
     A roll on which any consumer delivered nothing restarts the capture
     daemon and rolls once more (`ATTEMPTS`). Returns each capture id's raw
     output (for timestamps and counts)."""
+    counts = (dict(frames) if isinstance(frames, dict)
+              else {capture_id: int(frames) for capture_id in hints_by_id})
     outputs: Dict[int, str] = {}
     for attempt in range(1, ATTEMPTS + 1):
         if attempt > 1:
             host_layer.current().restart_capture_daemon(run)
-        outputs = _pair_roll(hints_by_id, gate, frames, timeout_s, run)
+        outputs = _pair_roll(hints_by_id, gate, counts, timeout_s, run, port)
         if all(count_delivered(out) for out in outputs.values()):
             break
     return outputs
 
 
-def _pair_roll(hints_by_id: Dict[int, Dict[str, Any]], gate, frames: int,
-               timeout_s: Optional[float], run) -> Dict[int, str]:
+def _pair_roll(hints_by_id: Dict[int, Dict[str, Any]], gate, counts: Dict[int, int],
+               timeout_s: Optional[float], run, port: Optional[str]) -> Dict[int, str]:
     """One simultaneous roll of every consumer, each at its link's caps and
-    exposure range."""
+    source properties, to its own frame count."""
     if timeout_s is None:
-        timeout_s = 20.0 + frames / 5.0
+        timeout_s = 20.0 + max(counts.values(), default=0) / 5.0
     gate(False)
     procs = {}
     for capture_id, hints in hints_by_id.items():
         cmd = consumer_pipeline(capture_id, hints["sensor_mode"], hints["width"],
-                                hints["height"], frames, hints.get("framerate"),
-                                exposure_us=hints.get("exposure_us"),
-                                exposure_min_us=hints.get("exposure_min_us"),
-                                exposure_max_us=hints.get("exposure_max_us"))
+                                hints["height"], counts[capture_id], hints.get("framerate"),
+                                props=viewers.source_props(hints, port=port))
         procs[capture_id] = run.Popen(cmd, stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT, text=True)
     time.sleep(CAPTURE_SETTLE_S)
-    gate(True)
+    _open_gate(gate, list(procs.values()), timeout_s)
     outputs: Dict[int, str] = {}
     timed_out: Dict[int, bool] = {}
 

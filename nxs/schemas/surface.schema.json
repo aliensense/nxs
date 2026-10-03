@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://aliensense.github.io/nxs-docs/schemas/surface.schema.json",
   "title": "nxs --json surfaces (contract 2)",
-  "description": "Every document an `nxs \u2026 --json` verb emits, one definition per surface. Each carries `contract: 2`; a breaking change to any surface bumps the contract.",
+  "description": "Every document an `nxs … --json` verb emits, one definition per surface. Each carries `contract: 2`; a breaking change to any surface bumps the contract.",
   "$defs": {
     "contract": {
       "const": 2
@@ -255,7 +255,8 @@
       "additionalProperties": false,
       "required": [
         "contract",
-        "buses"
+        "buses",
+        "not_opened"
       ],
       "properties": {
         "contract": {
@@ -322,6 +323,26 @@
               }
             }
           }
+        },
+        "not_opened": {
+          "description": "The leaf buses the sweep could not open, so did not sweep, each with the reason (`Permission denied` names the i2c group the user lacks).",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "bus",
+              "reason"
+            ],
+            "properties": {
+              "bus": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              }
+            }
+          }
         }
       }
     },
@@ -350,6 +371,10 @@
         "error": {
           "type": "string",
           "description": "Why the probe stopped before the walk: the bus could not be opened or locked, or the hub cannot be identified."
+        },
+        "held": {
+          "type": "boolean",
+          "description": "Another nxs run held the bus lock past the wait (nxsd while it brings the ports up after boot): status stopped its remaining reads, what the walk read before stands, and a hub it did not reach is not absent."
         },
         "port": {
           "type": "string"
@@ -430,6 +455,14 @@
                     },
                     "state": {
                       "$ref": "#/$defs/ack"
+                    },
+                    "strap": {
+                      "type": "integer",
+                      "description": "The address the pod straps, sought when its alias is silent."
+                    },
+                    "answers_at": {
+                      "type": "integer",
+                      "description": "Where a pod silent at its alias answered: the hub lost its aliases, and `nxs switch` maps them."
                     },
                     "personalities": {
                       "type": "array",
@@ -681,14 +714,9 @@
               },
               "description": "What each link does under the trigger (fsync, or free_run with the reason)."
             },
-            "pulses_per_frame": {
-              "type": "integer",
-              "minimum": 1,
-              "description": "The generator pulses this many times per frame; the sensors take every n-th."
-            },
-            "exposure_us": {
-              "type": "number",
-              "description": "The integration time the pulse's low time sets, microseconds."
+            "pulse_exposure": {
+              "type": "boolean",
+              "description": "The trigger pulse sets the synced links' exposure: the pulse's low time at one pulse per frame plus the sensor's trigger offset (absent when it sets none)."
             },
             "trigger_vmax": {
               "type": "object",
@@ -696,10 +724,209 @@
                 "type": "integer"
               },
               "description": "The trigger frame each synced link runs, in lines."
+            },
+            "ae": {
+              "description": "Who sets the exposure and the gain of the port's camera links: under frame sync the leader's capture session decides the pair's gain and the follower's head takes it (follow), a declared gain locks every named link (locked), or each capture session runs its own loop (per_link, with the reason).",
+              "oneOf": [
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "mode",
+                    "leader",
+                    "follower"
+                  ],
+                  "properties": {
+                    "mode": {
+                      "const": "follow"
+                    },
+                    "leader": {
+                      "type": "string"
+                    },
+                    "follower": {
+                      "type": "string"
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "mode",
+                    "gain_db",
+                    "links"
+                  ],
+                  "properties": {
+                    "mode": {
+                      "const": "locked"
+                    },
+                    "gain_db": {
+                      "type": "number",
+                      "minimum": 0
+                    },
+                    "links": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "minItems": 1
+                    }
+                  }
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "mode",
+                    "reason"
+                  ],
+                  "properties": {
+                    "mode": {
+                      "const": "per_link"
+                    },
+                    "reason": {
+                      "type": "string"
+                    }
+                  }
+                }
+              ]
             }
           },
           "required": [
             "source"
+          ]
+        },
+        "verified": {
+          "description": "The delivery check that last passed on the port, after `on`, `set sync` or `set fps` (null when none holds: a new boot, a sync or rate change, a link marked unknown or parked clears it).",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": false,
+          "required": [
+            "at",
+            "rates"
+          ],
+          "properties": {
+            "at": {
+              "type": "number",
+              "description": "When the check ran, in seconds since the epoch."
+            },
+            "rates": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "number"
+              },
+              "description": "The rate each link delivered, in fps, by the buffers' timestamps."
+            }
+          }
+        },
+        "ae": {
+          "description": "Who decides the gain of the port's camera links: the part the record names (sync_live.ae), and for a followed pair whether nxsd copies the leader's gain now (following: the follower's heartbeat says so and is at most 3 s old), the heartbeat's age in seconds, the gain it copies and the reason a follower its faults stopped gives (null when the record names no part).",
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "mode",
+                "leader",
+                "follower",
+                "gain_db",
+                "following",
+                "heartbeat_age_s"
+              ],
+              "properties": {
+                "mode": {
+                  "const": "follow"
+                },
+                "leader": {
+                  "type": "string"
+                },
+                "follower": {
+                  "type": "string"
+                },
+                "gain_db": {
+                  "type": [
+                    "number",
+                    "null"
+                  ],
+                  "minimum": 0
+                },
+                "following": {
+                  "type": "boolean"
+                },
+                "heartbeat_age_s": {
+                  "type": [
+                    "number",
+                    "null"
+                  ],
+                  "minimum": 0
+                },
+                "reason": {
+                  "type": "string"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "mode",
+                "gain_db",
+                "links",
+                "following",
+                "heartbeat_age_s"
+              ],
+              "properties": {
+                "mode": {
+                  "const": "locked"
+                },
+                "gain_db": {
+                  "type": "number",
+                  "minimum": 0
+                },
+                "links": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  },
+                  "minItems": 1
+                },
+                "following": {
+                  "const": false
+                },
+                "heartbeat_age_s": {
+                  "type": "null"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "mode",
+                "reason",
+                "following",
+                "heartbeat_age_s"
+              ],
+              "properties": {
+                "mode": {
+                  "const": "per_link"
+                },
+                "reason": {
+                  "type": "string"
+                },
+                "following": {
+                  "const": false
+                },
+                "heartbeat_age_s": {
+                  "type": "null"
+                }
+              }
+            }
           ]
         },
         "presence": {
@@ -761,14 +988,20 @@
           "additionalProperties": false,
           "required": [
             "dir",
+            "shipped",
             "installed"
           ],
           "properties": {
             "dir": {
               "type": "string"
             },
+            "shipped": {
+              "type": "integer",
+              "description": "The sealed personalities the assets put in the store."
+            },
             "installed": {
-              "type": "integer"
+              "type": "integer",
+              "description": "The personalities installed beside them (nxs personality install)."
             }
           }
         },
@@ -885,6 +1118,10 @@
               "rides": {
                 "type": "string",
                 "description": "`<port>/<link>` when the unit rides a camera link: it is that link's node."
+              },
+              "held": {
+                "type": "boolean",
+                "description": "The unit was not read: its port's bus stayed another run's past the wait (nxsd while it brings the ports up after boot), and a unit not reached is not absent."
               }
             }
           }
@@ -938,7 +1175,7 @@
         },
         "sync_pairs": {
           "type": "array",
-          "description": "Modes shipped for the pair under frame sync, with their rate range.",
+          "description": "On a pair, per mode the port runs under frame sync: the lowest and the highest whole rate it takes.",
           "items": {
             "type": "object",
             "additionalProperties": false,
@@ -1007,17 +1244,36 @@
                 "type": [
                   "integer",
                   "null"
-                ]
+                ],
+                "description": "The mode's index in the table the port boots; null for a mode the table carries no row for, or on a pack without a capture table."
               },
               "token": {
                 "type": "string",
                 "description": "The mode as `on --mode` takes it: WxH, or WxH-rawN when two depths share a geometry."
+              },
+              "runs_alone": {
+                "type": "boolean",
+                "description": "On a pair, true for a mode the pair's program does not carry: it runs one camera alone on the port, with no range, line or sync pair listed here."
+              },
+              "capture_row": {
+                "type": [
+                  "boolean",
+                  "null"
+                ],
+                "description": "Whether the table the port boots carries the mode's row (one pixel format per table); false for a mode that boots on no node, with no range or line listed; null on a pack without a capture table."
               },
               "fps_floor": {
                 "type": [
                   "number",
                   "null"
                 ]
+              },
+              "fps_guaranteed": {
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "description": "The rate at which the mode runs the datasheet's recommended frame at the port's line; a slower rate stretches the frame past it, where the datasheet guarantees no imaging characteristics. Null for a part whose table sets its frame, or a mode the port does not run."
               },
               "line_time_ns": {
                 "type": [
@@ -1032,15 +1288,11 @@
                   "null"
                 ],
                 "enum": [
-                  "shipped",
-                  "pair",
+                  "datasheet",
+                  "found",
                   null
                 ],
-                "description": "Where the line comes from: the shipped shipped point, or the pair line the hub's output leaves a mode that ships a solo point only."
-              },
-              "experimental": {
-                "type": "boolean",
-                "description": "True for a mode that ships no shipped point for this port: offered only under --experimental."
+                "description": "Where the line comes from: the datasheet (the sensor's own line, or the deserializer's pair line law on a pair), or found (the longer line the delivery check of `on` found a pair needs on this rig); null for a mode without a line."
               },
               "offered": {
                 "type": "boolean",
@@ -1350,6 +1602,10 @@
                         },
                         "fw": {
                           "type": "string"
+                        },
+                        "personality": {
+                          "type": "string",
+                          "description": "The personality the pod runs, by the name it reports, as a unit on a bare bus carries it."
                         }
                       }
                     },

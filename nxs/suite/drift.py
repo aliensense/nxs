@@ -9,6 +9,9 @@ from nxs.suite.schema import (UnitSpec, device_proves_patch, device_runs,
                               parse_version)
 from nxs.suite.state import SuiteState
 
+#: The slots a unit's personality store holds.
+STORE_SLOTS = 8
+
 
 @dataclass
 class UnitDrift:
@@ -51,15 +54,19 @@ def orientation_drift(unit: UnitSpec, transport) -> bool:
 
 
 def firmware_drift(unit: UnitSpec, state: SuiteState, transport,
-                   pin: Optional[str] = None) -> bool:
-    """True when apply would flash: provable mismatch, or unknown
-    version without a matching state record. `pin` is the version to
-    hold the unit at; the unit's own `firmware` when None."""
+                   pin: Optional[str] = None, image: Optional[str] = None) -> bool:
+    """True when apply would flash. `image` is the build identity the
+    pinned image carries: the unit runs that image exactly when it reports
+    the identity, as `push-fw` judges a push. Without one, a provable
+    mismatch or an unknown version without a matching state record. `pin`
+    is the version to hold the unit at; the unit's own `firmware` when None."""
     pin = pin or unit.firmware
     if not pin:
         return False
-    want = parse_version(pin)
     device = transport.read_fw_version()
+    if image is not None:
+        return device != image
+    want = parse_version(pin)
 
     # A full build identity proves the whole triple and decides alone; the
     # state record never overrides what the wire proves.
@@ -83,6 +90,32 @@ def firmware_drift(unit: UnitSpec, state: SuiteState, transport,
     # No record: a proven major.minor match converges; flash only when the
     # wire cannot prove even major.minor.
     return runs is None
+
+
+def driver_slots(transport) -> List[int]:
+    """The populated store slots that hold a sensor personality: every one
+    but a camera personality's, which the camera steps own. A slot the unit
+    refuses to describe counts as a sensor slot; a transport that cannot
+    peek a slot counts every populated one."""
+    from nxs.client import ERRNO_EBUSY, DeviceRefused, SupportsSlotPeek
+    from nxs.image import IMAGE_KIND_NAMES, ImageKind
+
+    if not isinstance(transport, SupportsSlotPeek):
+        return list(range(transport.read_store_count()))
+    camera = IMAGE_KIND_NAMES[ImageKind.CAMERA]
+    slots = []
+    for slot in range(STORE_SLOTS):
+        try:
+            info = transport.read_slot_info(slot)
+        except DeviceRefused as exc:
+            if exc.code == ERRNO_EBUSY:
+                raise
+            slots.append(slot)
+            continue
+        kind = getattr(info, "kind", None)
+        if info is not None and IMAGE_KIND_NAMES.get(kind, kind) != camera:
+            slots.append(slot)
+    return slots
 
 
 def egress_drift(unit: UnitSpec, transport) -> Dict[str, Tuple[object, object]]:
@@ -111,10 +144,10 @@ def detect_unit_drift(unit: UnitSpec, panel: list, transport,
                       egress=egress_drift(unit, transport),
                       orientation=orientation_drift(unit, transport))
     if not panel:
-        # Declared-empty (`sensors: []`): anything running or stored is
-        # driver drift. An unmanaged panel (key absent) is never drift.
+        # Declared-empty (`sensors: []`): a sensor personality running or
+        # stored is driver drift. An unmanaged panel (key absent) is never drift.
         if unit.sensors is not None and (
-                transport.read_driver_name() or transport.read_store_count()):
+                transport.read_driver_name() or driver_slots(transport)):
             drift.driver = True
         return drift
 
@@ -123,12 +156,14 @@ def detect_unit_drift(unit: UnitSpec, panel: list, transport,
     if active not in names:
         drift.driver = True
         return drift
-    # A driver that loaded but never probed is not the manifest realized; the
-    # runner parks in PROBE_FAILED until a host command intervenes.
-    if transport.read_runner_state() == RunnerStates.RunnerState.PROBE_FAILED:
+    # A driver that is not measuring is not the manifest realized: one that
+    # never probed parks in PROBE_FAILED until a host command intervenes, a
+    # stopped one waits in LOADING. Either is redeployed, and the deploy's
+    # own verdict names why it does not come up.
+    if transport.read_runner_state() != RunnerStates.RunnerState.MEASURING:
         drift.driver = True
         return drift
-    if transport.read_store_count() != len(panel) \
+    if len(driver_slots(transport)) != len(panel) \
             or state.unit(unit.name).get("panel_hash") != expected_hash:
         drift.shape = True
         return drift

@@ -10,7 +10,7 @@ from typing import List, Optional, Tuple
 
 from nxs._generated_constants import CyphalDefaults, NxsDevices
 from nxs.suite.schema import SuiteConfig, LinkSpec, stable_path
-from nxs.transports import open_client
+from nxs import transports
 
 # The register-map address, plus NXS+1: the alias convention for a second
 # unit presented on the same host bus by a SerDes/mux.
@@ -96,8 +96,10 @@ def _i2c_buses() -> List[str]:
 
 
 def scan_bus_units(bus: str, addresses=I2C_ADDRESSES,
-                   opener=open_client) -> List[Found]:
-    """The units answering on one I2C bus at the given addresses."""
+                   opener=None) -> List[Found]:
+    """The units answering on one I2C bus at the given addresses. The
+    opener defaults to the one `nxs.transports` holds at the call."""
+    opener = opener or transports.open_client
     found = []
     for address in addresses:
         link = LinkSpec(transport="i2c", bus=bus, address=address)
@@ -224,9 +226,11 @@ def _scan_can(opener, declared: List[LinkSpec]) -> List[Found]:
 
 
 def scan_suite(cfg: Optional[SuiteConfig] = None,
-               opener=open_client) -> List[Found]:
+               opener=None) -> List[Found]:
     """Probe every plausible link; `cfg` widens the I2C address, serial
-    port, and CAN node-id sweeps to the declared links."""
+    port, and CAN node-id sweeps to the declared links. The opener defaults
+    to the one `nxs.transports` holds at the call."""
+    opener = opener or transports.open_client
     declared = [link for u in cfg.units for link in u.links] if cfg else []
     return (_scan_i2c(opener, declared) + _scan_serial(opener, declared)
             + _scan_can(opener, declared))

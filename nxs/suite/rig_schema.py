@@ -4,22 +4,21 @@
 """The rig's rules as one JSON Schema: the manifest schema narrowed by the
 nodes that are on this rig. Each node brings its own rules, selected by its
 `compatible` the way a devicetree binding is: a hub brings its links and its
-frame sync, a sensor its modes and the rates each ships at, a unit's
-personality the configuration keys it takes. A key no node on the rig brings
-is not in the schema, and `additionalProperties: false` refuses it.
+frame sync, a sensor its modes and the rates the laws give each on the port,
+a unit's personality the configuration keys it takes. A key no node on the
+rig brings is not in the schema, and `additionalProperties: false` refuses it.
 
 The schema is necessary, not sufficient. It judges names, values, and the
-combinations inside one link, from the same laws and shipped points the tool
-composes with. Arithmetic across nodes (two cameras on one line, lanes
-against the hub's output) stays with those laws, and `nxs status` on the rig
-is the judge."""
+combinations inside one link, from the same laws the tool composes with.
+Arithmetic across nodes (two cameras on one line, lanes against the hub's
+output) stays with those laws, and `nxs status` on the rig is the judge."""
 
 from __future__ import annotations
 
 import copy
 from typing import Any, Dict, List, Optional, Tuple
 
-from nxs import experimental, schemas
+from nxs import schemas
 
 #: What a hub's link carries and a sensor on the port's own bus does not.
 _HUB_LINK_KEYS = ("ser", "des_window", "ser_addr", "tca_addr")
@@ -54,15 +53,6 @@ def _mode_tokens(sen, names: List[str]) -> Dict[str, str]:
     return tokens
 
 
-def _offered_modes(sen, cameras: int, lanes: int) -> List[str]:
-    from nxs.cam import shipped
-
-    proven = list(shipped.shipped_modes(sen, cameras, lanes))
-    if experimental.enabled():
-        proven += [n for n in sen.program_modes() if n not in proven]
-    return proven
-
-
 def _default_mode(flows, pack, topology, link) -> Optional[str]:
     try:
         return str(flows.default_mode(pack, link, topology))
@@ -77,15 +67,12 @@ def _camera_rule(pack, flows, topology, link) -> Dict[str, Any]:
     it; a mapping that names no mode is judged at the sensor's default."""
     import dataclasses
 
-    from nxs.cam import shipped
-
-    cameras, lanes = shipped.cameras(topology.links), int(topology.csi_lanes)
     served = sorted(pack.descriptor(chip).compatible for chip in pack.sensors())
     rules = []
     for compatible in served:
         sen = pack.descriptor(compatible)
         as_if = dataclasses.replace(link, sensor_compatible=compatible)
-        tokens = _mode_tokens(sen, _offered_modes(sen, cameras, lanes))
+        tokens = _mode_tokens(sen, list(sen.program_modes()))
         per_mode = []
         for token, mode in sorted(tokens.items()):
             rate = _rate(flows, pack, topology, as_if, mode)

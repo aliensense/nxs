@@ -18,11 +18,8 @@ import inspect
 from fractions import Fraction
 from typing import Any, Dict, List, Optional, Tuple
 
-from nxs import experimental
-
-from . import shipped
-from .contracts import (CsiContract, InfeasibleConfig, LinkSpec, RateRange, Topology,
-                        VcGeometry)
+from .contracts import (FPS_DEFAULT, CsiContract, InfeasibleConfig, LinkSpec, RateRange,
+                        Topology, VcGeometry)
 from .descriptors import FREERUN, resolve_mode
 from .packs import sensor_address
 from .plan import RawConfig, scan_forbidden
@@ -50,14 +47,11 @@ def _call(fn, *args, **kwargs):
 
 
 def sensor_module(pack, link, topology: Optional[Topology] = None):
-    """The law family bound to a link's sensor, at the port's view when the
-    port is known (one camera on its lanes)."""
+    """The law family bound to a link's sensor: the port carries one camera
+    at the mode's own line, so the port adds nothing to it."""
+    del topology
     compatible = str(getattr(link, "sensor_compatible", link))
-    if topology is not None:
-        module = pack.chip_module(compatible, shipped.cameras(topology.links),
-                                  int(topology.csi_lanes))
-    else:
-        module = pack.chip_module(compatible)
+    module = pack.chip_module(compatible)
     if module is None:
         raise InfeasibleConfig(f"sensor {compatible} binds no law family in pack {pack.name}")
     return module
@@ -90,33 +84,28 @@ def resolve_modes(pack, links, mode=None,
 
 def fps_range(pack, topology: Topology, link, mode: str,
               partner_mode_name: Optional[str] = None) -> RateRange:
-    """The free-run rates a link's mode may run at: the family's range,
-    narrowed to the shipped point when the mode ships one. A table-only
-    part runs its mode at the one rate its table sets."""
+    """The free-run rates a link's mode may run at: the family's range, from
+    the driver's minimum rate to the datasheet frame at the mode's line. A
+    table-only part runs its mode at the one rate its table sets."""
     del partner_mode_name
     module = sensor_module(pack, link, topology)
-    sen = module.descriptor()
     ceiling = float(_call(module.fps_ceiling, mode))
     floor = float(_call(module.fps_floor, mode=mode))
     if not hasattr(module, "vmax_for_fps"):
-        floor = ceiling
-    cameras, lanes = shipped.cameras(topology.links), int(topology.csi_lanes)
-    point = shipped.fps_range(sen, mode, cameras, lanes)
-    if point is not None:
-        floor, ceiling = max(floor, point[0]), min(ceiling, point[1])
-    return RateRange(floor=floor, ceiling=ceiling, shipped=point is not None,
-                     binds="the sensor's mode")
+        return RateRange(floor=ceiling, ceiling=ceiling, binds="mode table")
+    return RateRange(floor=floor, ceiling=ceiling, binds="datasheet frame")
 
 
 def _rate(pack, module, mode: str, asked: Optional[float], spec: LinkSpec,
           topology: Topology) -> float:
     """The rate the link runs: the asked one, else the link's declared, the
-    port's, the mode's ceiling; judged by the mode's lawful range."""
+    port's, FPS_DEFAULT inside the mode's range; judged by the mode's
+    lawful range."""
     sen = module.descriptor()
     rates = fps_range(pack, topology, spec, mode)
     declared = asked if asked is not None else (spec.fps or topology.camera_fps)
     if declared is None:
-        return rates.ceiling
+        return min(max(FPS_DEFAULT, rates.floor), rates.ceiling)
     declared = float(declared)
     slack = _RATE_TOLERANCE * rates.ceiling
     if rates.floor - slack <= declared <= rates.ceiling + slack:
@@ -127,7 +116,7 @@ def _rate(pack, module, mode: str, asked: Optional[float], spec: LinkSpec,
             alternatives=[f"--fps {rates.ceiling:g}"])
     raise InfeasibleConfig(
         f"{declared:g} fps is outside {sen.compatible} {mode}'s "
-        f"{rates.floor:g} to {rates.ceiling:g} fps", alternatives=[f"--fps {rates.ceiling:g}"])
+        f"{rates.floor:g} to {rates.ceiling:g} fps", alternatives=[f"--fps {rates.whole()[1]}"])
 
 
 def _start_steps(module, spec: LinkSpec, mode: str, rate: float,
@@ -165,14 +154,7 @@ def build_solo(pack, topology: Topology, link: str, mode=None,
     _stream_gate(module)            # refused here, before anything is composed
     mode = resolve_modes(pack, [spec], mode, topology=topology)[link]
     sen.mode_value(mode)
-    cameras, lanes = shipped.cameras(topology.links), int(topology.csi_lanes)
-    if shipped.entry(sen, mode, cameras, lanes) is None and not experimental.enabled():
-        raise InfeasibleConfig(
-            f"link {link}: {sen.compatible} {mode} is not shipped with "
-            f"{shipped.label(cameras)} on {lanes} CSI lanes",
-            alternatives=[f"--mode {m} (shipped)"
-                          for m in shipped.shipped_modes(sen, cameras, lanes)]
-            + [experimental.refusal(f"an unshipped mode ({mode})")])
+    lanes = int(topology.csi_lanes)
     rate = _rate(pack, module, mode, fps, spec, topology)
     mipi = module.export_mipi_contract(mode, fps=rate)
     if int(mipi.lanes) != lanes:
@@ -313,13 +295,12 @@ def viewer_hints(pack, topology: Topology, mode=None, triggered: bool = False,
     m = sen.modes[resolved]
     geo = m["geometry"]
     # The port boots this sensor's rows alone: the session's index is its own.
-    index = tables.mode_index(pack, sen, resolved, [sen.name])
+    index = tables.port_index(pack, topology, sen, resolved)
     return {
         "width": int(geo["width"]),
         "height": int(geo["height"]),
         "framerate": _fraction(_rate(pack, module, resolved, fps, spec, topology)),
         "sensor_mode": 0 if index is None else int(index),
-        "locked_props": True,
         "crop_bottom": 0,
         "mode": resolved,
         "sensor": sen.compatible,

@@ -1,5 +1,7 @@
 """What firmware a device runs: the register-map contract it speaks, the version floor this tool drives, and the verdict on a push."""
 
+import os
+import re
 import time
 from typing import Optional
 
@@ -35,6 +37,31 @@ def contract_mismatch(transport, *, unreadable_is_skew: bool = False) -> Optiona
 MIN_FIRMWARE = "1.1.0"
 
 MIN_FIRMWARE_ASSET = f"nxs-v{MIN_FIRMWARE}-firmware.bin"
+
+_ASSET_NAME = re.compile(r"^nxs-v(\d+)\.(\d+)\.(\d+)(?:-rc(\d+))?-firmware\.bin$")
+
+
+def push_fw_asset(store: Optional[str] = None) -> str:
+    """The firmware file the refusal tells the operator to push: the newest
+    release image in the assets store (`nxs assets install` fills it), else
+    the path the current release's image takes there."""
+    from nxs.suite import FIRMWARE_DIR
+    store = store or FIRMWARE_DIR
+    found = []
+    try:
+        names = os.listdir(store)
+    except OSError:
+        names = []
+    for name in names:
+        m = _ASSET_NAME.match(name)
+        if m:
+            major, minor, patch, rc = m.groups()
+            key = (int(major), int(minor), int(patch), 1 if rc is None else 0,
+                   int(rc or 0))
+            found.append((key, name))
+    if found:
+        return os.path.join(store, max(found)[1])
+    return os.path.join(store, MIN_FIRMWARE_ASSET)
 
 class FirmwareTooOld(RuntimeError):
     """The unit runs firmware older than `MIN_FIRMWARE`; the message is the
@@ -80,7 +107,7 @@ def firmware_too_old(transport, target: str = "<target>") -> Optional[str]:
     if ver >= parse_version(MIN_FIRMWARE):
         return None
     return (f"unit runs firmware {identity}; this nxs needs v{MIN_FIRMWARE} "
-            f"or newer — push it: nxs {target} push-fw {MIN_FIRMWARE_ASSET}")
+            f"or newer — push it: nxs {target} push-fw {push_fw_asset()}")
 
 def require_firmware(transport, target: str = "<target>") -> None:
     """Refuse a unit older than `MIN_FIRMWARE`: raises `FirmwareTooOld`

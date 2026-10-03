@@ -108,10 +108,34 @@ PULL_ERR_REASON = {
     116: "no response from the file server",                           # ETIMEDOUT
 }
 
-# `Cmd::CAM_RUN`'s acceptance, device numbering: the slot must hold a camera
-# personality and the transfer session must be free.
+# The verdict of a finished run: `CAM_ERROR` on the terminal edge (the
+# device's libc numbering: ETIMEDOUT 116, EILSEQ 138, ECANCELED 140).
+CAM_VERDICT_REASON = {
+    5:   "the sensor stopped answering past the register retries",      # EIO
+    6:   "no sensor answered at the personality's address",             # ENXIO
+    19:  "no sensor answered at the personality's address",             # ENODEV
+    116: "a poll did not see its value within its timeout",             # ETIMEDOUT
+    140: "the run was aborted",                                         # ECANCELED
+    8:   "the slot holds a driver personality, not a camera one",      # ENOEXEC
+    9:   "the slot's camera personality does not parse; reinstall it: "
+         "nxs switch",                                                  # EBADF
+    14:  "the personality's program faulted; the unit's log names the "
+         "instruction",                                                 # EFAULT
+    27:  "the personality's program is larger than the unit's camera "
+         "runner holds",                                                # EFBIG
+    71:  "the personality's program raised an error of its own; the "
+         "unit's log names the instruction",                            # EPROTO
+    134: "the personality's I2C profile tops out below the pod bus's "
+         "clock",                                                       # ENOTSUP
+    138: "a register read did not match the value the personality "
+         "expects",                                                     # EILSEQ
+}
+
+# `Cmd::CAM_RUN`'s result, device numbering: the accept's refusal, or the verdict of a run
+# that ended before the host read the accept; the accept's reason stands where both name a code.
 CAM_RUN_ERR_REASON = {
-    8:  "the slot holds a driver personality, not a camera one",        # ENOEXEC
+    **CAM_VERDICT_REASON,
+    8:  "the slot holds a driver personality, not a camera one",       # ENOEXEC
     2:  "the slot is empty — upload the camera personality and save it",  # ENOENT
     16: "the unit is busy: a run, an upload, or a firmware push holds "
         "the transfer session",                                         # EBUSY
@@ -126,16 +150,6 @@ CAM_ABORT_ERR_REASON = {
     2:  "no camera run is live",                                        # ENOENT
     11: "the device dropped the command before dispatch (queue full) — "
         "retry",                                                        # EAGAIN
-}
-
-# The verdict of a finished run: `CAM_ERROR` on the terminal edge (the
-# device's libc numbering: ETIMEDOUT 116, ECANCELED 140).
-CAM_VERDICT_REASON = {
-    5:   "the sensor stopped answering past the register retries",      # EIO
-    6:   "no sensor answered at the personality's address",             # ENXIO
-    19:  "no sensor answered at the personality's address",             # ENODEV
-    116: "a poll did not see its value within its timeout",             # ETIMEDOUT
-    140: "the run was aborted",                                         # ECANCELED
 }
 
 ERRNO_EEXIST = 17
@@ -155,8 +169,12 @@ ERRNO_EOPNOTSUPP = 95
 
 ERRNO_ECANCELED = 140
 
-# A hub image offered to the store: the host runs those.
+# A hub image offered to the store: the host runs those. A slot's peek
+# answers it for an image of another format version.
 ERRNO_ENOTSUP = 134
+
+# A slot's peek on an image that does not parse.
+ERRNO_EBADF = 9
 
 # Raised at the I2C claim sites too (a mode readback that does not echo the
 # write means the session is held), which never see a CMD_ERROR value.

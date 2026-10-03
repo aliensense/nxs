@@ -16,7 +16,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
-from nxs.client import DeviceRefused, SupportsCameraRun, SupportsSlotPeek
+from nxs.client import (ERRNO_EBADF, ERRNO_ENOTSUP, DeviceRefused, SupportsCameraRun,
+                        SupportsSlotPeek)
 from nxs.personality.records import ParamMap, RunParam
 
 from .contracts import ContractError
@@ -29,6 +30,9 @@ from . import port_state
 CACHE_DIR = "unit-descriptors"
 #: Store slots a unit can hold (ids 0..7).
 MAX_SLOTS = 8
+#: The peek refusals that name the image a slot holds, by the unit's errno,
+#: as what a pod holds there: the slot is taken, and a reinstall replaces it.
+STALE_PEEKS = {ERRNO_ENOTSUP: "of another format version", ERRNO_EBADF: "that does not parse"}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -117,8 +121,7 @@ def _descriptor_doc(descriptor: Descriptor) -> Dict[str, Any]:
 
 
 _SECTIONS = ("meta", "registers", "default_mode", "modes", "limits", "trigger",
-             "sync", "test_pattern", "program", "controls", "capture", "shipped",
-             "status")
+             "sync", "test_pattern", "program", "controls", "capture", "status")
 
 
 def cached_record(topology: Topology, link: LinkSpec) -> Optional[Dict[str, Any]]:
@@ -192,6 +195,17 @@ class UnreadableSlot(RuntimeError):
         self.slot = slot
 
 
+class StaleSlot(UnreadableSlot):
+    """A store slot whose image the unit refuses to describe, one of
+    STALE_PEEKS: `what` says which (`of another format version`), and a
+    reinstall replaces the image in place."""
+
+    def __init__(self, slot: int, what: str, reason: str) -> None:
+        RuntimeError.__init__(self, f"slot {slot}: {reason}")
+        self.slot = slot
+        self.what = what
+
+
 def read_unit_personality(client, known_crc: Optional[int] = None
                           ) -> Optional[UnitPersonality]:
     """The camera personality in the unit's store, read over an open
@@ -201,14 +215,23 @@ def read_unit_personality(client, known_crc: Optional[int] = None
     the returned personality carries no descriptor: the caller's cache is
     current. None when the unit holds no camera personality or the
     transport cannot read trailers; UnreadableSlot when a slot's trailer
-    does not decode."""
+    does not decode; StaleSlot, naming the first such slot, when the unit
+    holds none it can read and a slot whose image it refuses to describe."""
     from nxs.image import parse_trailer
     from nxs.personality import records
 
     if not isinstance(client, SupportsCameraRun):
         return None
+    stale: Optional[StaleSlot] = None
     for slot in range(MAX_SLOTS):
-        if slot_kind(client, slot) == "driver":
+        try:
+            kind = slot_kind(client, slot)
+        except DeviceRefused as exc:
+            if exc.code not in STALE_PEEKS:
+                raise
+            stale = stale or StaleSlot(slot, STALE_PEEKS[exc.code], str(exc))
+            continue
+        if kind == "driver":
             continue
         try:
             data = client.read_personality_info(slot)
@@ -234,6 +257,8 @@ def read_unit_personality(client, known_crc: Optional[int] = None
             raise UnreadableSlot(slot, str(exc)) from exc
         return UnitPersonality(slot=slot, name=name or descriptor.name, crc=crc,
                                descriptor=descriptor, params=params)
+    if stale is not None:
+        raise stale
     return None
 
 
@@ -282,6 +307,16 @@ def refresh_from_unit(topology: Topology, link: LinkSpec, opener=None
     return found
 
 
+def last_run_text(state: int) -> str:
+    """`last run <STATE>` for a camera run state the unit reports, and
+    `never run` before its first run (IDLE)."""
+    from nxs.client import CamRunState, cam_run_state_name
+
+    if state == CamRunState.IDLE:
+        return "never run"
+    return f"last run {cam_run_state_name(state)}"
+
+
 def unit_status(topology: Topology, link: LinkSpec, opener=None
                 ) -> Optional[Dict[str, Any]]:
     """What the link's unit holds and last ran: the camera personality's
@@ -310,7 +345,7 @@ def unit_status(topology: Topology, link: LinkSpec, opener=None
         if close is not None:
             close()
     run = {"state": cam_run_state_name(state), "error": int(error), "values": values}
-    parts = [f"{found.summary()}, slot {found.slot}, last run {run['state']}"]
+    parts = [f"{found.summary()}, slot {found.slot}, {last_run_text(state)}"]
     parts.extend(f"{name} {value}" + (f" {units[name]}" if units.get(name) else "")
                  for name, value in values.items())
     return {"name": found.name, "slot": int(found.slot), "compatible": found.compatible,

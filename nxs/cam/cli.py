@@ -89,34 +89,30 @@ from .verbs.set import _sensor_readings, _set_sync, cmd_get, cmd_set
 from .verbs.status import (
     _unit_line,
     cmd_status,
+    follow_gap,
+    pair_gain,
     presence_payload,
     presence_rows,
     status_payload,
 )
 from .verbs.stream import (
-    _csi_gate,
-    _no_capture_id,
     _selected_up_links,
     cmd_capture,
     cmd_stream,
 )
 from .verbs.sync import (
     _booted_index,
-    _budget_warning,
-    _exposure_kwarg,
     _fsync_plan,
     _frames_kwarg,
     _hints_by_link,
-    _native_rate,
-    _nth,
     _port_viewer_hint,
     _rate_kwarg,
     _record_sync,
     _sync_links,
-    _sync_plan,
     plan_text,
     sync_text,
 )
+from .verbs.verify import _no_capture_id, csi_gate
 
 __all__ = [
     "InfeasibleConfig",
@@ -124,17 +120,14 @@ __all__ = [
     "UNIT_RUN_TIMEOUT_S",
     "_accepted",
     "_booted_index",
-    "_budget_warning",
     "_camera_knobs",
     "_compose_from",
-    "_csi_gate",
     "_dead_pipes",
     "_declare",
     "_declared_camera",
     "_descriptor_among",
     "_execute",
     "_execute_split",
-    "_exposure_kwarg",
     "_frames_kwarg",
     "_fsync_plan",
     "_hints_by_link",
@@ -143,9 +136,7 @@ __all__ = [
     "_knob_names",
     "_link_descriptor",
     "_mode_arg",
-    "_native_rate",
     "_no_capture_id",
-    "_nth",
     "_owns_link",
     "_pack_for",
     "_per_link",
@@ -174,7 +165,6 @@ __all__ = [
     "_set_sync",
     "_staged_values",
     "_sync_links",
-    "_sync_plan",
     "_unit_line",
     "_unit_personality",
     "_unit_program_refusal",
@@ -192,10 +182,13 @@ __all__ = [
     "cmd_status",
     "cmd_stream",
     "cmd_up",
+    "csi_gate",
     "detect_sensor",
     "experimental",
+    "follow_gap",
     "identity_facts",
     "packs",
+    "pair_gain",
     "park_port",
     "plan_text",
     "port_state",
@@ -248,7 +241,8 @@ def add_cam_parser(sub) -> None:
                         "the selected link(s); caps lists them")
     p.add_argument("--fps", action="append", default=None, type=float,
                    help="free-run rate for the selected link(s), inside "
-                        "the mode's shipped range (default: its ceiling)")
+                        "the mode's lawful range (default: the declared "
+                        "rate, else 30 fps inside the range)")
     p.add_argument("--dry-run", action="store_true",
                    help="the plan without touching the bus")
     p.set_defaults(cam_fn=cmd_up)
@@ -294,7 +288,7 @@ def add_cam_parser(sub) -> None:
     p.set_defaults(cam_fn=cmd_status)
 
     p = cam_sub.add_parser("caps", help="what the sensor offers on this port: "
-                                        "the shipped modes and rates, the knobs")
+                                        "every mode and its rates, the knobs")
     p.add_argument("links", nargs="*")
     p.add_argument("--json", action="store_true",
                    help="the caps surface (contract 2)")
@@ -316,10 +310,9 @@ def add_cam_parser(sub) -> None:
                    help="with sync fsync: the generator's rate (default: the "
                         "declared one)")
     p.add_argument("--exposure", type=float, default=None, metavar="US",
-                   help="with sync fsync: the integration time under the trigger, "
-                        "microseconds; the generator runs a multiple of --fps and "
-                        "the sensors take every n-th pulse, so the exposure lands "
-                        "on the nearest step (the plan line prints it)")
+                   help="refused with the fact that sets the exposure: under "
+                        "sync fsync the trigger pulse's low time at --fps, else "
+                        "the capture stack's loop")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(cam_fn=cmd_set)
 

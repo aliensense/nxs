@@ -11,7 +11,7 @@ from typing import List, Optional
 from nxs.client import (DeviceRefused, PUSH_INTERVAL_S, SupportsTimeSync,
                         ERRNO_EBUSY, estimate_and_push, exc_detail)
 from nxs.suite.schema import SuiteConfig
-from nxs.transports import open_client
+from nxs import transports
 
 log = logging.getLogger(__name__)
 
@@ -52,7 +52,7 @@ def render_systemd_unit(nxs_path: str, user: str, only_units=None,
 
 
 class SuitePusher:
-    def __init__(self, cfg: SuiteConfig, only_units=None, opener=open_client,
+    def __init__(self, cfg: SuiteConfig, only_units=None, opener=None,
                  pusher=estimate_and_push):
         self._mux_held = set()
         self._open_warned = set()
@@ -62,7 +62,8 @@ class SuitePusher:
                 raise ValueError(f"no unit named {name!r} in the manifest")
         self._units = [unit for unit in cfg.units
                        if only_units is None or unit.name in only_units]
-        self._opener = opener
+        # The opener `nxs.transports` holds when the pusher is built.
+        self._opener = opener or transports.open_client
         self._pusher = pusher
         self._open_units = {}
         self._estimators = {}

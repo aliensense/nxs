@@ -32,6 +32,40 @@ def _tool_version() -> str:
     return str(__version__).split("+", 1)[0].lstrip("v")
 
 
+def tool_build() -> Optional[str]:
+    """The build this wheel was packed from (`git describe` at the release
+    build, `nxs/_build_info.py`); None in a source checkout, which carries
+    no such record."""
+    try:
+        from nxs._build_info import BUILD_GIT_VERSION
+    except ImportError:
+        return None
+    return BUILD_GIT_VERSION or None
+
+
+def other_build(found: Optional[str]) -> Optional[str]:
+    """The refusal's fact when an assets manifest names a build other than
+    this wheel's: the wheel runs the hub images and the pack its own build
+    compiled, so assets of another build of the same version disagree with
+    it. None when they agree or either side names none."""
+    own = tool_build()
+    if not found or not own or found == own:
+        return None
+    return f"the assets are build {found}, this nxs is build {own}"
+
+
+def _manifest_build(tar: tarfile.TarFile) -> Optional[str]:
+    """The build an assets tarball's manifest names, if any."""
+    import yaml
+
+    try:
+        member = tar.extractfile(MANIFEST_MEMBER)
+        doc = yaml.safe_load(member.read()) if member is not None else None
+    except (KeyError, yaml.YAMLError):
+        return None
+    return str(doc["build"]) if isinstance(doc, dict) and doc.get("build") else None
+
+
 def _manifest_version(tar: tarfile.TarFile) -> Optional[str]:
     try:
         member = tar.extractfile(MANIFEST_MEMBER)
@@ -89,12 +123,21 @@ def install(path: str, *, accept_license: bool = False, log=print) -> int:
                   file=sys.stderr)
             print(f"  - install nxs-assets-{tool}.tar.gz", file=sys.stderr)
             return 1
+        if (fact := other_build(_manifest_build(tar))) is not None:
+            print(f"nxs assets: {fact} ({os.path.basename(path)})", file=sys.stderr)
+            print(f"  - install the nxs-assets-{tool}.tar.gz built with this nxs",
+                  file=sys.stderr)
+            return 1
         text = _license_text(tar)
         marker = os.path.join(ASSETS_ROOT, ".license-accepted")
         if text and not os.path.exists(marker) and not _accepted(text, accept_license):
             return 1
     root.run(["install", "-d", "-m", "755", ASSETS_ROOT])
-    root.run(["tar", "-xzf", path, "-C", ASSETS_ROOT])
+    # Root's own, whatever owner the archive names: tar keeps the archive's
+    # owners when it runs as root, and a directory an earlier install left
+    # under another owner keeps it through an extraction.
+    root.run(["tar", "--no-same-owner", "-xzf", path, "-C", ASSETS_ROOT])
+    root.run(["chown", "-R", "root:root", ASSETS_ROOT])
     if text:
         root.write_text(marker, f"accepted for {tool}\n")
     log(f"installed the assets {release or tool} under {ASSETS_ROOT}")

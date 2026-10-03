@@ -36,7 +36,6 @@ class CameraSensor(RegisterDriver):
         'default_vmax', 'fps_ceiling', 'fps_floor', 'vmax_for_fps',
         'validate_vmax', 'line_time_us', 'sync_capability', 'descriptor',
         'shs_floor', 'shs_for_exposure_us', 'frame_length_delta_formula',
-        'rows_delivered',
     })
 
     def _validate_kind(self) -> None:

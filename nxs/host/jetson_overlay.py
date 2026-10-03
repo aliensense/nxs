@@ -27,6 +27,7 @@ from .capture_table import REG_BITS_DEFAULT, VAL_BITS_DEFAULT, CaptureMode, Pool
 #: VC0 node: cam0 A is capture id 1 and B is 2, cam1 A is 0 and B is 3.
 #: `enable` is the connector's camera-enable line (NVIDIA's CAM0_PWDN and
 #: CAM1_PWDN) and the hog the foundation overlay holds it low with.
+#: `lanes` is the connector's CSI lane count: CAM0 wires two, CAM1 four.
 #: Behind a hub each channel's node carries a host alias (`sensor_addr`,
 #: `vc1.sensor_addr`), an address no part on the port straps: the link's
 #: serializer maps it to the sensor's own, so the kernel's per-frame
@@ -35,7 +36,7 @@ from .capture_table import REG_BITS_DEFAULT, VAL_BITS_DEFAULT, CaptureMode, Pool
 PORTS: Dict[str, Dict[str, Any]] = {
     "cam1": dict(
         module=0, i2c_bus=9, mux="cam_i2cmux_i2c1", mux_path="i2c@1",
-        node="c", sensor_addr=0x1C, badge="universal_rear_aliensense",
+        node="c", sensor_addr=0x1C, badge="universal_rear_aliensense", lanes=4,
         vi_port=2, csi_ch=2, port_index=2, devnode="video1",
         physical=("12.00", "9.30"), sinterface="serial_c", lane_polarity=0,
         enable=dict(gpio=("AC", 0), hog="som_gpio_cam1_rst"),
@@ -44,7 +45,7 @@ PORTS: Dict[str, Dict[str, Any]] = {
     ),
     "cam0": dict(
         module=1, i2c_bus=10, mux="cam_i2cmux_i2c0", mux_path="i2c@0",
-        node="b", sensor_addr=0x1B, badge="universal_centerright_aliensense",
+        node="b", sensor_addr=0x1B, badge="universal_centerright_aliensense", lanes=2,
         vi_port=1, csi_ch=1, port_index=1, devnode="video0",
         physical=("7.22", "7.05"), sinterface="serial_b",
         # The carrier inverts CAM0's two data lanes (NVIDIA's own imx219-A

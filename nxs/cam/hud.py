@@ -40,18 +40,35 @@ def sync_text(sync: Optional[Dict[str, Any]]) -> str:
     return "free-run"
 
 
+def ae_token(hints: Dict[str, Any], locked: bool) -> str:
+    """Who sets the link's exposure and gain, as the identity line names it:
+    `isp-locked` for a developer's lock, a synced pair's part
+    (`isp-auto · leads B`, `isp-locked · follows A`,
+    `isp-locked · 20.0 dB`), else `isp-auto`, the capture stack's loop."""
+    role, peer = hints.get("ae_role"), hints.get("ae_peer")
+    if locked:
+        return "isp-locked"
+    if role == "leader":
+        return f"isp-auto · leads {peer}"
+    if role == "follower":
+        return f"isp-locked · follows {peer}"
+    if role == "locked":
+        return f"isp-locked · {float(hints['gain_db']):.1f} dB"
+    return "isp-auto"
+
+
 def hud_text(port: str, link: str, capture_id: int, width: int, height: int,
              data_type: str, sensor_mode: int,
-             sync: Optional[Dict[str, Any]], locked: bool = True,
+             sync: Optional[Dict[str, Any]], ae: str = "isp-auto",
              sensor: str = "", link_sync: str = "") -> str:
     """The static identity line: port and link, the sensor, capture id,
-    geometry; a link the port trigger leaves free-running says so here."""
+    geometry, who sets the exposure and gain (`ae_token`); a link the port
+    trigger leaves free-running says so here."""
 
     del sync
     short = sensor.split(",")[-1] if sensor else ""
     parts = [f"{port} {link}", short, f"capture {capture_id}",
-             f"{width}x{height} {data_type} dt-mode {sensor_mode}".rstrip(),
-             "isp-locked" if locked else "isp-auto"]
+             f"{width}x{height} {data_type} dt-mode {sensor_mode}".rstrip(), ae]
     if link_sync.startswith("free_run ("):
         parts.append(f"not synced: {link_sync[len('free_run ('):-1]}")
     return " · ".join(p for p in parts if p)

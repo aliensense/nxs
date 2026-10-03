@@ -13,7 +13,6 @@ install personalities; a unit's slots are `nxs store ls`."""
 from __future__ import annotations
 
 import dataclasses
-import importlib.util
 import os
 import sys
 import zlib
@@ -79,10 +78,15 @@ def store_refusal(store: Optional[str] = None) -> Optional[str]:
             doc = yaml.safe_load(fh)
     except (OSError, yaml.YAMLError) as exc:
         return f"{manifest}: unreadable ({exc}); install {asset}"
+    from nxs.assets_cli import other_build
+
     found = str((doc or {}).get("version", "")) if isinstance(doc, dict) else ""
     if found != __version__:
         return (f"the personality store {store} is release {found or '?'}, this nxs is "
                 f"{__version__} — install {asset}")
+    built = str(doc.get("build") or "") if isinstance(doc, dict) else ""
+    if (fact := other_build(built)) is not None:
+        return f"in the personality store {store} {fact} — install the {asset} built with it"
     return None
 
 
@@ -183,13 +187,11 @@ def _class_in(path: str, label: str) -> Optional[type]:
     """The driver class a source file defines, None when it defines none;
     registered like an imported module so the class finds its sibling
     descriptor. A file that fails to import is an error, never None."""
-    spec = importlib.util.spec_from_file_location(f"nxs_local_drivers.{label}", path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = mod
+    from nxs.personality import load_source
+
     try:
-        spec.loader.exec_module(mod)
+        mod = load_source(f"nxs_local_drivers.{label}", path)
     except Exception as e:
-        sys.modules.pop(spec.name, None)
         from nxs.client import import_failure_detail
         raise ResolveError(f"{path} failed to import: "
                            f"{import_failure_detail(e, path)}") from None
@@ -420,22 +422,24 @@ def cmd_upload(t, args) -> int:
 
 def _land(t, args, source: Source, img: bytes, kind: int, name: str, compiled) -> int:
     """Upload the image: a driver runs, a camera personality lands in a
-    store slot when the transport can pick one, and the link's cache learns
-    the descriptor."""
+    store slot (refused on a transport that cannot save one), and the
+    link's cache learns the descriptor."""
     from nxs.cli import _upload_and_run
 
     if kind == ImageKind.HUB:
         print(f"error: {name} is a hub personality; the host runs it (nxs switch), "
               f"a unit never does", file=sys.stderr)
         return 1
-    if kind != ImageKind.CAMERA or not _can_save(t):
-        return _upload_and_run(t, img, kind)
+    if kind != ImageKind.CAMERA:
+        return _upload_and_run(t, img)
+    if not _can_save(t):
+        print("error: a camera personality runs from a flash slot, and this transport "
+              "cannot save one", file=sys.stderr)
+        return 1
     slot = _pick_slot(t, name, getattr(args, "slot", None))
     if slot is None:
         return 1
     t.upload_image(img)
-    if _slot_name(t, slot):
-        t.delete_slot(slot)
     try:
         t.save_slot(slot)
     except DeviceRefused as e:
@@ -455,22 +459,30 @@ def _can_save(t) -> bool:
     return isinstance(t, SupportsSlotPeek) and hasattr(t, "save_slot")
 
 
-def _slot_name(t, slot: int) -> str:
-    info, _held = peek_slot(t, slot)
-    return str(getattr(info, "name", "") or "") if info is not None else ""
-
-
 def _pick_slot(t, name: str, wanted: Optional[int]) -> Optional[int]:
-    """The slot a camera personality lands in: the one asked for, else the
-    slot already holding this name, else the slot holding the unit's camera
-    personality (a unit runs one; the upload replaces it), else the first
-    empty one."""
+    """The slot a camera personality occupies once saved, read from the
+    store: the one asked for, else the slot already holding this name, else
+    the slot holding the unit's camera personality (a unit runs one; the
+    upload replaces it), else a slot whose image the unit refuses to
+    describe (another format version: the upload reinstalls it), else the
+    first empty one. The unit keeps its store packed: a save overwrites an
+    occupied slot in place and appends anywhere else, so an empty slot
+    asked for is the first empty one, and nothing is deleted first, which
+    would move the later images down onto the slot."""
+    from nxs.cam.unit_source import STALE_PEEKS
     from nxs.image import IMAGE_KIND_NAMES
 
     names: Dict[int, Optional[str]] = {}
     cameras: List[int] = []
+    stale: List[int] = []
     for slot in range(MAX_SLOTS):
-        info, held = peek_slot(t, slot)
+        try:
+            info, held = peek_slot(t, slot)
+        except DeviceRefused as exc:
+            if exc.code not in STALE_PEEKS:
+                raise
+            stale.append(slot)
+            continue
         if held:
             print("store busy: a calibration procedure or firmware push holds "
                   "the session", file=sys.stderr)
@@ -479,20 +491,24 @@ def _pick_slot(t, name: str, wanted: Optional[int]) -> Optional[int]:
         kind = getattr(info, "kind", None)
         if IMAGE_KIND_NAMES.get(kind, kind) == IMAGE_KIND_NAMES[ImageKind.CAMERA]:
             cameras.append(slot)
+    empty = next((slot for slot, held_name in names.items() if held_name is None), None)
     if wanted is not None:
+        if wanted in stale:
+            return wanted
         if names.get(wanted) is not None and names[wanted].lower() != name.lower():
             print(f"slot {wanted} holds {names[wanted]}; nxs store rm {wanted} "
                   f"frees it", file=sys.stderr)
             return None
-        return wanted
+        return wanted if names.get(wanted) is not None else empty
     for slot, held_name in names.items():
         if held_name is not None and held_name.lower() == name.lower():
             return slot
     if cameras:
         return cameras[0]
-    for slot, held_name in names.items():
-        if held_name is None:
-            return slot
+    if stale:
+        return stale[0]
+    if empty is not None:
+        return empty
     print(f"store full ({MAX_SLOTS} slots): nxs store rm <slot> frees one",
           file=sys.stderr)
     return None
@@ -533,7 +549,7 @@ def port_link_for(args):
     return None
 
 
-def write_manifest(directory: str, version: str) -> Dict[str, Any]:
+def write_manifest(directory: str, version: str, build: Optional[str] = None) -> Dict[str, Any]:
     """`manifest.yaml` beside the `.nxs` files of a personalities directory:
     per image its name, the sensor it drives, the image format, and the
     file's CRC-32. Returns the manifest written."""
@@ -564,7 +580,10 @@ def write_manifest(directory: str, version: str) -> Dict[str, Any]:
                 record["sensor"] = descriptor.compatible
                 record["modes"] = len(records.mode_values(descriptor))
         entries.append(record)
-    manifest: Dict[str, Any] = {"version": str(version), "personalities": entries}
+    manifest: Dict[str, Any] = {"version": str(version)}
+    if build:
+        manifest["build"] = str(build)
+    manifest["personalities"] = entries
     with open(os.path.join(directory, "manifest.yaml"), "w", encoding="utf-8") as fh:
         fh.write(yaml.safe_dump(manifest, sort_keys=False))
     return manifest

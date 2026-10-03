@@ -59,6 +59,7 @@ from nxs.unit_cli import (
     _not_found_hint,
     _probe_detail,
     _target_flags,
+    _unanswered,
     _upload_and_run,
     add_commission_parser,
     add_timesync_parser,
@@ -281,9 +282,9 @@ def build_parser():
                         help="show program's version number and exit")
     parser.add_argument('--experimental', action='store_true',
                         default=experimental.enabled(),
-                        help='unlock the experimental surface: the unshipped '
-                             'modes (marked), a pack root and its overlays '
-                             '($NXS_CAM_DESCRIPTORS, $NXS_CAM_EXPERIMENTAL)')
+                        help='unlock the experimental surface: a pack root and '
+                             'its overlays ($NXS_CAM_DESCRIPTORS, '
+                             '$NXS_CAM_EXPERIMENTAL), a development personality store')
     parser.add_argument('-t', '--transport', choices=['i2c', 'cyphal-serial', 'cyphal-can'],
                         default=_default_transport(),
                         help='Transport ($NXS_TRANSPORT, else i2c on Linux / '
@@ -582,6 +583,12 @@ def _main():
     RECOVERY_VERBS = {'upload'}
     command = args.command
     if command in NEEDS_DEVICE | RECOVERY_VERBS and not t.probe():
+        # A unit at a camera link's alias that does not answer is named with
+        # its port and the next command, an upload included: no attempt on
+        # a silent I²C address reaches a unit.
+        refusal = _unanswered(args)
+        if refusal is not None:
+            sys.exit(f"nxs: {refusal}")
         if command in NEEDS_DEVICE:
             detail = _probe_detail(t) or (" (check wiring / power / -t/-b/-p "
                                           "or the $NXS_* env vars)")
@@ -603,6 +610,11 @@ def _main():
         print(f"ERROR: firmware rejected request: {e}", file=sys.stderr)
         rc = 1
     except OSError as e:
+        # A unit at a camera link's alias that stopped answering is named with
+        # its port and the next command; any other failure is the transport's.
+        refusal = _unanswered(args)
+        if refusal is not None and not t.probe():
+            sys.exit(f"nxs: {refusal}")
         print(f"ERROR: transport I/O failed: {e}", file=sys.stderr)
         rc = 1
     except KeyboardInterrupt:

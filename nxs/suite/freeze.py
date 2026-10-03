@@ -6,6 +6,7 @@ import io
 import os
 
 import yaml
+from ruamel.yaml.scalarint import HexInt
 import sys
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -15,7 +16,7 @@ from nxs.suite.reconcile import load_unit_driver
 from nxs.suite.schema import (ManifestError, SuiteConfig, UnitSpec,
                               device_proves_patch, parse_device_version,
                               parse_version)
-from nxs.transports import open_client
+from nxs import transports
 
 
 @dataclass
@@ -35,9 +36,11 @@ class FreezeReport:
 
 def freeze_suite(cfg: SuiteConfig, config_path: str, *,
                  only_unit: Optional[str] = None, dry_run: bool = False,
-                 pin_firmware: bool = False, opener=open_client,
+                 pin_firmware: bool = False, opener=None,
                  drivers_dir: "str | None" = None) -> List[FreezeReport]:
-    """Freeze the selected unit(s); write the manifest once at the end."""
+    """Freeze the selected unit(s); write the manifest once at the end. The
+    opener defaults to the one `nxs.transports` holds at the call."""
+    opener = opener or transports.open_client
     reports = []
     for unit in cfg.units:
         if only_unit is not None and unit.name != only_unit:
@@ -353,9 +356,14 @@ def port_block(topology, sync=None, viewer=None, viewers=None,
     from nxs.cam import packs
 
     sensors = sensors or {}
-    viewers = viewers or {}
-    modes = modes or {}
-    rates = {str(k): float(v) for k, v in (rates or {}).items()}
+    # A port's record outlives its cameras: the mode, the sync and the rates
+    # it holds count for the links that carry a camera today.
+    cameras = {l.name for l in topology.links if sensors.get(l.name) or l.sensor_compatible}
+    viewers = {n: v for n, v in (viewers or {}).items() if n in cameras}
+    modes = {n: v for n, v in (modes or {}).items() if n in cameras}
+    rates = {str(k): float(v) for k, v in (rates or {}).items() if str(k) in cameras}
+    if not cameras:
+        sync = viewer = None
     try:
         pack = packs.pack_for(topology)
     except Exception:
@@ -379,7 +387,7 @@ def port_block(topology, sync=None, viewer=None, viewers=None,
         # A direct port's link has no SerDes wiring to write down; a head
         # no one names has no camera row.
         entry = ({} if topology.is_direct else
-                 {"ser": link.ser_compatible, "des_window": int(link.des_window),
+                 {"ser": link.ser_compatible, "des_window": hex_address(link.des_window),
                   "csi_vc": int(link.csi_vc)})
         if sensor:
             entry = {"camera": sensor, **entry}
@@ -394,7 +402,7 @@ def port_block(topology, sync=None, viewer=None, viewers=None,
         # Where the wiring says the sensor answers, when it is not the
         # descriptor's own address: the node and the tool address it there.
         if link.sensor_addr is not None:
-            entry["sensor_addr"] = int(link.sensor_addr)
+            entry["sensor_addr"] = hex_address(link.sensor_addr)
         links[link.name] = entry
     block = {
         "bus": topology.i2c_bus,
@@ -578,17 +586,45 @@ def _render_hardware(ports: dict) -> str:
     header = ("# Written by `nxs generate`. What is wired:\n"
               "# regenerate it after a re-cable, and do not hand-edit it.\n"
               "# What you want of the rig lives in suite.yaml beside it.\n")
-    return header + yaml.safe_dump({"ports": ports}, sort_keys=True,
-                                   default_flow_style=False, width=100)
+    return header + yaml.dump({"ports": ports}, Dumper=_SeedDumper, sort_keys=True,
+                              default_flow_style=False, width=100)
+
+
+def hex_address(value: int) -> HexInt:
+    """An I²C address as the declaration files write it, in hex as every
+    line the tool prints names it (`alias: 0x31`); it reads back as the int.
+    The round-trip writer `nxs tune` saves through prints it as it is."""
+    return HexInt(int(value), width=2)
+
+
+class _SeedDumper(yaml.SafeDumper):
+    """The dumper of the seed and the wiring file: block style, I²C
+    addresses in hex."""
+
+
+_SeedDumper.add_representer(HexInt, lambda dumper, value: dumper.represent_scalar(
+    "tag:yaml.org,2002:int", f"{int(value):#04x}"))
+
+
+def render_seed(doc: dict) -> str:
+    """The seeded declaration's body, in the order it was built."""
+    return yaml.dump(doc, Dumper=_SeedDumper, sort_keys=False)
 
 
 def _write_atomic(path: str, render) -> None:
     """Land a rendered file: a temporary beside it and an atomic replace
     where this user may write, else through the root helper (the
-    declaration and its report live under /etc on a provisioned host)."""
+    declaration and its report live under /etc on a camera host). A
+    directory this user cannot create is made under root for the I²C
+    group, as `nxs switch` makes it."""
     directory = os.path.dirname(path) or "."
-    if not os.path.isdir(directory) or os.access(directory, os.W_OK):
-        os.makedirs(directory, exist_ok=True)
+    if not os.path.isdir(directory):
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except PermissionError:
+            from nxs.suite.switch_cam import make_group_dir
+            make_group_dir(directory)
+    if os.access(directory, os.W_OK):
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             render(f)

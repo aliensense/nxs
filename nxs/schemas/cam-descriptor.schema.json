@@ -146,7 +146,18 @@
       }
     },
     "trigger": {
-      "type": "object"
+      "type": "object",
+      "properties": {
+        "timing": {
+          "type": "object",
+          "properties": {
+            "pulse_width_is_exposure": {
+              "type": "boolean",
+              "description": "Whether the sensor integrates for the trigger pulse's low time under fast trigger, its shutter register inert. The IDENTITY record carries it; under frame sync the tool states the exposure as the pulse's low time and refuses one asked."
+            }
+          }
+        }
+      }
     },
     "sync": {
       "type": "object",
@@ -529,7 +540,7 @@
               "pixel_phase",
               "min_exp_us"
             ],
-            "description": "One capture-side mode. A row that states no line length or top rate takes them from the unit-program mode of its geometry and depth (the line length from the mode's HMAX in the table's pixel clock, the top rate from the shipped ceiling, else the laws'); a stated value stands.",
+            "description": "One capture-side mode. A row that states no line length or top rate takes them from the unit-program mode of its geometry and depth (the line length from the mode's HMAX in the table's pixel clock, the top rate from the laws' datasheet frame at that line); a stated value stands.",
             "properties": {
               "width": {
                 "type": "integer"
@@ -562,7 +573,7 @@
               },
               "max_fps": {
                 "type": "number",
-                "description": "The top rate; absent, the unit-program mode's shipped ceiling, else its laws'."
+                "description": "The top rate; absent, the unit-program mode's datasheet frame at its line."
               },
               "min_exp_us": {
                 "type": "integer"
@@ -579,25 +590,13 @@
     },
     "limits_source": {
       "type": "object",
-      "description": "Where each limit came from: datasheet, driver, measured (on a bench, shipped as a fact), or experimental (measured, experimental overlay only).",
+      "description": "Where each limit came from: datasheet, driver (where the vendor driver is the only public source), or experimental (measured, experimental overlay only).",
       "additionalProperties": {
         "enum": [
           "datasheet",
           "driver",
-          "measured",
           "experimental"
         ]
-      }
-    },
-    "shipped": {
-      "type": "object",
-      "description": "The operating points each mode ships: per (port, csi lanes) the free-run range, the line the port runs and, for a port shipped under frame sync, its trigger frame. A mode without a point for the port's port is experimental there.",
-      "additionalProperties": {
-        "type": "array",
-        "minItems": 1,
-        "items": {
-          "$ref": "#/$defs/shipped_point"
-        }
       }
     }
   },
@@ -696,7 +695,32 @@
           "type": "object"
         },
         "sony": {
-          "type": "object"
+          "type": "object",
+          "description": "The mode's row of the sensor datasheet's register lists: the recommended frame length V_TR (VMAX) the imaging characteristics are guaranteed at, the line length (HMAX), the frame rate at them, and the section that states them. The frame laws read V_TR from it; without it they compute the frame from `timing`.",
+          "additionalProperties": false,
+          "required": [
+            "vmax",
+            "hmax",
+            "section"
+          ],
+          "properties": {
+            "vmax": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "hmax": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "max_fps": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "section": {
+              "type": "string",
+              "pattern": "^[0-9]+(\\.[0-9]+)*$"
+            }
+          }
         },
         "mipi": {
           "type": "object",
@@ -789,58 +813,6 @@
         },
         "warn_nonzero": {
           "type": "boolean"
-        }
-      }
-    },
-    "shipped_point": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "cameras",
-        "csi_lanes",
-        "fps",
-        "hmax"
-      ],
-      "properties": {
-        "cameras": {
-          "enum": [
-            1,
-            2
-          ],
-          "description": "How many cameras the point was proven with: one, or the pair."
-        },
-        "csi_lanes": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 4
-        },
-        "fps": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": [
-            "floor",
-            "ceiling"
-          ],
-          "properties": {
-            "floor": {
-              "type": "number",
-              "exclusiveMinimum": 0
-            },
-            "ceiling": {
-              "type": "number",
-              "exclusiveMinimum": 0
-            }
-          }
-        },
-        "hmax": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "The line length the port runs at: the mode's timing.hmax, or the longer line a pair needs on the port's lanes (never shorter than the mode's); the port composes at it."
-        },
-        "trigger_vmax": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "The fast-trigger frame the port syncs at; present only for a port that ships under frame sync, and the frame the synced pair then runs."
         }
       }
     }
