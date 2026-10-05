@@ -180,7 +180,7 @@ class StreamDriver(SensorDriver):
                 em.emit_jmp(Op.JMP, L_TOP)
             else:
                 # Multi-byte delim: `pg` counts delim bytes matched at the tail;
-                # a mismatch resets it, checking a restart against delim[0].
+                # a mismatch retains the longest matching prefix suffix.
                 pg_r = self._regs.get("__match_pg")
                 em.emit_u32(Op.LOAD_IMM, pg_r, 0)
 
@@ -221,14 +221,28 @@ class StreamDriver(SensorDriver):
                         # pg was 0; stay at 0.
                         em.emit_jmp(Op.JMP, L_AFTER)
                     else:
-                        # pg was > 0; reset, but the current byte itself
-                        # might start a fresh match against delim[0].
-                        em.emit_cmp(Op.CMP_EQ, byte_r, delim_bytes[0], match_r)
-                        L_reset_zero = self._fresh_label(f"ru_reset_{i}")
-                        em.emit_jmp(Op.JZ, L_reset_zero, match_r)
-                        em.emit_u32(Op.LOAD_IMM, pg_r, 1)
-                        em.emit_jmp(Op.JMP, L_AFTER)
-                        em.label(L_reset_zero)
+                        # Keep the longest prefix ending at this byte.
+                        # The full delimiter can have no border while an
+                        # interior prefix does: aab must match in aaab.
+                        prefix = delim_bytes[:i]
+                        # The normal-match branch above already handles this
+                        # byte, so it cannot reach the fallback path.
+                        seen_bytes = {delim_bytes[i]}
+                        for keep in range(i, 0, -1):
+                            next_byte = delim_bytes[keep - 1]
+                            if next_byte in seen_bytes or not prefix.endswith(
+                                    delim_bytes[:keep - 1]):
+                                continue
+                            # Descending keep: a byte's first fallback wins.
+                            # Smaller keeps for that byte are unreachable;
+                            # emitting them bloats long repeated prefixes.
+                            seen_bytes.add(next_byte)
+                            L_next = self._fresh_label(f"ru_fallback_{i}_{keep}")
+                            em.emit_cmp(Op.CMP_EQ, byte_r, next_byte, match_r)
+                            em.emit_jmp(Op.JZ, L_next, match_r)
+                            em.emit_u32(Op.LOAD_IMM, pg_r, keep)
+                            em.emit_jmp(Op.JMP, L_AFTER)
+                            em.label(L_next)
                         em.emit_u32(Op.LOAD_IMM, pg_r, 0)
                         em.emit_jmp(Op.JMP, L_AFTER)
                     if not is_last:
