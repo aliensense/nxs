@@ -206,19 +206,12 @@ def walk_ports() -> List[PortFinding]:
 POD_ADDRESSES = tuple(range(0x30, 0x34))
 
 
-def _link_locks(descriptor, results) -> Dict[str, bool]:
-    """Link name -> whether the hub reports the link locked, from its
-    `link_lock_<name>` status probes; empty for a hub without them."""
-    from nxs.cam.descriptors import to_int
+def _link_locks(descriptor, results) -> Dict[str, Optional[bool]]:
+    """Link name -> whether the hub reports the link locked, None for a lock
+    it did not answer (`nxs.cam.diag.link_locks`)."""
+    from nxs.cam.diag import link_locks
 
-    probes = {str(p["name"]): p for p in descriptor.raw("status") or []}
-    locks: Dict[str, bool] = {}
-    for result in results:
-        probe = probes.get(result.name)
-        if (result.name.startswith("link_lock_") and result.raw is not None
-                and probe is not None and "mask" in probe):
-            locks[result.name[len("link_lock_"):]] = bool(result.raw & to_int(probe["mask"]))
-    return locks
+    return link_locks(descriptor, results)
 
 
 def _with_platform_links(declared, platform):
@@ -289,11 +282,14 @@ def _walk_hub(topology) -> PortFinding:
             # (the other link down meanwhile), as `on` addresses them.
             isolate = len(alone) > 1 and hasattr(flows, "isolate_link")
             for link in topology.links:
-                if locks.get(link.name) is False:
+                if link.name in locks and locks[link.name] is not True:
                     port.links.append(LinkFinding(
                         name=link.name, window=int(link.des_window),
                         ser=link.ser_compatible, ser_present=False, sensor=None,
-                        sensor_note="link not locked", locked=False))
+                        sensor_note=("link not locked" if locks[link.name] is False
+                                     else "link lock not read"),
+                        unwalked="" if locks[link.name] is False else "link lock not read",
+                        locked=locks[link.name]))
                     continue
                 if isolate:
                     if not flows.isolate_link(pack, i2c, topology, link):

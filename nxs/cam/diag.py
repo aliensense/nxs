@@ -54,40 +54,77 @@ def _read_register(i2c: Any, device_addr: int, reg_def: Dict[str, Any]) -> int:
     return out
 
 
+def _evaluate(i2c: Any, device_addr: int, descriptor: Descriptor,
+              probe: Dict[str, Any]) -> ProbeResult:
+    """One declared probe on a live device."""
+    name = str(probe["name"])
+    desc = str(probe.get("desc", ""))
+    reg_def = descriptor.registers[str(probe["reg"])]
+    try:
+        raw = _read_register(i2c, device_addr, reg_def)
+    except Exception:
+        return ProbeResult(name, None, "no ACK", False, desc)
+
+    value = raw & to_int(probe["mask"]) if "mask" in probe else raw
+    ok: Optional[bool] = None
+    if "expect" in probe:
+        ok = value == to_int(probe["expect"])
+    if probe.get("warn_nonzero"):
+        ok = value == 0
+
+    decode = probe.get("decode") or {}
+    decoded = {int(k): str(v) for k, v in decode.items()}
+    if value in decoded:
+        text = decoded[value]
+    elif str(probe.get("format", "")) == "int":
+        text = str(value)
+    else:
+        text = f"0x{value:02X}"
+    return ProbeResult(name, raw, text, ok, desc)
+
+
 def run_probes(
     i2c: Any,
     device_addr: int,
     descriptor: Descriptor,
 ) -> List[ProbeResult]:
     """Evaluate a descriptor's declared status probes on a live device."""
-    results: List[ProbeResult] = []
-    for probe in descriptor.raw("status") or []:
-        name = str(probe["name"])
-        desc = str(probe.get("desc", ""))
-        reg_def = descriptor.registers[str(probe["reg"])]
-        try:
-            raw = _read_register(i2c, device_addr, reg_def)
-        except Exception:
-            results.append(ProbeResult(name, None, "no ACK", False, desc))
+    return [_evaluate(i2c, device_addr, descriptor, probe)
+            for probe in descriptor.raw("status") or []]
+
+
+def lock_probes(i2c: Any, device_addr: int, descriptor: Descriptor) -> List[ProbeResult]:
+    """The hub's `link_lock_<name>` probes alone. A presence walk reads these
+    and nothing else, since another probe's read may clear a latched fault
+    the diagnosis is to report."""
+    return [_evaluate(i2c, device_addr, descriptor, probe)
+            for probe in descriptor.raw("status") or []
+            if str(probe["name"]).startswith("link_lock_")]
+
+
+def link_locks(descriptor: Descriptor, results: List[ProbeResult]) -> Dict[str, Optional[bool]]:
+    """Link name -> whether the hub reports the link locked, from its
+    `link_lock_<name>` status probes: None for a declared probe the hub did
+    not answer, and no entry for a hub without such probes."""
+    probes = {str(p["name"]): p for p in descriptor.raw("status") or []}
+    locks: Dict[str, Optional[bool]] = {}
+    for result in results:
+        probe = probes.get(result.name)
+        if not result.name.startswith("link_lock_") or probe is None or "mask" not in probe:
             continue
+        name = result.name[len("link_lock_"):]
+        locks[name] = None if result.raw is None else bool(result.raw & to_int(probe["mask"]))
+    return locks
 
-        value = raw & to_int(probe["mask"]) if "mask" in probe else raw
-        ok: Optional[bool] = None
-        if "expect" in probe:
-            ok = value == to_int(probe["expect"])
-        if probe.get("warn_nonzero"):
-            ok = value == 0
 
-        decode = probe.get("decode") or {}
-        decoded = {int(k): str(v) for k, v in decode.items()}
-        if value in decoded:
-            text = decoded[value]
-        elif str(probe.get("format", "")) == "int":
-            text = str(value)
-        else:
-            text = f"0x{value:02X}"
-        results.append(ProbeResult(name, raw, text, ok, desc))
-    return results
+def unwalked(lock: Optional[bool]) -> Optional[str]:
+    """Why a link is not read through its window, or None when it is: the
+    hub reports it unlocked, or did not answer its lock probe."""
+    if lock is False:
+        return "link not locked"
+    if lock is None:
+        return "link lock not read"
+    return None
 
 
 def derive_lines(pack, compatible: str,
@@ -143,7 +180,14 @@ def probe_topology(
         sections.append(("links (kernel-owned hub — not walked)", [], []))
         return sections
     if des_alive:
+        locks = link_locks(desd, des_results)
         for link in links or topology.links:
+            if link.name in locks and (why := unwalked(locks[link.name])):
+                # Nothing stands behind an unlocked link's window, and a read
+                # through it answers from the other link's serializer.
+                behind = "nothing behind it" if why == "link not locked" else "not walked"
+                sections.append((f"link {link.name} {why[5:]}, {behind}", [], []))
+                continue
             flows.open_window(pack, i2c, topology, link)
             serd = pack.descriptor(link.ser_compatible)
             ser_results = run_probes(i2c, link.ser_addr, serd)

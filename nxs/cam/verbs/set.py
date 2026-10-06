@@ -156,9 +156,9 @@ def _hold_rate(args: argparse.Namespace, topology: Topology, pack, flows, link,
                compose) -> None:
     """`set fps` holds the link to the rate it asked. The rate and the caps
     are recorded before the count, since the capture stack's driver sets
-    the frame from the caps' rate when a session starts (caveat C-024); a
-    rate the link does not deliver is refused with the previous rate
-    written back and recorded."""
+    the frame from the caps' rate when a session starts; a rate the link
+    does not deliver is refused with the previous rate written back and
+    recorded."""
     port = _port_name(topology)
     previous = port_state.port_rate(topology, link)
     _record_rate(pack, flows, topology, link, float(args.value))

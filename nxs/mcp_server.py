@@ -146,7 +146,7 @@ def samples(unit: Optional[str] = None, count: int = 5) -> dict:
 
 def status(port: Optional[str] = None, link: Optional[str] = None) -> dict:
     """Health. Without a port: the declared-vs-actual tree from the
-    manifest. With a port: the descriptor-driven diagnosis (link locks,
+    declaration. With a port: the descriptor-driven diagnosis (link locks,
     video lock per pipe, CSI gate, sensor timing readbacks)."""
     if port is None:
         return _call_json(["status", "--json"])
@@ -232,7 +232,7 @@ def set_knob(port: str, link: Optional[str], knob: str, value: str,
 
 
 # ---------------------------
-# Declarative verbs: the manifest
+# Declarative verbs: the declaration
 # ---------------------------
 
 def suite_get() -> dict:
@@ -243,7 +243,7 @@ def suite_get() -> dict:
 
 
 def suite_schema() -> dict:
-    """The rig's rules as JSON Schema (2020-12): the manifest schema narrowed
+    """The rig's rules as JSON Schema (2020-12): the declaration schema narrowed
     by the nodes on this rig. Each port lists the keys its nodes bring, each
     link the sensors its port's pack serves, each sensor its modes and each
     mode the rates the laws give it on the port; a unit's personality lists
@@ -256,7 +256,7 @@ def suite_schema() -> dict:
 def suite_set(channel: str, field: str, value: str,
               section: Optional[str] = None) -> dict:
     """Set one declared value from its offered options (see suite_get) and save
-    the manifest with a timestamped backup; the result carries the check
+    the declaration with a timestamped backup; the result carries the check
     findings. Nothing converges until `switch` (units) or `reload` (ports)."""
     address = f"{channel}:{section}:{field}" if section else f"{channel}:{field}"
     rc, out = _run(["tune", "--set", f"{address}={value}", "--json"],
@@ -270,7 +270,7 @@ def suite_set(channel: str, field: str, value: str,
 def switch(dry_run: bool = False, accept_new_serial: bool = False) -> str:
     """Apply the saved declaration to the units: a unit whose personality or settings
     differ is retuned or re-uploaded, a matching one is left alone. Refused
-    while the manifest is out of tune or a declared unit does not answer."""
+    while the declaration is out of tune or a declared unit does not answer."""
     argv = ["switch"]
     if dry_run:
         argv.append("--dry-run")
@@ -281,7 +281,7 @@ def switch(dry_run: bool = False, accept_new_serial: bool = False) -> str:
 
 def reload() -> dict:
     """Apply the saved declaration to the ports: signal the running nxsd to
-    reconverge the ports whose declaration changed. Refused while the manifest
+    reconverge the ports whose declaration changed. Refused while the declaration
     is out of tune."""
     rc, out = _run(["tune", "--play", "--json"], timeout=60.0)
     try:
@@ -291,7 +291,7 @@ def reload() -> dict:
 
 
 def freeze(unit: Optional[str] = None, dry_run: bool = False) -> str:
-    """Adopt live tuning into the manifest (the device wins): one unit
+    """Adopt live tuning into the declaration (the device wins): one unit
     by name, or every declared unit. The live-first flow's last step."""
     argv = ["tune", "--freeze"] + (["--unit", unit] if unit else [])
     if dry_run:
@@ -357,16 +357,16 @@ def host_modes(port: str) -> dict:
 TOOLS: List[ToolSpec] = [
     ToolSpec("probe", probe, "the units that answer, on every bus or a port's",
              "port?, link?", "none (reads identity registers)",
-             "no ACK rows; unknown port lists the ports", read_only=True),
+             "no ACK rows, or an unknown port, which lists the ports", read_only=True),
     ToolSpec("generate", generate, "the rig as it answers: ports, hubs, links, "
                                    "sensors, units",
              "dry_run?",
-             "walks every camera port and bus; with dry_run false it writes "
-             "hardware.yaml (the report of what answered), seeds suite.yaml when "
-             "there is none, and names a unit on a bare bus running nothing by "
+             "walks every camera port and bus. With dry_run false it writes "
+             "hardware.yaml, the report of what answered, and seeds suite.yaml when "
+             "there is none. A unit on a bare bus running nothing is named by "
              "trying every personality on it",
-             "no pack and no camera port; the wiring file is not writable"),
-    ToolSpec("status", status, "the declaration against the rig; a port's "
+             "no pack and no camera port, or the wiring file is not writable"),
+    ToolSpec("status", status, "the declaration against the rig, or a port's "
                                "presence and health",
              "port?, link?", "none (reads identity and status registers)",
              "hub does not answer", read_only=True),
@@ -375,9 +375,9 @@ TOOLS: List[ToolSpec] = [
              idempotent=True),
     ToolSpec("samples", samples, "read decoded samples from a unit",
              "unit?, count?",
-             "reads the sample window; over Cyphal it sets the output "
+             "reads the sample window. Over Cyphal it sets the output "
              "decimation for the read and puts the previous value back",
-             "no personality measuring; unit does not answer"),
+             "no personality measuring, or the unit does not answer"),
     ToolSpec("caps", caps, "what the sensor offers, with the laws",
              "port, link?", "none (descriptor data)",
              "no descriptor pack covers the chip", read_only=True),
@@ -385,57 +385,57 @@ TOOLS: List[ToolSpec] = [
              "port, link?, sensor?, mode?, fps?, dry_run?",
              "writes the program, trains links, follows video lock, counts two "
              "seconds of frames on every camera link",
-             "the laws refuse the mode or rate; hub does not answer; video "
-             "did not lock; the links do not deliver the rate"),
+             "the laws refuse the mode or rate, the hub does not answer, video "
+             "did not lock, or the links do not deliver the rate"),
     ToolSpec("off", off, "park the whole port", "port",
              "sensors to standby, CSI gate closed, viewers stopped, each pod's head parked",
              "kernel-owned hub"),
     ToolSpec("capture", capture, "headless delivery proof", "port, link, frames?, timeout_s?",
              "opens a capture session on the up link",
-             "link not up; frames not delivered"),
+             "the link is not up, or the frames were not delivered"),
     ToolSpec("get", get, "read a knob: the port's sync, the sensor's, the unit's",
              "port, link, knob",
              "none (reads sensor registers)", "unknown knob lists the knobs",
              read_only=True),
-    ToolSpec("set", set_knob, "change a knob under the laws; sync is the port's "
+    ToolSpec("set", set_knob, "change a knob under the laws, sync being the port's "
                               "frame sync",
              "port, link?, knob, value, dry_run?, fps?, exposure_us?",
-             "writes sensor registers; sync starts or stops the hub's generator; "
+             "writes sensor registers. Sync starts or stops the hub's generator, and "
              "a sync or fps change counts two seconds of frames",
-             "an unlawful value, with the lawful alternatives; a sync or rate the "
-             "links do not deliver, the previous one restored; live sibling link; "
-             "port not up"),
+             "an unlawful value, with the lawful alternatives. A sync or rate the "
+             "links do not deliver, the previous one restored. A live sibling link. "
+             "The port is not up"),
     ToolSpec("suite_get", suite_get, "the declaration as options", "—",
-             "none", "no camera port on the host and no manifest",
+             "none", "no camera port on the host and no declaration",
              read_only=True, idempotent=True),
     ToolSpec("suite_schema", suite_schema, "the rig's rules as JSON Schema", "—",
-             "none", "the manifest does not parse",
+             "none", "the declaration does not parse",
              read_only=True, idempotent=True),
     ToolSpec("suite_set", suite_set, "set one declared value from its options",
              "channel, field, value, section?",
-             "writes suite.yaml (timestamped backup; created when absent)",
-             "value not among the options; ambiguous field"),
+             "writes suite.yaml (a timestamped backup, created when absent)",
+             "the value is not among the options, or the field is ambiguous"),
     ToolSpec("switch", switch, "apply the saved declaration to the units",
              "dry_run?, accept_new_serial?",
              "retunes or re-uploads the personality on units whose entry differs",
-             "manifest out of tune; a declared unit does not answer"),
+             "the declaration is out of tune, or a declared unit does not answer"),
     ToolSpec("reload", reload, "apply the saved declaration to the ports", "—",
              "nxsd reconverges changed ports",
-             "manifest out of tune; nxsd not running"),
-    ToolSpec("freeze", freeze, "adopt live tuning into the manifest",
+             "the declaration is out of tune, or nxsd is not running"),
+    ToolSpec("freeze", freeze, "adopt live tuning into the declaration",
              "unit?, dry_run?", "writes suite.yaml", "unit unreachable"),
     ToolSpec("upload", upload,
              "compile and upload a personality to a unit (or compile only)",
              "name, port?, link?, unit?, params?, slot?, compile_only?",
-             "a driver runs; a camera personality lands in a store slot",
-             "unknown name; the source does not compile; store full; several "
-             "units answer and none is named"),
+             "a driver runs, and a camera personality lands in a store slot",
+             "an unknown name, a source that does not compile, a full store, or several "
+             "units that answer with none named"),
     ToolSpec("host_info", host_info, "the capture host and what it booted",
              "—", "none (reads the device tree and boot config)", "never",
              read_only=True, idempotent=True),
     ToolSpec("host_modes", host_modes, "the booted capture table of a port",
              "port", "none (reads the device tree)",
-             "unknown port; device tree silent", read_only=True, idempotent=True),
+             "an unknown port, or a silent device tree", read_only=True, idempotent=True),
 ]
 
 

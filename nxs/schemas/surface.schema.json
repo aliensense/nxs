@@ -352,6 +352,15 @@
         "no ACK"
       ]
     },
+    "link_ack": {
+      "description": "A link's serializer or head as the walk found it: present, silent, or not read because the hub reports the link unlocked or did not answer its lock probe.",
+      "enum": [
+        "present",
+        "no ACK",
+        "link not locked",
+        "link lock not read"
+      ]
+    },
     "presence": {
       "title": "the presence walk of a port (nxs <port> status --json, presence)",
       "type": "object",
@@ -427,10 +436,10 @@
                 "type": "string"
               },
               "ser": {
-                "$ref": "#/$defs/ack"
+                "$ref": "#/$defs/link_ack"
               },
               "sen": {
-                "$ref": "#/$defs/ack"
+                "$ref": "#/$defs/link_ack"
               },
               "sen_addr": {
                 "description": "The address the head was probed at: its host alias while the port is up, its own address before the first on maps it.",

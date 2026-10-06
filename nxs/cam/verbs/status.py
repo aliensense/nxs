@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from nxs.cam.descriptors import to_int
 from nxs.cam.contracts import ContractError, LinkSpec, Topology
+from nxs.cam.diag import unwalked
 from nxs import host as host_layer
 from nxs.finding import Finding
 from nxs.cam import port_state
@@ -146,9 +147,21 @@ def presence_payload(topology: Topology,
         if not direct and not _presence_hub(payload, pack, topology, i2c):
             return payload
         payload["walked"] = True
+        locks: Dict[str, Optional[bool]] = {}
+        if not direct:
+            from nxs.cam.diag import link_locks, lock_probes
+
+            desd = pack.descriptor(topology.des_compatible)
+            locks = link_locks(desd, lock_probes(i2c, topology.des_addr, desd))
         found_sensors: Dict[str, str] = {}
         walked: List[Tuple[LinkSpec, Dict[str, Any]]] = []
         for link in selected or topology.links:
+            if link.name in locks and (why := unwalked(locks[link.name])):
+                # Nothing stands behind an unlocked link's window, and a read
+                # through it answers from the other link's serializer.
+                payload["links"].append({"name": link.name, "units": [], "ser": why, "sen": why})
+                payload["ok"] = False
+                continue
             flows.open_window(pack, i2c, topology, link)
             entry: Dict[str, Any] = {"name": link.name, "units": []}
             walked.append((link, entry))
@@ -585,6 +598,10 @@ def verdict_lines(topology: Topology, pack, presence: Dict[str, Any],
         if rate is not None and link.has_camera:
             parts.append(f"{float(rate):.1f} fps")
         entry = entries.get(link.name) or {}
+        if entry.get("ser") in ("link not locked", "link lock not read"):
+            lines.append(f"{port}/{link.name}: {entry['ser']}")
+            ok = False
+            continue
         if not link.has_camera:
             # A pod alone: the pod's name and personality, then the state.
             who = names.get(link.name) or (f"@{link.nxs_units[0].alias_addr:#04x}"
