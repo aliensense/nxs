@@ -21,11 +21,11 @@ PROGRAM = TrailerRecord.PROGRAM
 TRIGGERS = TrailerRecord.TRIGGERS
 RUN_PARAMS = TrailerRecord.RUN_PARAMS
 
-#: The enum params a camera personality dispatches on, by the name its
+#: The enum params a cam personality dispatches on, by the name its
 #: behaviour class declares them under; the wire carries their indices.
 MODE_PARAM = "mode"
 TRIGGER_PARAM = "trigger"
-#: The run parameters a camera personality stages in physical units and
+#: The run parameters a cam personality stages in physical units and
 #: the values it records for the host, by name: the line period and the
 #: frame period a run starts the sensor at, the frame length in lines it
 #: achieved, and the action a run performs.

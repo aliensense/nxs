@@ -1,4 +1,4 @@
-"""Register-bus drivers (I²C, SPI) and the register tables they load."""
+"""Register-bus click personalities (I²C, SPI) and the register tables they load."""
 
 from __future__ import annotations
 
@@ -11,13 +11,13 @@ from typing import List, Optional, Tuple
 
 from nxs._generated_constants import NxsDriverImage
 from nxs.opcodes import Op
-from nxs.dsl.base import SensorDriver
+from nxs.dsl.base import ClickPersonality
 from nxs.dsl.emit import BUS_REGISTER, _TraceReadValue, _load_spec_byte
 from nxs.dsl.errors import CompileError
 from nxs.dsl.loop import _ASTCompiler
 
 
-class RegisterDriver(SensorDriver):
+class RegisterClickPersonality(ClickPersonality):
     """Base class for sensors on a register bus (I²C, SPI). Without ``FRAME``,
     reads and writes emit ``OP_REG_READ`` / ``OP_REG_WRITE``; with a ``SpiFrame``
     schema they emit the exact on-wire bytes via MEMCPY_IMM + REG_XFER."""
@@ -53,7 +53,7 @@ class RegisterDriver(SensorDriver):
             return
         if dev is not None:
             raise CompileError(
-                "dev= targets an I2C companion; a FRAME driver is SPI and "
+                "dev= targets an I2C companion; a FRAME personality is SPI and "
                 "declares no companions.")
 
         # FRAME path: compose the full wire bytes at trace time, MEMCPY_IMM
@@ -245,13 +245,13 @@ class RegisterDriver(SensorDriver):
                                _load_spec_byte(2, signed, endian))
 
     def read(self, reg, width=1, signed=False, endian="big", dev=None):
-        # Plain reads are the base SensorDriver.read; RegisterDriver adds only
+        # Plain reads are the base ClickPersonality.read; RegisterClickPersonality adds only
         # the custom-FRAME path below.
         if self.FRAME is None:
             return super().read(reg, width, signed, endian, dev=dev)
         if dev is not None:
             raise CompileError(
-                "dev= targets an I2C companion; a FRAME driver is SPI and "
+                "dev= targets an I2C companion; a FRAME personality is SPI and "
                 "declares no companions.")
 
         # FRAME path with optional pipelining: read_pipeline=N means the
@@ -278,7 +278,7 @@ class RegisterDriver(SensorDriver):
         Returns the slot offset for the caller's response LOAD."""
         if tuple(self.BUSES) != ('spi',):
             raise CompileError(
-                f"xfer clocks a literal full-duplex SPI word, so the driver "
+                f"xfer clocks a literal full-duplex SPI word, so the personality "
                 f"must declare BUSES = ('spi',) — {type(self).__name__} "
                 f"declares {self.BUSES}, and a non-SPI binding has no "
                 f"defined wire behaviour for it")
@@ -375,7 +375,7 @@ class RegisterDriver(SensorDriver):
             self._emitter.emit(Op.I2C_TARGET, 0)
 
     def load_table(self, path: str) -> List[Tuple[int, int]]:
-        """The `(reg, value)` rows of a register table beside the driver's
+        """The `(reg, value)` rows of a register table beside the personality's
         source file (an absolute path is used as is): a YAML list of
         `[reg, value]` pairs or `{reg, value}` mappings, a YAML `reg: value`
         mapping, or a CSV of `reg,value` rows (a header row and `#` lines
@@ -465,14 +465,14 @@ def _table_int(text, where: str) -> int:
 
 def load_table(path: str, relative_to: Optional[str] = None) -> List[Tuple[int, int]]:
     """The `(reg, value)` rows of a register table file (see
-    `RegisterDriver.load_table`); a relative `path` resolves against
+    `RegisterClickPersonality.load_table`); a relative `path` resolves against
     `relative_to`. A YAML `{sleep_ms: N}` row is a settle between writes
     and loads as `(SLEEP_ROW, N)`. Every row is validated with the file
     and row named."""
     if not os.path.isabs(path):
         if relative_to is None:
             raise CompileError(
-                f"load_table({path!r}): the driver has no source file to "
+                f"load_table({path!r}): the personality has no source file to "
                 f"resolve a relative path against; pass an absolute path")
         path = os.path.join(relative_to, path)
     if not os.path.exists(path):

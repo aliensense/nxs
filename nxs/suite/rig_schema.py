@@ -28,13 +28,13 @@ _NOTE = ("The rules of this rig, from the nodes on it. Necessary, not sufficient
          "arithmetic across nodes is the laws', and `nxs status` on the rig is the judge.")
 
 
-def _rate(flows, pack, topology, link, mode: str) -> Optional[Dict[str, Any]]:
+def _rate(flows, hub, topology, link, mode: str) -> Optional[Dict[str, Any]]:
     """The `fps` rule of one mode on a link: a range, or the one rate a
     table-only part runs it at; None where the laws refuse the mode here."""
     from nxs.cam.contracts import InfeasibleConfig
 
     try:
-        rates = flows.fps_range(pack, topology, link, mode)
+        rates = flows.fps_range(hub, topology, link, mode)
     except (InfeasibleConfig, KeyError, AttributeError):
         return None
     if rates.floor == rates.ceiling:
@@ -53,35 +53,35 @@ def _mode_tokens(sen, names: List[str]) -> Dict[str, str]:
     return tokens
 
 
-def _default_mode(flows, pack, topology, link) -> Optional[str]:
+def _default_mode(flows, hub, topology, link) -> Optional[str]:
     try:
-        return str(flows.default_mode(pack, link, topology))
+        return str(flows.default_mode(hub, link, topology))
     except Exception:
         return None
 
 
-def _camera_rule(pack, flows, topology, link) -> Dict[str, Any]:
-    """A link's `camera`: a sensor the port's pack serves, or the mapping
+def _camera_rule(hub, flows, topology, link) -> Dict[str, Any]:
+    """A link's `camera`: a sensor the port's hub serves, or the mapping
     whose mode belongs to that sensor and whose rate belongs to that mode.
     Every served sensor gets its own rules, judged as if the link carried
     it; a mapping that names no mode is judged at the sensor's default."""
     import dataclasses
 
-    served = sorted(pack.descriptor(chip).compatible for chip in pack.sensors())
+    served = sorted(hub.descriptor(chip).compatible for chip in hub.sensors())
     rules = []
     for compatible in served:
-        sen = pack.descriptor(compatible)
+        sen = hub.descriptor(compatible)
         as_if = dataclasses.replace(link, sensor_compatible=compatible)
         tokens = _mode_tokens(sen, list(sen.program_modes()))
         per_mode = []
         for token, mode in sorted(tokens.items()):
-            rate = _rate(flows, pack, topology, as_if, mode)
+            rate = _rate(flows, hub, topology, as_if, mode)
             if rate is not None:
                 per_mode.append({"if": {"properties": {"mode": {"const": token}},
                                         "required": ["mode"]},
                                  "then": {"properties": {"fps": rate}}})
-        default = _default_mode(flows, pack, topology, as_if)
-        rate = _rate(flows, pack, topology, as_if, default) if default else None
+        default = _default_mode(flows, hub, topology, as_if)
+        rate = _rate(flows, hub, topology, as_if, default) if default else None
         if rate is not None:
             per_mode.append({"if": {"not": {"required": ["mode"]}},
                              "then": {"properties": {"fps": rate}}})
@@ -113,7 +113,7 @@ def _direct_link_rules(base: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _port_rule(base: Dict[str, Any], port) -> Dict[str, Any]:
-    from nxs.cam import packs
+    from nxs.cam import hubs
     from nxs.cam import topology as cam_topo
     from nxs.suite.schema import SYNC_SOURCES
 
@@ -141,10 +141,10 @@ def _port_rule(base: Dict[str, Any], port) -> Dict[str, Any]:
     props["camera"] = camera
     try:
         topology = cam_topo.port_topology(port)
-        pack = packs.pack_for(topology)
-        flows = pack.flows()
+        hub = hubs.for_topology(topology)
+        flows = hub.flows()
     except Exception:
-        return rule          # a pack that does not load is `nxs status`'s finding
+        return rule          # a hub that does not load is `nxs status`'s finding
     resolved = {link.name: link for link in topology.links}
     links: Dict[str, Any] = {}
     for declared in port.links:
@@ -162,7 +162,7 @@ def _port_rule(base: Dict[str, Any], port) -> Dict[str, Any]:
             # asks for the camera the way `check` does.
             entry["required"] = ["camera"]
         else:
-            entry["properties"]["camera"] = _camera_rule(pack, flows, topology, link)
+            entry["properties"]["camera"] = _camera_rule(hub, flows, topology, link)
         links[declared.name] = entry
     # The rig's links and no other, whatever node brings them.
     props["links"] = {"type": "object", "properties": links, "additionalProperties": False}
@@ -177,17 +177,17 @@ def _unit_rules(cfg) -> Tuple[List[str], List[Dict[str, Any]]]:
     takes, applied to the `sensors[]` entry that names it. The rig's own
     personalities are judged at their declared configuration."""
     from nxs.check import sensor_allowed_keys
-    from nxs.suite.reconcile import DriverNotFound, known_driver_modules, load_unit_driver
+    from nxs.suite.reconcile import ClickPersonalityNotFound, known_click_personalities, load_click_personality
 
-    declared = {spec.driver: dict(spec.config) for unit in cfg.units
+    declared = {spec.personality: dict(spec.config) for unit in cfg.units
                 for spec in (unit.sensors or [])}
     admitted: List[str] = []
     rules = []
-    for name in sorted(set(known_driver_modules()) | set(declared)):
+    for name in sorted(set(known_click_personalities()) | set(declared)):
         try:
-            driver = load_unit_driver(name)
-            allowed = sorted(sensor_allowed_keys(driver, driver().compile(declared.get(name, {}))))
-        except (DriverNotFound, Exception):
+            personality = load_click_personality(name)
+            allowed = sorted(sensor_allowed_keys(personality, personality().compile(declared.get(name, {}))))
+        except (ClickPersonalityNotFound, Exception):
             continue     # a personality that does not load is `nxs status`'s finding
         names = sorted({name, name.replace("_", "-")})
         admitted.extend(names)

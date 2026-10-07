@@ -10,13 +10,12 @@ import yaml
 
 from nxs.suite.schema_base import ManifestError, _parse_int, _require_keys
 from nxs.suite.schema_ports import (
-    HARDWARE_LINK_KEYS, HARDWARE_PORT_KEYS, HUB_DRIVERS, SYNC_SOURCES,
+    HUB_DRIVERS, SYNC_SOURCES,
     PortLinkSpec, PortSpec, PortUnitRef, _parse_link_camera, _parse_port,
 )
 
 __all__ = [
-    "EGRESS_SUBJECTS", "EgressSpec", "HARDWARE_LINK_KEYS",
-    "HARDWARE_PORT_KEYS", "HUB_DRIVERS", "LinkSpec", "MODULES",
+    "EGRESS_SUBJECTS", "EgressSpec", "HUB_DRIVERS", "LinkSpec", "MODULES",
     "ManifestError", "PortLinkSpec", "PortSpec", "PortUnitRef",
     "SYNC_SOURCES", "SensorSpec", "SuiteConfig", "TRANSPORTS", "UnitSpec",
     "device_proves_patch", "device_runs", "hardware_path",
@@ -108,7 +107,7 @@ class EgressSpec:
 
 @dataclass
 class SensorSpec:
-    driver: str
+    personality: str
     config: dict = field(default_factory=dict)
 
 
@@ -244,17 +243,17 @@ def _parse_sensor(raw, where: str) -> SensorSpec:
     if not isinstance(raw.get("personality"), str):
         raise ManifestError(f"{where}: sensor needs a personality (personality: <name>)")
     # Marketing names hyphenate (neo-m9n); module files underscore.
-    driver = raw["personality"].replace("-", "_")
+    personality = raw["personality"].replace("-", "_")
     # Personality names become module names and filesystem paths; the token
     # shape rules out traversal (`../evil`) by construction.
-    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", driver):
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", personality):
         raise ManifestError(
             f"{where}.personality: {raw['personality']!r} is not a module name "
             f"(letters, digits, underscores)")
     config = raw.get("config", {}) or {}
     if not isinstance(config, dict):
         raise ManifestError(f"{where}.config: expected a mapping")
-    return SensorSpec(driver=driver, config=config)
+    return SensorSpec(personality=personality, config=config)
 
 
 def _parse_unit(raw, where: str, defaults: dict) -> UnitSpec:
@@ -289,12 +288,12 @@ def _parse_unit(raw, where: str, defaults: dict) -> UnitSpec:
             raise ManifestError(f"{where}.sensors: expected a list")
         sensors = [_parse_sensor(s, f"{where}.sensors[{i}]")
                    for i, s in enumerate(sensors_raw)]
-    # A driver is a stable identity within its panel (drift and freeze match
-    # the active driver by name), so a duplicate is rejected.
-    driver_names = [s.driver for s in (sensors or [])]
-    dupes = sorted({d for d in driver_names if driver_names.count(d) > 1})
+    # A personality is a stable identity within its panel (drift and freeze
+    # match the active one by name), so a duplicate is rejected.
+    personality_names = [s.personality for s in (sensors or [])]
+    dupes = sorted({d for d in personality_names if personality_names.count(d) > 1})
     if dupes:
-        raise ManifestError(f"{where}: duplicate driver(s) {dupes} in one unit")
+        raise ManifestError(f"{where}: duplicate personality(ies) {dupes} in one unit")
 
     egress = None
     if "egress" in raw and raw["egress"] is not None:

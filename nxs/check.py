@@ -1,9 +1,9 @@
 # Copyright (c) 2026 Aliensense.
 # SPDX-License-Identifier: Apache-2.0
 
-"""`nxs status`: validate the manifest against the hardware's descriptors
+"""`nxs status`: validate the manifest against the hardware's facts
 without touching a register: schema shape first, then camera declarations
-against the pack's laws and unit sensor configs against the driver descriptors."""
+against the hub's laws and unit sensor configs against the click personalities' facts."""
 
 import re
 import os
@@ -11,13 +11,13 @@ import os
 from nxs.finding import Finding, as_data, parse_refusal
 
 
-def sensor_allowed_keys(drv_cls, compiled) -> set:
-    """Config keys a driver accepts: declared params, `sample_rate`, `bus`, and
+def sensor_allowed_keys(cls, compiled) -> set:
+    """Config keys a click personality accepts: declared params, `sample_rate`, `bus`, and
     `trigger` for from_config loops."""
     allowed = {p.name for p in compiled.params}
     allowed.add("sample_rate")
-    for attr_name in dir(drv_cls):
-        fn = getattr(drv_cls, attr_name)
+    for attr_name in dir(cls):
+        fn = getattr(cls, attr_name)
         if (callable(fn) and getattr(fn, "_measure_loop", False)
                 and getattr(fn, "_trigger", "") == "from_config"):
             allowed.add("trigger")
@@ -99,7 +99,7 @@ def check_config(cfg, booted: bool = True) -> list:
         if (port.hub_compatible is None and not port.links) or not declared:
             continue
         try:
-            from nxs.cam import packs as cam_packs
+            from nxs.cam import hubs
             from nxs.cam import topology as cam_topo
             from nxs.cam.contracts import InfeasibleConfig
             from nxs.cam.descriptors import resolve_mode
@@ -116,7 +116,7 @@ def check_config(cfg, booted: bool = True) -> list:
             findings.append(Finding(where, "no camera port carries this declaration"))
             continue
         try:
-            pack = cam_packs.pack_for(topology)
+            hub = hubs.for_topology(topology)
         except Exception as exc:
             findings.append(Finding.of(where, exc))
             continue
@@ -134,7 +134,7 @@ def check_config(cfg, booted: bool = True) -> list:
                 continue
             try:
                 declared_modes[link.name] = resolve_mode(
-                    pack.descriptor(link.sensor_compatible), token)
+                    hub.descriptor(link.sensor_compatible), token)
             except InfeasibleConfig as exc:
                 refused = True
                 findings.append(Finding(
@@ -146,7 +146,7 @@ def check_config(cfg, booted: bool = True) -> list:
         # A link with no declared mode runs the highest mode the port's
         # laws admit (`on` resolves it the same way); that mode is judged.
         try:
-            resolved = _resolve_modes(pack.flows(), pack, list(cams), declared_modes, topology)
+            resolved = _resolve_modes(hub.flows(), hub, list(cams), declared_modes, topology)
         except InfeasibleConfig as exc:
             findings.append(Finding.of(f"{where}.camera.mode", exc))
             continue
@@ -154,11 +154,11 @@ def check_config(cfg, booted: bool = True) -> list:
         # and Bayer phase, so the port's boot table carries one of each.
         from nxs.host import capture_table as tables
         left_out = {m.key: m for m in tables.excluded_rows(
-            pack, tables.port_sensors(pack, topology), **tables.table_layout(pack, topology))}
+            hub, tables.port_sensors(hub, topology), **tables.table_layout(hub, topology))}
         if left_out:
-            depth, phase = tables.table_format(tables.port_table(pack, topology))
+            depth, phase = tables.table_format(tables.port_table(hub, topology))
             for link in cams:
-                sen = pack.descriptor(link.sensor_compatible)
+                sen = hub.descriptor(link.sensor_compatible)
                 geo = sen.modes[resolved[link.name]]["geometry"]
                 row = left_out.get((sen.compatible, int(geo["width"]), int(geo["height"]),
                                     int(geo["bit_depth"])))
@@ -181,7 +181,7 @@ def check_config(cfg, booted: bool = True) -> list:
             host = host_layer.current()
             if booted and host.booted_modes(topology.i2c_bus):
                 for link in cams:
-                    sen = pack.descriptor(link.sensor_compatible)
+                    sen = hub.descriptor(link.sensor_compatible)
                     geo = sen.modes[resolved[link.name]]["geometry"]
                     if host.mode_index(topology.i2c_bus, sen.compatible, geo["width"],
                                        geo["height"], geo["bit_depth"],
@@ -218,15 +218,16 @@ def check_config(cfg, booted: bool = True) -> list:
                          else "sync.fps" if port.sync_fps is not None
                          else f"links.{min(declared)}.camera.fps" if declared else "sync")
                 try:
-                    pack.flows().build_fsync(pack, topology, topology.synced_fps, modes=resolved)
+                    hub.flows().build_fsync(hub, topology, topology.synced_fps, modes=resolved)
                 except InfeasibleConfig as exc:
-                    findings.append(Finding.of(f"{where}.{label}", exc))
-                except Exception as exc:  # a pack without the trigger overlay
+                    rated = any(alt.startswith("fps") for alt in exc.alternatives)
+                    findings.append(Finding.of(f"{where}.{label if rated else 'sync'}", exc))
+                except Exception as exc:  # a hub without the trigger overlay
                     findings.append(Finding.of(f"{where}.camera.sync", exc))
         else:
             # Every link's declared rate (its own, else the port's) is
             # judged by its resolved mode: the lawful range on the port,
-            # then the pack's timing law at that rate's VMAX (the same laws
+            # then the hub's timing law at that rate's VMAX (the same laws
             # `on` composes with); free-running links keep their own frames.
             from nxs.cam import timing as cam_timing
             for link in cams:
@@ -238,7 +239,7 @@ def check_config(cfg, booted: bool = True) -> list:
                        else f"links.{link.name}.camera.fps")
                 at = f" (link {link.name}, {link_mode})" if len(cams) > 1 else ""
                 refusal = cam_timing.free_run_refusal(
-                    pack, link, link_mode, float(fps), topology=topology)
+                    hub, link, link_mode, float(fps), topology=topology)
                 if refusal:
                     fact, alternatives = parse_refusal(refusal)
                     findings.append(Finding(f"{where}.{key}", f"{fact}{at}", alternatives))
@@ -250,14 +251,14 @@ def check_config(cfg, booted: bool = True) -> list:
             fact = declared_exposure_fact(topology, synced)
             findings.append(Finding(f"{where}.camera.exposure_us", fact, ["drop the key"]))
         if port.camera_gain_db is not None:
-            # The lock `on` writes, judged by the pack's laws.
-            lock = getattr(pack.flows(), "build_gain_lock", None)
+            # The lock `on` writes, judged by the hub's laws.
+            lock = getattr(hub.flows(), "build_gain_lock", None)
             if lock is None:
                 findings.append(Finding(f"{where}.camera.gain_db",
-                                        f"pack {pack.name} writes no gain lock", ["drop the key"]))
+                                        f"hub {hub.name} writes no gain lock", ["drop the key"]))
             else:
                 try:
-                    lock(pack, topology, port.camera_gain_db, synced)
+                    lock(hub, topology, port.camera_gain_db, synced)
                 except InfeasibleConfig as exc:
                     findings.append(Finding.of(f"{where}.camera.gain_db", exc))
 
@@ -265,20 +266,20 @@ def check_config(cfg, booted: bool = True) -> list:
         for i, spec in enumerate(unit.sensors or []):
             where = f"units.{unit.name}.sensors[{i}]"
             try:
-                from nxs.suite.reconcile import load_unit_driver
-                drv_cls = load_unit_driver(spec.driver)
+                from nxs.suite.reconcile import load_click_personality
+                cls = load_click_personality(spec.personality)
             except Exception as exc:
                 findings.append(Finding.of(where, exc))
                 continue
             try:
-                compiled = drv_cls().compile(dict(spec.config))
+                compiled = cls().compile(dict(spec.config))
             except Exception as exc:
                 findings.append(Finding.of(where, exc))
                 continue
-            unknown = set(spec.config) - sensor_allowed_keys(drv_cls,
+            unknown = set(spec.config) - sensor_allowed_keys(cls,
                                                              compiled)
             if unknown:
-                valid = sorted(sensor_allowed_keys(drv_cls, compiled))
+                valid = sorted(sensor_allowed_keys(cls, compiled))
                 findings.append(_KeyFinding(
                     where, f"unknown config key(s) {', '.join(sorted(unknown))} "
                            f"(valid: {', '.join(valid)})", valid))
@@ -286,28 +287,28 @@ def check_config(cfg, booted: bool = True) -> list:
 
 
 def _stale_hub_findings(name: str, port) -> list:
-    """The declaration names a hub and a camera its pack does not serve."""
+    """The declaration names a hub and a camera no installed cam personality describes."""
     if port.hub_compatible is None or not port.hub_source or not port.links:
         return []
     try:
-        from nxs.cam import packs as cam_packs
+        from nxs.cam import hubs
         from nxs.cam import topology as cam_topo
         from nxs.suite.schema_ports import WIRING_ALTERNATIVE
-        pack = cam_packs.pack_for(cam_topo.port_topology(port))
-        served = sorted(pack.descriptor(chip).compatible for chip in pack.sensors())
-        rides = getattr(pack.flows(), "LINK_VC", None) or {}
+        hub = hubs.for_topology(cam_topo.port_topology(port))
+        served = sorted(hub.descriptor(chip).compatible for chip in hub.sensors())
+        rides = getattr(hub.flows(), "LINK_VC", None) or {}
     except Exception:
-        return []        # a pack that does not load is the other checks' finding
+        return []        # a hub that does not load is the other checks' finding
     findings = [Finding(f"ports.{name}.links.{link.name}",
-                        f"{port.hub_source} names hub {port.hub_compatible} and its pack "
-                        f"serves no {link.camera}",
+                        f"{port.hub_source} names hub {port.hub_compatible}, and no installed "
+                        f"cam personality describes {link.camera}",
                         [WIRING_ALTERNATIVE]
                         + [f"ports.{name}.links.{link.name}.camera: {c}" for c in served])
                 for link in port.links if link.camera and link.camera not in served]
-    # The pack's programs fix the channel each link rides, and with it the
+    # The hub's programs fix the channel each link rides, and with it the
     # capture node and the host alias the head answers at; a wiring that
     # says otherwise steers the wrong head. A link that declares no channel
-    # takes the pack's.
+    # takes the hub's.
     findings += [Finding(f"ports.{name}.links.{link.name}.csi_vc",
                          f"link {link.name} rides virtual channel {rides[link.name]} "
                          f"behind {port.hub_compatible}, and the wiring declares "

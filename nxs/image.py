@@ -35,7 +35,7 @@ SEAL_NONCE_SIZE = NxsDriverImage.SEAL_NONCE_SIZE
 MAX_TRAILER_SIZE = NxsDriverImage.MAX_TRAILER_SIZE
 _TRAILER_RECORD_HEADER = struct.Struct("<BH")
 
-IMAGE_KIND_NAMES = {ImageKind.DRIVER: 'driver', ImageKind.CAMERA: 'camera',
+IMAGE_KIND_NAMES = {ImageKind.DRIVER: 'click', ImageKind.CAMERA: 'cam',
                     ImageKind.HUB: 'hub'}
 #: The NXS minor that introduced a kind; an image of that kind never asks
 #: for less, whatever its opcodes need.
@@ -169,7 +169,7 @@ def serialize(compiled: CompiledDriver) -> bytes:
                         len(name_bytes), len(compiled.params),
                         len(compiled.output_fields), probe_len)
 
-    # Driver name
+    # Personality name
     buf += name_bytes
 
     # Bytecode section: the nonce precedes the length only when sealed.
@@ -179,7 +179,7 @@ def serialize(compiled: CompiledDriver) -> bytes:
     buf += compiled.bytecode
 
     # Probe block: WHO_AM_I anchor + candidate I²C addresses; empty for a
-    # stream driver.
+    # stream personality.
     wai_reg = getattr(compiled, 'who_am_i_reg', 0) or 0
     wai_values = list(getattr(compiled, 'who_am_i_values', []) or [])[:16]
     i2c_addrs = list(getattr(compiled, 'i2c_addrs', []) or [])[:8]

@@ -1,13 +1,13 @@
 # Copyright (c) 2026 Aliensense.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The experimental switch: `nxs --experimental …` reads a pack root and the
-experimental overlays ($NXS_CAM_DESCRIPTORS, $NXS_CAM_EXPERIMENTAL) and takes
+"""The experimental switch: `nxs --experimental …` reads a hub root and the
+experimental overlays ($NXS_CAM_HUBS, $NXS_CAM_PERSONALITIES, $NXS_CAM_EXPERIMENTAL) and takes
 a development personality store.
 
-Without it the tool is the product: the shipped pack and the release's
+Without it the tool is the product: the shipped hub and the release's
 store, every mode their programs carry. The flag sets `NXS_EXPERIMENTAL=1`
-so a daemon, an MCP subprocess and the pack loader in another process agree.
+so a daemon, an MCP subprocess and the hub loader in another process agree.
 """
 
 from __future__ import annotations

@@ -51,8 +51,8 @@ def cmd_store_ls(t, args):
                 name = info.name
         elif i == active:
             # No per-slot peek on this transport: the active slot's
-            # driver is loaded, so its name is readable from the device.
-            name = t.read_driver_name()
+            # personality is loaded, so its name is readable from the device.
+            name = t.read_personality_name()
         if name:
             extras = []
             kind = getattr(info, 'kind', None)

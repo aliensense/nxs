@@ -18,13 +18,13 @@ def candidates() -> List[Tuple[str, type, dict]]:
     """The (module, class, config) trials: every personality the tool
     knows, I2C first, then SPI, UART last. A two-bus part is tried once
     per bus."""
-    from nxs.suite.reconcile import (DriverNotFound, known_driver_modules,
-                                     load_unit_driver)
+    from nxs.suite.reconcile import (ClickPersonalityNotFound, known_click_personalities,
+                                     load_click_personality)
     passes = {"i2c": [], "spi": [], "uart": [], "other": []}
-    for name in known_driver_modules():
+    for name in known_click_personalities():
         try:
-            cls = load_unit_driver(name)
-        except DriverNotFound:
+            cls = load_click_personality(name)
+        except ClickPersonalityNotFound:
             continue
         buses = tuple(getattr(cls, "BUSES", None) or ())
         if not buses:

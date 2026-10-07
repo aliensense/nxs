@@ -4,8 +4,8 @@ Copyright 2026 Aliensense
 The Python packages and the C headers of this distribution are licensed
 under the Apache License, Version 2.0 (LICENSE). The executor library,
 nxs/_lib/libnxs.so, is licensed under the NXS Runtime Library License
-(nxs/_lib/LICENSE). The descriptor pack under nxs/packs is licensed under
-the NXS Descriptor Pack License (its LICENSE-descriptors). The assets
+(nxs/_lib/LICENSE). The hub under nxs/hubs is licensed under
+the NXS Hub License (its LICENSE-hub). The assets
 tarball, nxs-assets-<version>.tar.gz, is licensed under the NXS Assets
 License (the LICENSE at its root).
 

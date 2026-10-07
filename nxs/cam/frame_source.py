@@ -83,9 +83,34 @@ def frames(port: str, link: str, count: Optional[int] = None) -> Iterator[Frame]
                 raise
 
 
+def _restart_output(topology: Topology) -> None:
+    """Close and open the port's output under a session just opened, so the
+    capture stack sees the stream start: the gate every choreographed
+    capture switches, each write under the bus lock."""
+    from nxs.cam.select import _hub_for
+    from nxs.cam.verbs import verify
+
+    hub = _hub_for(topology)
+    gate = verify.csi_gate(hub, hub.flows(), topology)
+    gate(False)
+    gate(True)
+
+
+def _restart_output_or_raise(topology: Topology, label: str) -> None:
+    """`_restart_output` with the tool's exits (a refused gate, a held bus)
+    turned into the RuntimeError this module's callers handle."""
+    try:
+        _restart_output(topology)
+    except SystemExit as exc:
+        raise RuntimeError(f"{label}: the output did not restart: {exc}") from None
+
+
 def _session(port: str, link: str, count: Optional[int]) -> Iterator[Frame]:
     """One capture session on the link's node, ended by `count`, an end of
-    stream, or an error (a RuntimeError)."""
+    stream, or an error (a RuntimeError). A port's first session opens on
+    a running output and never sees the stream start, so a session with
+    no frame by its first wait has the output restarted under it, once; a
+    session beside a delivering one has its frames by then."""
     try:
         import numpy as np
     except ImportError as exc:
@@ -105,12 +130,16 @@ def _session(port: str, link: str, count: Optional[int]) -> Iterator[Frame]:
     bus = pipeline.get_bus()
     pipeline.set_state(Gst.State.PLAYING)
     index = 0
+    restarted = False
     try:
         while count is None or index < count:
             sample = sink.emit("try-pull-sample", 2 * Gst.SECOND)
             if sample is None:
                 message = bus.pop_filtered(Gst.MessageType.ERROR | Gst.MessageType.EOS)
                 if message is None:
+                    if index == 0 and not restarted:
+                        _restart_output_or_raise(port_topology(port), f"{port}/{link}")
+                        restarted = True
                     continue
                 if message.type == Gst.MessageType.ERROR:
                     err, _debug = message.parse_error()

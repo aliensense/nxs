@@ -15,7 +15,7 @@ STORE_SLOTS = 8
 
 @dataclass
 class UnitDrift:
-    driver: bool = False
+    personality: bool = False
     shape: bool = False
     params: Dict[str, Tuple[object, object]] = field(default_factory=dict)
     egress: Dict[str, Tuple[object, object]] = field(default_factory=dict)
@@ -23,14 +23,14 @@ class UnitDrift:
     orientation: bool = False
 
     def any(self) -> bool:
-        return (self.driver or self.shape or bool(self.params)
+        return (self.personality or self.shape or bool(self.params)
                 or bool(self.egress) or self.fw or self.orientation)
 
     def kinds(self) -> List[str]:
         """Render labels, most invasive first."""
         kinds = []
-        if self.driver:
-            kinds.append("driver")
+        if self.personality:
+            kinds.append("personality")
         if self.shape:
             kinds.append("shape")
         if self.params:
@@ -92,9 +92,9 @@ def firmware_drift(unit: UnitSpec, state: SuiteState, transport,
     return runs is None
 
 
-def driver_slots(transport) -> List[int]:
-    """The populated store slots that hold a sensor personality: every one
-    but a camera personality's, which the camera steps own. A slot the unit
+def click_slots(transport) -> List[int]:
+    """The populated store slots that hold a click personality: every one
+    but a cam personality's, which the camera steps own. A slot the unit
     refuses to describe counts as a sensor slot; a transport that cannot
     peek a slot counts every populated one."""
     from nxs.client import ERRNO_EBUSY, DeviceRefused, SupportsSlotPeek
@@ -144,26 +144,26 @@ def detect_unit_drift(unit: UnitSpec, panel: list, transport,
                       egress=egress_drift(unit, transport),
                       orientation=orientation_drift(unit, transport))
     if not panel:
-        # Declared-empty (`sensors: []`): a sensor personality running or
-        # stored is driver drift. An unmanaged panel (key absent) is never drift.
+        # Declared-empty (`sensors: []`): a click personality running or
+        # stored is personality drift. An unmanaged panel (key absent) is never drift.
         if unit.sensors is not None and (
-                transport.read_driver_name() or driver_slots(transport)):
-            drift.driver = True
+                transport.read_personality_name() or click_slots(transport)):
+            drift.personality = True
         return drift
 
     names = [compiled.name for _, compiled in panel]
-    active = transport.read_driver_name()
+    active = transport.read_personality_name()
     if active not in names:
-        drift.driver = True
+        drift.personality = True
         return drift
-    # A driver that is not measuring is not the manifest realized: one that
+    # A personality that is not measuring is not the manifest realized: one that
     # never probed parks in PROBE_FAILED until a host command intervenes, a
     # stopped one waits in LOADING. Either is redeployed, and the deploy's
     # own verdict names why it does not come up.
     if transport.read_runner_state() != RunnerStates.RunnerState.MEASURING:
-        drift.driver = True
+        drift.personality = True
         return drift
-    if len(driver_slots(transport)) != len(panel) \
+    if len(click_slots(transport)) != len(panel) \
             or state.unit(unit.name).get("panel_hash") != expected_hash:
         drift.shape = True
         return drift

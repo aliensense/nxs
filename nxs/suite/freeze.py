@@ -1,7 +1,8 @@
 """`nxs tune --freeze`: adopt a unit's live tuning into the manifest, the
-inverse of `switch`. It captures the active driver's full live parameter set
-for units and drivers the manifest already declares; the write keeps comments
+inverse of `switch`. It captures the active personality's full live parameter set
+for units and personalities the manifest already declares; the write keeps comments
 and layout."""
+import dataclasses
 import io
 import os
 
@@ -12,7 +13,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 from nxs.client import exc_detail
-from nxs.suite.reconcile import load_unit_driver
+from nxs.suite.reconcile import load_click_personality
 from nxs.suite.schema import (ManifestError, SuiteConfig, UnitSpec,
                               device_proves_patch, parse_device_version,
                               parse_version)
@@ -37,7 +38,7 @@ class FreezeReport:
 def freeze_suite(cfg: SuiteConfig, config_path: str, *,
                  only_unit: Optional[str] = None, dry_run: bool = False,
                  pin_firmware: bool = False, opener=None,
-                 drivers_dir: "str | None" = None) -> List[FreezeReport]:
+                 personalities_dir: "str | None" = None) -> List[FreezeReport]:
     """Freeze the selected unit(s); write the manifest once at the end. The
     opener defaults to the one `nxs.transports` holds at the call."""
     opener = opener or transports.open_client
@@ -46,7 +47,7 @@ def freeze_suite(cfg: SuiteConfig, config_path: str, *,
         if only_unit is not None and unit.name != only_unit:
             continue
         reports.append(_freeze_unit(unit, pin_firmware=pin_firmware,
-                                    opener=opener, drivers_dir=drivers_dir))
+                                    opener=opener, personalities_dir=personalities_dir))
     changed = [r for r in reports if r.ok and r.changed]
     if changed and not dry_run:
         _write_manifest(config_path, changed)
@@ -54,10 +55,10 @@ def freeze_suite(cfg: SuiteConfig, config_path: str, *,
 
 
 def _freeze_unit(unit: UnitSpec, *, pin_firmware: bool, opener,
-                 drivers_dir) -> FreezeReport:
+                 personalities_dir) -> FreezeReport:
     report = FreezeReport(name=unit.name)
     try:
-        panel = [(spec, load_unit_driver(spec.driver, drivers_dir)().compile(spec.config))
+        panel = [(spec, load_click_personality(spec.personality, personalities_dir)().compile(spec.config))
                  for spec in (unit.sensors or [])]
     except Exception as e:
         report.ok = False
@@ -94,16 +95,16 @@ def _freeze_unit(unit: UnitSpec, *, pin_firmware: bool, opener,
                             + " or ".join(l.describe() for l in unit.links))
             return report
 
-        active = transport.read_driver_name()
+        active = transport.read_personality_name()
         if not active:
             report.ok = False
-            report.error = "no active driver to freeze"
+            report.error = "no active personality to freeze"
             return report
         index = next((i for i, (_, compiled) in enumerate(panel)
                       if compiled.name == active), None)
         if index is None:
             report.ok = False
-            report.error = (f"active driver {active} is not declared for "
+            report.error = (f"active personality {active} is not declared for "
                             f"this unit — declare it in the manifest (or "
                             f"redeploy with `nxs switch`) before "
                             f"freezing")
@@ -113,7 +114,7 @@ def _freeze_unit(unit: UnitSpec, *, pin_firmware: bool, opener,
         _, compiled = panel[index]
         desired = {p.name: p.current for p in compiled.params}
         if set(live) != set(desired):
-            # A same-named driver serving a different parameter set is a different
+            # A same-named personality serving a different parameter set is a different
             # revision; adopting its values would not reproduce.
             detail = []
             if extra := sorted(set(live) - set(desired)):
@@ -122,9 +123,9 @@ def _freeze_unit(unit: UnitSpec, *, pin_firmware: bool, opener,
                 detail.append(f"host-only: {', '.join(missing)}")
             report.ok = False
             report.error = (f"device parameter set does not match the "
-                            f"compiled {compiled.name} driver "
+                            f"compiled {compiled.name} personality "
                             f"({'; '.join(detail)}) — the unit runs a "
-                            f"different driver revision; redeploy with "
+                            f"different personality revision; redeploy with "
                             f"`nxs switch` before freezing")
             return report
         report.sensor_index = index
@@ -322,21 +323,20 @@ def _geometry_token(hints) -> str:
     return ""
 
 
-def _mode_token(pack, sensor: str, geometry: str, mode: Optional[str]) -> str:
-    """The token the manifest resolves back to the running mode: the
-    geometry when it names one mode of the sensor, the mode's own name
-    when several modes share it."""
-    if not geometry or not mode or pack is None:
-        return geometry
-    from nxs.cam.contracts import InfeasibleConfig
+def _mode_name(hub, sensor: str, geometry: str, mode: Optional[str]) -> Optional[str]:
+    """The mode a link runs, by name: the record's own token or the viewer's
+    geometry resolved against the sensor's modes; the token itself when it
+    names several modes or a sensor nothing describes."""
+    token = str(mode) if mode else geometry
+    if not token:
+        return None
+    if not sensor or hub is None:
+        return token
     from nxs.cam.descriptors import resolve_mode
     try:
-        resolve_mode(pack.descriptor(sensor), geometry)
-    except InfeasibleConfig as exc:
-        return mode if getattr(exc, "alternatives", None) else geometry
-    except Exception:
-        return geometry
-    return geometry
+        return resolve_mode(hub.descriptor(sensor), token)
+    except Exception:        # noqa: BLE001 (several modes, or a sensor nothing describes)
+        return token
 
 
 def _link_sensor(topology, name: str) -> str:
@@ -346,96 +346,158 @@ def _link_sensor(topology, name: str) -> str:
     return ""
 
 
-def port_block(topology, sync=None, viewer=None, viewers=None,
-               sensors=None, modes=None, rates=None) -> dict:
-    """One `ports:` entry from a port: bus, lanes, hub, links with their sensors
-    and capture ids, and the live port's camera mode and sync. A mixed hub
-    declares the mode per link; ``modes`` names the mode each link runs,
-    ``rates`` the free-run rate each link was programmed for (written per
-    link when they differ, at the port when they agree)."""
-    from nxs.cam import packs
+#: What the declaration carries from the file it rewrites: the bus and the
+#: lane count an operator pinned, a link's clock, and the port's exposure
+#: and gain. The booted tree's other facts (the capture ids, the addresses
+#: the wiring translates) are the report's alone.
+_CARRIED_PORT_KEYS = ("bus", "csi_lanes")
+_CARRIED_LINK_KEYS = ("inck_hz",)
+_CARRIED_CAMERA_KEYS = ("exposure_us", "gain_db")
+HUB_ADDR_DEFAULT = 0x6A
+POD_TARGET_DEFAULT = 0x30
 
+
+def port_block(topology, sync=None, modes=None, rates=None, gain_db=None, units=None,
+               sensors=None, viewers=None, declared=None, viewer=None) -> dict:
+    """One `ports:` entry in the declaration's one spelling: per port `hub`,
+    `sync: {source, fps}` and `camera: {gain_db}`; per link `camera:
+    {sensor, mode, fps}` and `unit: {name, alias}`. `modes` names the mode
+    each link runs and `rates` its free-run rate; `units` the pod on each
+    link ({name, alias}); `viewers` (a geometry per link, `viewer` the
+    port's) stands in for a mode no record names. `declared` is the entry
+    the file holds: its host facts, its pods where `units` is silent, and
+    a link's clock are carried, and nothing else of it."""
+    from nxs.cam import hubs
+
+    declared = declared if isinstance(declared, dict) else {}
+    declared_links = declared.get("links") if isinstance(declared.get("links"), dict) else {}
     sensors = sensors or {}
-    # A port's record outlives its cameras: the mode, the sync and the rates
-    # it holds count for the links that carry a camera today.
-    cameras = {l.name for l in topology.links if sensors.get(l.name) or l.sensor_compatible}
-    viewers = {n: v for n, v in (viewers or {}).items() if n in cameras}
-    modes = {n: v for n, v in (modes or {}).items() if n in cameras}
-    rates = {str(k): float(v) for k, v in (rates or {}).items() if str(k) in cameras}
-    if not cameras:
-        sync = viewer = None
+    modes = {str(k): v for k, v in (modes or {}).items() if v}
+    rates = {str(k): float(v) for k, v in (rates or {}).items() if v}
+    viewers = dict(viewers or {})
+    if viewer and not viewers:
+        viewers = {link.name: viewer for link in topology.links}
     try:
-        pack = packs.pack_for(topology)
-    except Exception:
-        pack = None
-    tokens = {name: _mode_token(pack, sensors.get(name) or _link_sensor(topology, name),
-                                _geometry_token(h), modes.get(name))
-              for name, h in viewers.items()}
-    present = {name: t for name, t in tokens.items() if t}
-    kinds = {sensors.get(l.name) or l.sensor_compatible for l in topology.links}
-    # Per-link modes when the links run different geometries, or when a
-    # mixed hub has only some links up.
-    per_link = (len(set(present.values())) > 1
-                or (len(kinds) > 1 and bool(present)
-                    and len(present) < len(topology.links)))
-    synced = bool(sync and sync.get("source") == "fsync" and sync.get("fps"))
-    # Free-running links may run different rates; one rate is the port's.
-    per_link_rates = (not synced and len({round(r, 6) for r in rates.values()}) > 1)
+        hub = hubs.for_topology(topology)
+    except Exception:        # noqa: BLE001 (a hub nothing serves names its mode by token)
+        hub = None
+    # A port's record outlives its cameras: the sync and the gain it holds
+    # count for the links that carry a camera today.
+    cameras = [l for l in topology.links if sensors.get(l.name) or l.sensor_compatible]
+    synced = bool(cameras and sync and sync.get("source") == "fsync")
+    if not cameras:
+        gain_db = None
+    block: dict = {}
+    for key in _CARRIED_PORT_KEYS:
+        if key in declared:
+            block[key] = declared[key]
+    if not topology.is_direct:
+        extras = {}
+        if str(getattr(topology, "hub_driver", "nxs")) != "nxs":
+            extras["driver"] = str(topology.hub_driver)
+        if int(getattr(topology, "des_addr", HUB_ADDR_DEFAULT)) != HUB_ADDR_DEFAULT:
+            extras["addr"] = hex_address(topology.des_addr)
+        block["hub"] = ({"compatible": topology.des_compatible, **extras} if extras
+                        else topology.des_compatible)
+    if synced:
+        block["sync"] = {"source": "fsync"}
+        if sync.get("fps"):
+            block["sync"]["fps"] = _rate_value(float(sync["fps"]))
+    camera = {}
+    old_camera = declared.get("camera") if isinstance(declared.get("camera"), dict) else {}
+    for key in _CARRIED_CAMERA_KEYS:
+        if key in old_camera:
+            camera[key] = old_camera[key]
+    if gain_db is not None:
+        camera["gain_db"] = _rate_value(float(gain_db))
+    if camera:
+        block["camera"] = camera
     links = {}
     for link in topology.links:
+        old = declared_links.get(link.name) if isinstance(declared_links.get(link.name), dict) else {}
+        entry: dict = {}
         sensor = sensors.get(link.name) or link.sensor_compatible
-        # A direct port's link has no SerDes wiring to write down; a head
-        # no one names has no camera row.
-        entry = ({} if topology.is_direct else
-                 {"ser": link.ser_compatible, "des_window": hex_address(link.des_window),
-                  "csi_vc": int(link.csi_vc)})
         if sensor:
-            entry = {"camera": sensor, **entry}
-        if per_link and tokens.get(link.name):
-            entry["camera"] = {"sensor": sensor, "mode": tokens[link.name]}
-        if per_link_rates and link.name in rates:
-            if not isinstance(entry["camera"], dict):
-                entry["camera"] = {"sensor": sensor}
-            entry["camera"]["fps"] = _rate_value(rates[link.name])
-        if link.capture_id is not None:
-            entry["capture_id"] = int(link.capture_id)
-        # Where the wiring says the sensor answers, when it is not the
-        # descriptor's own address: the node and the tool address it there.
-        if link.sensor_addr is not None:
-            entry["sensor_addr"] = hex_address(link.sensor_addr)
-        links[link.name] = entry
-    block = {
-        "bus": topology.i2c_bus,
-        "csi_lanes": int(topology.csi_lanes),
-        "hub": {"compatible": topology.des_compatible,
-                "driver": topology.hub_driver},
-        "links": links,
-    }
-    if topology.is_direct:
-        del block["hub"]            # naming no hub is what makes the port direct
-    token = ""
-    if not per_link:
-        any_link = next(iter(topology.links), None)
-        one_mode = next(iter(modes.values()), None) if len(set(modes.values())) == 1 else None
-        token = _mode_token(pack, sensors.get(any_link.name) if any_link else "",
-                            _geometry_token(viewer), one_mode) if any_link else _geometry_token(viewer)
-    if token:
-        if synced:
-            block["camera"] = {"mode": f"{token}@{float(sync['fps']):g}",
-                               "sync": "fsync"}
-        elif rates and not per_link_rates:
-            block["camera"] = {"mode": f"{token}@{_rate_value(next(iter(rates.values()))):g}"}
-        else:
-            block["camera"] = {"mode": token}
-    elif synced:
-        block["camera"] = {"sync": "fsync"}
-        block["sync"] = {"source": "fsync", "fps": float(sync["fps"])}
+            cam = {"sensor": sensor}
+            mode = _mode_name(hub, sensor, _geometry_token(viewers.get(link.name)), modes.get(link.name))
+            if mode:
+                cam["mode"] = mode
+            if not synced and link.name in rates:
+                cam["fps"] = _rate_value(rates[link.name])
+            entry["camera"] = cam
+        unit = (units or {}).get(link.name)
+        if unit is None and isinstance(old.get("unit"), dict):
+            unit = old["unit"]
+        if unit:
+            ref = {"name": str(unit["name"])}
+            if unit.get("alias") is not None:
+                ref["alias"] = hex_address(int(unit["alias"]))
+            if unit.get("target") is not None and int(unit["target"]) != POD_TARGET_DEFAULT:
+                ref["target"] = hex_address(int(unit["target"]))
+            entry["unit"] = ref
+        for key in _CARRIED_LINK_KEYS:
+            if key in old:
+                entry[key] = old[key]
+        if entry:
+            links[link.name] = entry
+    if links:
+        block["links"] = links
     return block
 
 
-#: Port keys a freeze owns entirely: present when the live port carries
-#: the behavior, removed when it does not.
-_FROZEN_BEHAVIOR_KEYS = ("sync", "camera")
+def port_intent(port) -> dict:
+    """What a parsed port declares, as `port_block` takes it: its sync, the
+    mode and free-run rate of each link, the pod on each link and the
+    port's gain. A port-level mode, rate or sync (the shorthand a file may
+    still carry) folds onto every camera link, so the next save writes the
+    one spelling."""
+    synced = port.sync_source == "fsync"
+    fps = port.sync_fps if port.sync_fps is not None else (port.camera_fps if synced else None)
+    return {
+        "sync": {"source": port.sync_source, "fps": fps},
+        "modes": {l.name: l.camera_mode or port.camera_mode for l in port.links},
+        "rates": {l.name: l.camera_fps if l.camera_fps is not None
+                  else (None if synced else port.camera_fps) for l in port.links},
+        "units": {l.name: {"name": l.unit.name, "alias": l.unit.alias, "target": l.unit.target}
+                  for l in port.links if l.unit is not None},
+        "gain_db": port.camera_gain_db,
+    }
+
+
+def _declared_owner(topology, declared: dict):
+    """`topology` with the hub's owner as the declaration names it: the booted
+    tree does not say whether a kernel driver or the tool runs the hub."""
+    hub = declared.get("hub")
+    driver = hub.get("driver") if isinstance(hub, dict) else None
+    if not driver or topology.is_direct:
+        return topology
+    return dataclasses.replace(topology, hub_driver=str(driver))
+
+
+def port_wiring(topology, sensors=None) -> dict:
+    """What answered on a port, for `hardware.yaml`: the bus, the lane
+    count, the hub, and every link's wiring (serializer, window, channel,
+    capture id, addresses) with the sensor it carries."""
+    sensors = sensors or {}
+    links = {}
+    for link in topology.links:
+        entry = ({} if topology.is_direct else
+                 {"ser": link.ser_compatible, "des_window": hex_address(link.des_window),
+                  "csi_vc": int(link.csi_vc)})
+        sensor = sensors.get(link.name) or link.sensor_compatible
+        if sensor:
+            entry = {"camera": sensor, **entry}
+        if link.capture_id is not None:
+            entry["capture_id"] = int(link.capture_id)
+        if link.sensor_addr is not None:
+            entry["sensor_addr"] = hex_address(link.sensor_addr)
+        links[link.name] = entry
+    block = {"bus": topology.i2c_bus, "csi_lanes": int(topology.csi_lanes)}
+    if not topology.is_direct:
+        block["hub"] = {"compatible": topology.des_compatible, "driver": topology.hub_driver}
+    if links:
+        block["links"] = links
+    return block
 
 
 def freeze_ports(config_path: str, dry_run: bool = False,
@@ -446,15 +508,15 @@ def freeze_ports(config_path: str, dry_run: bool = False,
     wiring report to `generate`."""
     import io
 
-    from nxs.cam.packs import PackError
+    from nxs.cam.hubs import HubError
     from nxs.cam.topology import TopologyError, _ports_from_suite, discover_ports
     from nxs.suite.schema import hardware_path
     from nxs.cam import port_state
 
     # What discovery found, never the manifest read back: the platform's
-    # buses, the booted tree's lanes and ids, the pack's link shape. A port
-    # that serves the sensor on its own bus is no pack's shape: the walk
-    # wrote it down, and it is frozen as it stands, with or without a pack
+    # buses, the booted tree's lanes and ids, the hub's link shape. A port
+    # that serves the sensor on its own bus is no hub's shape: the walk
+    # wrote it down, and it is frozen as it stands, with or without a hub
     # that shapes the other ports.
     try:
         standing = {t.carrier.rsplit("/", 1)[-1]: t
@@ -463,7 +525,7 @@ def freeze_ports(config_path: str, dry_run: bool = False,
         standing = {}
     try:
         discovered, _ = discover_ports()
-    except PackError:
+    except HubError:
         if not standing:
             raise
         discovered = {}
@@ -473,15 +535,6 @@ def freeze_ports(config_path: str, dry_run: bool = False,
         if only_port not in candidates:
             raise ValueError(f"no camera port named {only_port} answers on this host")
         candidates = {only_port: candidates[only_port]}
-    ports = {}
-    for name, topology in sorted(candidates.items()):
-        own = port_state.port_record(topology)      # this port only
-        ports[name] = port_block(topology, sync=own.get("sync"),
-                                 viewer=own.get("viewer"),
-                                 viewers=own.get("viewers"),
-                                 sensors=own.get("sensors"),
-                                 modes=own.get("modes"),
-                                 rates=own.get("rates"))
     yaml_rt = _round_trip_yaml()
     if os.path.exists(config_path) and os.path.getsize(config_path) > 0:
         with open(config_path, encoding="utf-8") as f:
@@ -490,41 +543,22 @@ def freeze_ports(config_path: str, dry_run: bool = False,
     else:
         doc = {}
     existing = doc.setdefault("ports", {}) or {}
-    for name, block in ports.items():
-        entry = existing.setdefault(name, {})
-        # The frozen links carry what the tree and the port know; the
-        # unit riding a link is the operator's declaration and survives.
-        old_links = entry.get("links") if isinstance(entry.get("links"), dict) else {}
-        for link_name, link_entry in block["links"].items():
-            old = old_links.get(link_name) or {}
-            if "unit" in old and "unit" not in link_entry:
-                link_entry["unit"] = old["unit"]
-        # Who owns the hub is the operator's word too (a kernel-driven hub
-        # has no port state to freeze from).
-        old_hub = entry.get("hub") if isinstance(entry.get("hub"), dict) else {}
-        if "driver" in old_hub and "hub" in block:
-            block["hub"]["driver"] = old_hub["driver"]
-        for key, value in block.items():
-            entry[key] = value
-        # The block is the whole frozen declaration: a behavior key an earlier
-        # freeze wrote and the live port does not carry must not survive it.
-        for key in _FROZEN_BEHAVIOR_KEYS:
-            if key not in block:
-                entry.pop(key, None)
-    doc["ports"] = existing
-    # Rendered before the split: the block is the whole declaration, the
-    # two halves merged, which is what a reader wants to see.
-    merged = {n: dict(existing[n]) for n in sorted(ports)}
-    # Two files describe the rig: what is wired, and what you want of it.
-    # Split the frozen entries so a re-cable regenerates one and leaves the other.
-    wiring, intent = {}, {}
-    for name in sorted(ports):
-        wired, want = _split_entry(existing[name])
-        if wired:
-            wiring[name] = wired
-        if want:
-            intent[name] = want
-        existing[name] = want
+    wiring, merged = {}, {}
+    for name, topology in sorted(candidates.items()):
+        own = port_state.port_record(topology)      # this port only
+        # The block is the whole declaration of the port: what the operator
+        # pinned (the host facts, the pods, a link's addresses) is carried
+        # from the entry, the rest is the live port's.
+        declared = existing.get(name)
+        if not isinstance(declared, dict):
+            declared = {}
+        topology = _declared_owner(topology, declared)
+        block = port_block(topology, sync=own.get("sync"), viewer=own.get("viewer"),
+                           viewers=own.get("viewers"), sensors=own.get("sensors"),
+                           modes=own.get("modes"), rates=own.get("rates"), declared=declared)
+        existing[name] = block
+        merged[name] = dict(block)
+        wiring[name] = port_wiring(topology, sensors=own.get("sensors"))
     doc["ports"] = {n: existing[n] for n in existing if existing[n]}
     if not doc["ports"]:
         doc.pop("ports", None)
@@ -539,41 +573,6 @@ def freeze_ports(config_path: str, dry_run: bool = False,
             hw = hardware_path(config_path)
             _write_atomic(hw, lambda f: f.write(_render_hardware(wiring)))
     return out.getvalue()
-
-
-#: What only the report carries: the host's and the booted tree's facts.
-REPORT_ONLY_PORT_KEYS = {"csi_lanes"}
-REPORT_ONLY_LINK_KEYS = {"ser", "des_window", "csi_vc", "ser_addr", "sensor_addr",
-                         "tca_addr", "capture_id"}
-
-
-def _split_entry(entry: dict) -> tuple:
-    """Partition one port entry into (the report's wiring, the declaration):
-    the declaration keeps the bus, the hub, every link's sensor and unit and
-    the wants; the report keeps what answered, wiring included."""
-    from nxs.suite.schema import HARDWARE_LINK_KEYS, HARDWARE_PORT_KEYS
-
-    wiring, intent = {}, {}
-    for key, value in entry.items():
-        if key == "links":
-            continue
-        if key in HARDWARE_PORT_KEYS:
-            wiring[key] = value
-        if key not in REPORT_ONLY_PORT_KEYS:
-            intent[key] = value
-    wired_links, want_links = {}, {}
-    for name, link in (entry.get("links") or {}).items():
-        w = {k: v for k, v in link.items() if k in HARDWARE_LINK_KEYS}
-        i = {k: v for k, v in link.items() if k not in REPORT_ONLY_LINK_KEYS}
-        if w:
-            wired_links[name] = w
-        if i:
-            want_links[name] = i
-    if wired_links:
-        wiring["links"] = wired_links
-    if want_links:
-        intent["links"] = want_links
-    return wiring, intent
 
 
 def _render_hardware(ports: dict) -> str:
@@ -646,7 +645,7 @@ def run_freeze(config_path: str, only_unit: Optional[str] = None,
     if ports:
         try:
             block = freeze_ports(config_path, dry_run=dry_run, only_port=only_port)
-        except Exception as e:      # a silent tree, no pack, an unwritable path
+        except Exception as e:      # a silent tree, no hub, an unwritable path
             print(f"nxs tune: cannot freeze the ports: {e}", file=sys.stderr)
             return 1
         print(block, end="")

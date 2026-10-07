@@ -9,6 +9,7 @@ and nxsd realize through the functions below."""
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shutil
 from pathlib import Path
@@ -139,22 +140,22 @@ def tuning_hash(stack: str, rows: List[Dict[str, Any]],
     return hashlib.sha256(json.dumps(facts, sort_keys=True).encode()).hexdigest()[:16]
 
 
-def tuning_overrides(host, pack, bus: str) -> Dict[str, Dict[str, str]]:
+def tuning_overrides(host, hub, bus: str) -> Dict[str, Dict[str, str]]:
     """Per booted sensor, the vendor override its descriptor names
-    (`capture.tuning`: url and sha256); a sensor the pack has no
+    (`capture.tuning`: url and sha256); a sensor the hub has no
     descriptor for, or whose descriptor names none, is left out."""
-    from nxs.cam.packs import PackError
+    from nxs.cam.hubs import HubError
 
     out: Dict[str, Dict[str, str]] = {}
-    if pack is None:
+    if hub is None:
         return out
     for mode in host.booted_modes(bus):
         for compatible in mode.get("pool") or []:
             if compatible in out:
                 continue
             try:
-                capture = pack.descriptor(compatible).raw("capture") or {}
-            except PackError:
+                capture = hub.descriptor(compatible).raw("capture") or {}
+            except HubError:
                 continue
             tuning = capture.get("tuning") or {}
             if tuning.get("override_url") and tuning.get("sha256"):
@@ -200,13 +201,13 @@ def fetch_override(url: str, sha256: str, log=print) -> Path:
     return target
 
 
-def _pack_of(topology):
-    """The pack whose descriptors name the port's sensors, None when none
-    covers the port (a host whose sensors no pack knows builds no override)."""
-    from nxs.cam import packs
+def _hub_of(topology):
+    """The hub whose descriptors name the port's sensors, None when none
+    covers the port (a host whose sensors no hub knows builds no override)."""
+    from nxs.cam import hubs
 
     try:
-        return packs.pack_for(topology)
+        return hubs.for_topology(topology)
     except Exception:        # noqa: BLE001 (the build reports its own facts)
         return None
 
@@ -251,7 +252,7 @@ def build_tuning(host, topology, sensor_id: Optional[int] = None,
 
     port = port_state.port_name(topology)
     rows = _table_rows(host, topology.i2c_bus)
-    overrides = tuning_overrides(host, _pack_of(topology), topology.i2c_bus)
+    overrides = tuning_overrides(host, _hub_of(topology), topology.i2c_bus)
     digest = tuning_hash(host.stack(), rows, overrides)
     if sensor_id is None:
         sensor_id = _default_sensor_id(host, topology.i2c_bus)
@@ -299,7 +300,7 @@ def ensure_tuning(host, topology, log=print) -> Optional[str]:
     rows = _table_rows(host, topology.i2c_bus)
     if not rows:
         return None
-    overrides = tuning_overrides(host, _pack_of(topology), topology.i2c_bus)
+    overrides = tuning_overrides(host, _hub_of(topology), topology.i2c_bus)
     digest = tuning_hash(host.stack(), rows, overrides)
     badge = host.tuning_badge(port)
     record = tuning_record_path(port)
@@ -386,7 +387,7 @@ def _cmd_modes(args) -> int:
     return 0
 
 
-def generate(pack, topology, port_name: str, lanes: int,
+def generate(hub, topology, port_name: str, lanes: int,
              sensors: Optional[List[str]], out_dir: Path) -> List[Dict[str, Any]]:
     """Generate (and compile when dtc is present) the port's overlay into
     ``out_dir``: one record, both virtual channels. A port that serves the
@@ -402,26 +403,26 @@ def generate(pack, topology, port_name: str, lanes: int,
     direct = bool(topology is not None and topology.is_direct)
     node_addr = None
     if direct:
-        from nxs.cam.packs import native_sensor_address
+        from nxs.cam.hubs import native_sensor_address
         if sensors is None:
-            sensors = [pack.descriptor(link.sensor_compatible).name for link in topology.links]
+            sensors = [hub.descriptor(link.sensor_compatible).name for link in topology.links]
         # The node answers where the link's sensor does: its declared
         # address when the wiring names one, else the descriptor's own. A
         # wiring that found no sensor names no node, and no capture mode.
         if topology.links:
-            node_addr = native_sensor_address(pack, topology.links[0])
-    layout = tables.table_layout(pack, topology, int(lanes))
-    table = tables.capture_table(pack, sensors, **layout)
+            node_addr = native_sensor_address(hub, topology.links[0])
+    layout = tables.table_layout(hub, topology, int(lanes))
+    table = tables.capture_table(hub, sensors, **layout)
     if not table:
         from nxs.suite import PERSONALITY_DIR
         raise SystemExit(
-            f"nxs host: no capture modes for {port_name}: pack {pack.name!r} "
-            f"carries no sensor, no camera personality is installed under "
+            f"nxs host: no capture modes for {port_name}: hub {hub.name!r} "
+            f"carries no sensor, no cam personality is installed under "
             f"{PERSONALITY_DIR}, and no unit of the port has served one — "
             f"install the assets (nxs-assets-<version>.tar.gz, nxs assets install) "
             f"or upload a personality to the link's unit")
     out_dir.mkdir(parents=True, exist_ok=True)
-    dts = host.overlay(pack, port_name, lanes, sensors, direct=direct, node_addr=node_addr,
+    dts = host.overlay(hub, port_name, lanes, sensors, direct=direct, node_addr=node_addr,
                        fps=layout["default_fps"], bit_depth=layout["bit_depth"])
     name = gen.dtbo_basename(port_name, lanes, direct)
     dts_path = out_dir / name.replace(".dtbo", ".dts")
@@ -469,7 +470,7 @@ class BootTableRefused(RuntimeError):
         super().__init__(refusal)
 
 
-def reboot_rule(host, pack, topology, links, modes: Dict[str, str],
+def reboot_rule(host, hub, topology, links, modes: Dict[str, str],
                 install_overlays: bool = True,
                 vcs: Optional[Dict[str, int]] = None,
                 declared: Optional[Collection[str]] = None,
@@ -486,7 +487,7 @@ def reboot_rule(host, pack, topology, links, modes: Dict[str, str],
     the sentence; an overlay that is not generated or not installed raises
     BootTableRefused."""
     from nxs.cam import port_state
-    from nxs.cam.packs import native_sensor_address
+    from nxs.cam.hubs import native_sensor_address
     from nxs.host import capture_table as tables
 
     links = [l for l in links if getattr(l, "has_camera", True)]
@@ -508,7 +509,7 @@ def reboot_rule(host, pack, topology, links, modes: Dict[str, str],
             if topology.is_direct:
                 # The node on a port without a hub is the sensor's own
                 # address: the kernel's controls land nowhere else.
-                wanted = {int(vcs[link.name]): native_sensor_address(pack, link)
+                wanted = {int(vcs[link.name]): native_sensor_address(hub, link)
                           for link in links if link.name in vcs}
             else:
                 wanted = host.node_aliases(port_state.port_name(topology)) or {}
@@ -526,7 +527,7 @@ def reboot_rule(host, pack, topology, links, modes: Dict[str, str],
                                f"{int(wanted[int(vc)]):#04x} (booted {booted_addr:#04x}, "
                                f"link {link.name})")
     for link in links:
-        sen = pack.descriptor(link.sensor_compatible)
+        sen = hub.descriptor(link.sensor_compatible)
         mode = modes.get(link.name)
         if not mode:
             continue
@@ -538,7 +539,7 @@ def reboot_rule(host, pack, topology, links, modes: Dict[str, str],
                                 direct=bool(topology.is_direct))
         # The port's table at its lanes and rate: a direct port's carries
         # its one sensor's rows alone.
-        wanted_index = tables.port_index(pack, topology, sen, mode)
+        wanted_index = tables.port_index(hub, topology, sen, mode)
         if index is None:
             missing.append(f"{sen.compatible} {geo['width']}x{geo['height']} "
                            f"RAW{geo['bit_depth']}"
@@ -553,7 +554,7 @@ def reboot_rule(host, pack, topology, links, modes: Dict[str, str],
         elif wanted_index is not None:
             # The row's exposure ceiling is the driver's law for the frame:
             # a booted row with another one stretches the frame.
-            row = tables.port_table(pack, topology)[int(wanted_index)]
+            row = tables.port_table(hub, topology)[int(wanted_index)]
             wanted_ceiling = row.exposure_ceiling_us()
             booted_row = next((m for m in booted if int(m.get("index", -1)) == int(index)
                                and sen.compatible in (m.get("pool") or [])), None)
@@ -578,7 +579,7 @@ def reboot_rule(host, pack, topology, links, modes: Dict[str, str],
         # differs from the generated one is stale. The flag's pooled
         # table is never the booted one; it has no verdict here.
         try:
-            records = generate(pack, topology, port, int(lanes), None,
+            records = generate(hub, topology, port, int(lanes), None,
                                port_state.state_dir() / "host-overlays")
         except SystemExit:
             records = []
@@ -593,6 +594,30 @@ def reboot_rule(host, pack, topology, links, modes: Dict[str, str],
     stray = [] if declared is None else sorted(set(host.boot_entry_ports()) - {*declared, port})
     if not missing and not stale and not stray:
         return None
+    # The booted table's rows prove the modes alone. The rest of a generated
+    # overlay (the receiver's clock, a default exposure) is proven booted when
+    # the generated file is the one the host recorded as this boot's.
+    proven = all(host.booted_overlay_digest(Path(record["dtbo"]).name)
+                 == hashlib.sha256(Path(record["dtbo"]).read_bytes()).hexdigest()
+                 for record in records) if stale and not missing and not stray else False
+    if proven:
+        # A declaration put back after a reboot it asked for: the next boot
+        # needs the file that fits, and this boot needs no reboot.
+        say = report or (lambda line: print(f"{port}: {line}"))
+        for record in records:
+            compiled = Path(record["dtbo"])
+            if not install_overlays:
+                say(f"would install {compiled.name} (the booted table fits the declaration)")
+                continue
+            try:
+                where = host.refresh_overlay(compiled)
+            except NotImplementedError:
+                raise BootTableRefused([], "overlays install on a supported Jetson carrier only "
+                                           f"(this host: {host.describe()})") from None
+            except PermissionError as exc:
+                raise BootTableRefused([], boot_write_refusal(exc)) from None
+            say(f"installed {where} (the booted table fits the declaration)")
+        return None
     # One fact per line: the gap, the table, what was written, the next step.
     lines = ([f"the booted overlay on {port} lacks " + "; ".join(missing)] if missing
              else [f"the installed overlay on {port} is stale: its rows' facts moved"] if stale
@@ -605,7 +630,7 @@ def reboot_rule(host, pack, topology, links, modes: Dict[str, str],
         lines.append("nxs switch installs the port's overlay, then reboot")
         return "\n".join(lines)
     try:
-        records = records or generate(pack, topology, port, int(lanes), None,
+        records = records or generate(hub, topology, port, int(lanes), None,
                                       port_state.state_dir() / "host-overlays")
         # The entry the tool writes is the one the next boot takes: a
         # fresh host has no other that carries the port.

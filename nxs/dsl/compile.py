@@ -1,4 +1,4 @@
-"""The compile phase of a driver: probe and configure traced, the measure loop compiled, the image assembled."""
+"""The compile phase of a personality: probe and configure traced, the measure loop compiled, the image assembled."""
 
 from __future__ import annotations
 
@@ -15,16 +15,16 @@ from nxs.dsl.loop import _ASTCompiler
 
 
 class _CompilePhase:
-    """The `compile()` half of `SensorDriver`: the image from the traced probe and
+    """The `compile()` half of `ClickPersonality`: the image from the traced probe and
     configure and the compiled measure loop."""
 
     def compile(self, config: Optional[dict] = None) -> CompiledDriver:
-        """Compile the driver into VM bytecode. `config` is the sensor
+        """Compile the personality into VM bytecode. `config` is the sensor
         configuration dict (from YAML) passed to configure(); None means {}."""
         if self.BUS_KIND is None:
             raise CompileError(
-                f"{type(self).__name__} inherits SensorDriver directly; "
-                "use RegisterDriver or StreamDriver as the base class.")
+                f"{type(self).__name__} inherits ClickPersonality directly; "
+                "use RegisterClickPersonality or StreamClickPersonality as the base class.")
 
         if config is None:
             config = {}
@@ -78,7 +78,7 @@ class _CompilePhase:
         self._trace_phase = None
         configure_end = self._emitter._current_offset()
 
-        # Phase 3: AST-compile measure(); a camera personality halts instead
+        # Phase 3: AST-compile measure(); a cam personality halts instead
         # (its one pass is probe, configure, release the bus).
         if is_camera:
             self._emitter.emit(Op.HALT)
@@ -96,7 +96,7 @@ class _CompilePhase:
             ast_compiler = _ASTCompiler(
                 self._emitter, self._regs, trigger, sample_rate, self.BUS_KIND,
                 frame=getattr(self, 'FRAME', None),
-                driver=self,
+                personality=self,
                 drdy_base_hz=getattr(measure_fn, "_drdy_base_hz", 0))
             ast_compiler.compile_function(measure_fn)
 
@@ -104,7 +104,7 @@ class _CompilePhase:
         budget = self._budget_lines(probe_end, configure_end, len(bytecode))
 
         # Finalize patch map: build full value_map for each patch entry
-        # by compiling the driver with each valid parameter value
+        # by compiling the personality with each valid parameter value
         finalized_patches = self._finalize_patches(config)
 
         # Over the program cap the compile fails with the budget, never a
@@ -118,9 +118,9 @@ class _CompilePhase:
                 f"{cap} B VM program limit; the budget:\n"
                 f"{report}")
 
-        # Auto-declare the runtime `bus` param on every register driver from its
+        # Auto-declare the runtime `bus` param on every register personality from its
         # `BUSES` tuple; the first entry is the default. No bytecode is patched.
-        # A camera personality binds the pod bus and carries no bus switch.
+        # A cam personality binds the pod bus and carries no bus switch.
         if (self.BUS_KIND == BUS_REGISTER and 'bus' not in self._params
                 and not is_camera):
             buses = getattr(self, 'BUSES', None)
@@ -171,7 +171,7 @@ class _CompilePhase:
                 unit='',
             )
 
-        # Auto-inject a runtime `reset_active` param when the driver overrides
+        # Auto-inject a runtime `reset_active` param when the personality overrides
         # the mikroBUS reset polarity; the pod bus has no reset line.
         reset_active = str(getattr(self, 'RESET_ACTIVE', 'low')).lower().strip()
         if reset_active not in ('low', 'high'):
@@ -191,8 +191,8 @@ class _CompilePhase:
         skip_reason = getattr(cls, 'WHO_AM_I_SKIP_REASON', None)
         if skip_reason is not None:
             skip_reason = str(skip_reason).strip() or None
-        # The WHO_AM_I rule applies only to register drivers that declare
-        # WHO_AM_I_VALUES somewhere in their MRO; stream drivers have no probe.
+        # The WHO_AM_I rule applies only to register personalities that declare
+        # WHO_AM_I_VALUES somewhere in their MRO; stream personalities have no probe.
         who_am_i_declared = any(
             'WHO_AM_I_VALUES' in c.__dict__ for c in cls.__mro__
         )
@@ -201,7 +201,7 @@ class _CompilePhase:
                 raise CompileError(
                     f"{cls.__name__}: WHO_AM_I_VALUES = [] requires a "
                     f"non-empty WHO_AM_I_SKIP_REASON attribute explaining "
-                    f"why this driver opts out of the WHO_AM_I probe. "
+                    f"why this personality opts out of the WHO_AM_I probe. "
                     f"Either declare a real WHO_AM_I check (`WHO_AM_I_REG`, "
                     f"`WHO_AM_I_VALUES`), define a synthetic `probe()` "
                     f"that reads any register and asserts a known "
@@ -266,7 +266,7 @@ class _CompilePhase:
     def _build_bus_config(self, cls, config: dict) -> Optional[list]:
         """Assemble the bus_config trailer: one register-access profile per
         entry in ``BUSES`` (from ``SPI_PROFILE`` / ``I2C_PROFILE`` or the
-        conventional defaults). None for a stream driver."""
+        conventional defaults). None for a stream personality."""
         if self.BUS_KIND == BUS_REGISTER:
             profiles = []
             seen = set()
@@ -285,8 +285,8 @@ class _CompilePhase:
     @staticmethod
     def _spi_profile_dict(cls) -> dict:
         """One SPI register-access profile dict for the NXS trailer, from the
-        driver's ``SPI_PROFILE`` descriptor (conventional wire-shape defaults
-        when the driver declares none)."""
+        personality's ``SPI_PROFILE`` descriptor (conventional wire-shape defaults
+        when the personality declares none)."""
         prof = getattr(cls, 'SPI_PROFILE', None)
         if not isinstance(prof, SpiProfile):
             prof = SpiProfile()
@@ -305,8 +305,8 @@ class _CompilePhase:
     @staticmethod
     def _i2c_profile_dict(cls) -> dict:
         """One I²C register-access profile dict for the NXS trailer, from the
-        driver's ``I2C_PROFILE`` descriptor (conventional defaults when the
-        driver declares none)."""
+        personality's ``I2C_PROFILE`` descriptor (conventional defaults when the
+        personality declares none)."""
         prof = getattr(cls, 'I2C_PROFILE', None)
         if not isinstance(prof, I2cProfile):
             prof = I2cProfile()
@@ -338,7 +338,7 @@ class _CompilePhase:
         return int(spec['addr'])
 
     def _validate_companions(self):
-        """Structural checks on ``I2C_COMPANIONS``: the driver must be I2C-only,
+        """Structural checks on ``I2C_COMPANIONS``: the personality must be I2C-only,
         and each companion needs an identity anchor or a documented skip."""
         companions = getattr(type(self), 'I2C_COMPANIONS', None) or {}
         if not companions:
@@ -541,7 +541,7 @@ class _CompilePhase:
                 self._config = alt_config
                 self._budget_spans = []
                 self._work = _WorkAlloc(_ASTCompiler.VM_WORK_BUF_SIZE)
-                # Refill read-response queue from the driver's template
+                # Refill read-response queue from the personality's template
                 # so probe() reads the declared WHO_AM_I etc. again.
                 self._read_responses = {
                     reg: list(vals)

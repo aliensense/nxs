@@ -74,9 +74,9 @@ def _changed(before: _Want, after: _Want) -> str:
 def _pair_ports(cfg) -> Dict[str, Tuple[Topology, Any]]:
     """The owned hub ports that declare a pair, each with its topology (each
     head at its capture node's host address, from the booted tree) and its
-    pack; a port that does not resolve runs no follower, and its `on` says
+    hub; a port that does not resolve runs no follower, and its `on` says
     why."""
-    from nxs.cam import packs
+    from nxs.cam import hubs
     from nxs.cam import topology as cam_topo
     from nxs.daemon import _owned
 
@@ -88,7 +88,7 @@ def _pair_ports(cfg) -> Dict[str, Tuple[Topology, Any]]:
             continue
         try:
             topology = cam_topo.port_topology(port)
-            ports[name] = (topology, packs.pack_for(topology))
+            ports[name] = (topology, hubs.for_topology(topology))
         except Exception as exc:        # noqa: BLE001 (the port's `on` names it)
             log.warning("%s: no follower (%s)", name, exc)
     return ports
@@ -206,12 +206,12 @@ class Followers:
                 log.exception("the followers were not reconciled")
 
     def _start_run(self, name: str, want: _Want) -> None:
-        topology, pack = self._ports[name]
-        build = getattr(pack.flows(), "build_follow", None)
+        topology, hub = self._ports[name]
+        build = getattr(hub.flows(), "build_follow", None)
         try:
             if build is None:
-                raise InfeasibleConfig(f"pack {pack.name} copies no gain")
-            plan = build(pack, topology, want.leader, want.follower)
+                raise InfeasibleConfig(f"hub {hub.name} copies no gain")
+            plan = build(hub, topology, want.leader, want.follower)
             bus = self._open_bus(want.bus)
         except (InfeasibleConfig, OSError) as exc:
             # Not tried again until the port's record changes: the same

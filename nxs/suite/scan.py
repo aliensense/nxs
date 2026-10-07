@@ -22,7 +22,7 @@ class Found:
     link: LinkSpec
     serial: str = ""
     fw_version: str = ""
-    driver: str = ""
+    personality: str = ""
 
 
 def _suggest_name(link: LinkSpec) -> str:
@@ -48,7 +48,7 @@ def _inspect(transport, link: LinkSpec) -> Optional[Found]:
             raw = transport.read_serial()
             found.serial = raw.hex() if raw else ""
             found.fw_version = transport.read_fw_version() or ""
-            found.driver = transport.read_driver_name() or ""
+            found.personality = transport.read_personality_name() or ""
         except Exception:
             pass
         return found
@@ -141,8 +141,9 @@ def _scan_serial(opener, declared: List[LinkSpec]) -> List[Found]:
     try:
         from serial.tools import list_ports
     except ImportError:
+        from nxs.extras import install_line
         print("scan: pyserial not installed — serial sweep skipped "
-              "(pip install 'aliensense-nxs[cyphal]')", file=sys.stderr)
+              f"({install_line('cyphal')})", file=sys.stderr)
         return []
     # USB bridges are probed blind at the default baud; other ports only
     # when declared. Keyed by resolved node; a declared entry wins the key.
@@ -237,10 +238,10 @@ def scan_suite(cfg: Optional[SuiteConfig] = None,
 
 
 def _module_for_driver(active: str) -> Optional[str]:
-    """The personality module compiling to the driver the device reports, or
+    """The click personality whose class compiles to the name the device reports, or
     None when no known personality carries that class."""
-    from nxs.suite.reconcile import module_for_driver_name
+    from nxs.suite.reconcile import click_personality_for
     try:
-        return module_for_driver_name(active)
+        return click_personality_for(active)
     except Exception:
         return None

@@ -10,7 +10,7 @@ from typing import Callable, Dict, Iterator, List, Optional, Tuple
 from nxs._generated_constants import Calibration as CalConstants
 from nxs._generated_constants import FieldSemantics
 from nxs._generated_constants import RunnerStates
-from nxs.descriptor import is_decodable, parse_sample
+from nxs.click_facts import is_decodable, parse_sample
 
 from nxs.device_errors import (
     CALIB_ERR_REASON, CAM_ABORT_ERR_REASON, CAM_RUN_ERR_REASON,
@@ -86,7 +86,7 @@ LINK_DROP_ADVICE = ("A J-Link VCOM can wedge on open or drop under load; prefer 
 
 def await_driver_unloaded(driver_gone, timeout_s=RESET_SETTLE_TIMEOUT_S,
                           poll_s=0.02):
-    """Block until `driver_gone` reports the device holds no driver image,
+    """Block until `driver_gone` reports the device holds no personality image,
     which is what `store save` would persist; it returns True once the image
     is gone, False while present, None when the device did not answer (never
     counted as gone). Raises TimeoutError after `timeout_s`."""
@@ -99,7 +99,7 @@ def await_driver_unloaded(driver_gone, timeout_s=RESET_SETTLE_TIMEOUT_S,
         except OSError as e:
             last_err = e            # NACK while the runner switches state
         time.sleep(poll_s)
-    raise TimeoutError("device did not report the driver unloaded within "
+    raise TimeoutError("device did not report the personality unloaded within "
                        f"{timeout_s:g}s" + (f" (last bus error: {last_err})" if last_err else ""))
 
 # Wire sentinel for an inactive selector, shared by the SDK and its transports.
@@ -113,8 +113,8 @@ SUBJECT_BUCKETS = {
     if name != 'NONE'
 }
 
-# Slot sentinel meaning "the active driver" rather than a stored slot; the
-# firmware uses the same 0xFF for a transient (RAM-only) driver.
+# Slot sentinel meaning "the active personality" rather than a stored slot; the
+# firmware uses the same 0xFF for a transient (RAM-only) personality.
 ACTIVE_SLOT = 0xFF
 
 
@@ -196,7 +196,7 @@ def peek_slot(transport, slot: int):
 @dataclass
 class Sample:
     """One decoded sample. `values` maps field name to physical value, and is
-    empty when the driver exposes no descriptors or declares a type this tool
+    empty when the personality exposes no descriptors or declares a type this tool
     cannot decode; `raw` always holds the bytes."""
     count: int
     raw: bytes
@@ -368,7 +368,7 @@ class NxsClient(ABC):
         TEST state (False); None where the transport serves no such state."""
         return None
 
-    # ── Driver lifecycle ──────────────────────────────────
+    # ── Personality lifecycle ──────────────────────────────────
     @abstractmethod
     def upload_image(self, image: bytes):
         """Stage and load an NXS image into the VM."""
@@ -379,11 +379,11 @@ class NxsClient(ABC):
 
     @abstractmethod
     def vm_stop(self):
-        """Halt the VM; the driver stays loaded."""
+        """Halt the VM; the personality stays loaded."""
 
     @abstractmethod
     def vm_reset(self):
-        """Unload the driver entirely."""
+        """Unload the personality entirely."""
 
     @abstractmethod
     def confirm_fw(self) -> None:
@@ -421,7 +421,7 @@ class NxsClient(ABC):
                 return p
         raise KeyError(name)
 
-    # ── Driver store ──────────────────────────────────────
+    # ── Personality store ──────────────────────────────────────
     @abstractmethod
     def save_slot(self, slot: int):
         """Persist the staged image to store slot `slot`."""
@@ -440,7 +440,7 @@ class NxsClient(ABC):
 
     # ── Status / metadata ─────────────────────────────────
     @abstractmethod
-    def read_driver_name(self) -> str: ...
+    def read_personality_name(self) -> str: ...
     @abstractmethod
     def read_sample_size(self) -> int: ...
     @abstractmethod
@@ -470,7 +470,7 @@ class NxsClient(ABC):
     @abstractmethod
     def _descriptor_token(self) -> int:
         """Opaque generation of the current descriptor set; changes when the
-        loaded driver changes. A transport without change detection returns a constant."""
+        loaded personality changes. A transport without change detection returns a constant."""
 
     # ── Streaming primitives (transport-specific) ─────────
     @abstractmethod
@@ -572,7 +572,7 @@ class NxsClient(ABC):
     def poll_sample(self, timeout: float = 0.0) -> Optional[Sample]:
         """Single-sample read for multiplexing several clients in one loop: a
         decoded `Sample`, or None if none arrived within `timeout`. Arms the
-        stream on first call and tracks the driver like `iter_samples`."""
+        stream on first call and tracks the personality like `iter_samples`."""
         if not self._streaming:
             self.start_stream()
         if self._poll_fields is None:
@@ -642,7 +642,7 @@ class NxsClient(ABC):
 
     def _refreshed_fields(self, token: int,
                           fields: List[dict]) -> Tuple[int, List[dict]]:
-        """Descriptor refresh across a driver change, committing the new
+        """Descriptor refresh across a personality change, committing the new
         (token, fields) pair only when a complete set was read. An unresolved
         swap keeps the old token and collapses the fields to raw-only."""
         new_token = self._descriptor_token()
@@ -685,13 +685,13 @@ class NxsClient(ABC):
 
 
 def active_driver_tag(transport, record=None) -> int:
-    """The running sensor's identity tag: driver name, bus, latched address.
+    """The running sensor's identity tag: personality name, bus, latched address.
     The bus is read, never inferred."""
-    if record is not None and not any(record.driver_tags) and not record.encoder_tag:
+    if record is not None and not any(record.personality_tags) and not record.encoder_tag:
         return 0
-    from nxs.descriptor import driver_tag
+    from nxs.click_facts import driver_tag
     try:
-        name = transport.read_driver_name() or ""
+        name = transport.read_personality_name() or ""
     except Exception:
         return 0
     if not name:
@@ -713,9 +713,9 @@ def active_driver_tag(transport, record=None) -> int:
 """Pushes that may be lost before the pushed discipline expires."""
 
 
-"""Budget for a driver to load, reset its sensor, and probe after a RUN."""
+"""Budget for a personality to load, reset its sensor, and probe after a RUN."""
 
-"""Register-poll spacing while waiting for the driver to come up."""
+"""Register-poll spacing while waiting for the personality to come up."""
 
 
 

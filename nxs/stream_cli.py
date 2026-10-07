@@ -1,14 +1,13 @@
 """`nxs stream`: the sample table, its rate meter, and the egress decimation a target rate asks for."""
 
 import collections
-import importlib
 import os
 import sys
 import time
 from typing import Optional
 
 from nxs.client import SupportsCalibration, SupportsEgressDecimation
-from nxs.descriptor import (
+from nxs.click_facts import (
     effective_scale_fields, is_decodable, parse_sample, sample_width)
 from nxs.term import status_line
 
@@ -94,11 +93,11 @@ def _looks_textual(data: bytes) -> bool:
 def cmd_stream(t, args):
     """Stream samples over any transport, rendering the decoded `Sample`s from
     iter_samples() the same way whatever the transport."""
-    # read_driver_name's first GetDriverInfo transfer can drop on a fresh link;
+    # read_personality_name's first GetDriverInfo transfer can drop on a fresh link;
     # retry so a flaky round-trip doesn't refuse a running device.
     name = ""
     for attempt in range(3):
-        name = t.read_driver_name()
+        name = t.read_personality_name()
         if name:
             break
         if attempt < 2:
@@ -109,8 +108,8 @@ def cmd_stream(t, args):
             cal_record = t.read_calibration()
         except (RuntimeError, OSError, TimeoutError):
             pass
-    driver_name = name or args.driver
-    if not driver_name:
+    personality_name = name or args.personality
+    if not personality_name:
         print("No personality loaded.")
         return 1
     sample_size = t.read_sample_size()
@@ -122,7 +121,7 @@ def cmd_stream(t, args):
     local_fields = []
     if not device_fields:
         local_fields = (_get_output_fields(name, t) if name
-                        else _get_output_fields_by_name(args.driver))
+                        else _get_output_fields_by_name(args.personality))
     fields = device_fields or local_fields
     if fields and not is_decodable(fields):
         print("warning: the personality declares an output type this nxs "
@@ -175,12 +174,12 @@ def cmd_stream(t, args):
         units = "  ".join(
             f"{'(' + _display_unit(f.get('unit', ''), human) + ')':>10s}"
             for f in fields)
-        print(f"Streaming {driver_name} — {len(fields)} fields, "
+        print(f"Streaming {personality_name} — {len(fields)} fields, "
               f"{sample_size}B/sample, every_nth={every_nth} (ctrl-C to stop)\n")
         print(f"{'':>{prefix_w}s}  {header}")
         print(f"{'':>{prefix_w}s}  {units}")
     else:
-        print(f"Streaming {driver_name} (sample_size={sample_size}, "
+        print(f"Streaming {personality_name} (sample_size={sample_size}, "
               f"every_nth={every_nth}, ctrl-C to stop)\n")
 
     count = args.count
@@ -287,7 +286,7 @@ def cmd_stream(t, args):
         from nxs.schemas import CONTRACT
         doc = {
             "contract": CONTRACT,
-            "personality": driver_name,
+            "personality": personality_name,
             "fields": [{"name": f["name"], "unit": f.get("unit", "")} for f in fields],
             "samples": records,
         }
@@ -346,28 +345,34 @@ def _every_for_hz(t, hz: int) -> int:
               f"(decimation can only deliver acq_rate / integer)")
     return every
 
-def _get_output_fields_by_name(driver_name, config=None):
-    """Compile the named driver locally with the given config for field
-    descriptors; [] if the name does not resolve or the compile fails."""
+def _click_class(personality_name):
+    """The click personality class the device names: by its name among the
+    installed ones (lower-cased), else by its class name; None when nothing
+    installed carries it."""
+    from nxs.suite.reconcile import (ClickPersonalityNotFound, known_click_personalities,
+                                     load_click_personality)
     try:
-        mod = importlib.import_module(f"nxs.drivers.{driver_name.lower()}")
-    except ModuleNotFoundError:
-        return []
+        return load_click_personality(personality_name.lower())
+    except ClickPersonalityNotFound:
+        pass
+    for name in known_click_personalities():
+        try:
+            cls = load_click_personality(name)
+        except ClickPersonalityNotFound:
+            continue
+        if cls.__name__ == personality_name:
+            return cls
+    return None
 
-    from nxs.compiler import SensorDriver
-    drv_cls = None
-    for attr in dir(mod):
-        obj = getattr(mod, attr)
-        if (isinstance(obj, type) and issubclass(obj, SensorDriver)
-                and obj is not SensorDriver
-                and obj.__module__ == mod.__name__):
-            drv_cls = obj
-            break
-    if drv_cls is None:
+def _get_output_fields_by_name(personality_name, config=None):
+    """Compile the named click personality locally with the given config
+    for field descriptors; [] if the name does not resolve or the compile
+    fails."""
+    cls = _click_class(personality_name)
+    if cls is None:
         return []
-
     try:
-        compiled = drv_cls().compile(config or {})
+        compiled = cls().compile(config or {})
         # Fold the live param scaling in, matching what the device serves.
         return effective_scale_fields(compiled.output_fields, compiled.params)
     except Exception as e:
@@ -375,31 +380,12 @@ def _get_output_fields_by_name(driver_name, config=None):
         print(f"(warning: could not load output fields: {e})", file=sys.stderr)
         return []
 
-def _get_output_fields(driver_name, t):
-    """Get output field descriptors by compiling the driver locally, with the
-    device's current parameter values so scales match its configuration."""
-    # Map driver names to module names
-    name_map = {
-        'IAM20680': 'iam20680',
-        'NeoM9N': 'neo_m9n',
-    }
-    mod_name = name_map.get(driver_name, driver_name.lower())
-
-    try:
-        mod = importlib.import_module(f"nxs.drivers.{mod_name}")
-    except ModuleNotFoundError:
-        return []
-
-    from nxs.compiler import SensorDriver
-    drv_cls = None
-    for attr in dir(mod):
-        obj = getattr(mod, attr)
-        if (isinstance(obj, type) and issubclass(obj, SensorDriver)
-                and obj is not SensorDriver
-                and obj.__module__ == mod.__name__):
-            drv_cls = obj
-            break
-    if drv_cls is None:
+def _get_output_fields(personality_name, t):
+    """Get output field descriptors by compiling the click personality
+    locally, with the device's current parameter values so scales match
+    its configuration."""
+    cls = _click_class(personality_name)
+    if cls is None:
         return []
 
     # Read the device's param values to build a matching config; a field whose
@@ -417,7 +403,7 @@ def _get_output_fields(driver_name, t):
 
     # Compile with current config to get output fields with correct scales
     try:
-        compiled = drv_cls().compile(config)
+        compiled = cls().compile(config)
         # Fold the live param scaling in, matching what the device serves.
         return effective_scale_fields(compiled.output_fields, compiled.params)
     except Exception as e:
@@ -441,8 +427,8 @@ def add_stream_parser(sub) -> None:
                                'where a sample_rate param exists. Default when '
                                'omitted: the personality\'s sample_rate, else '
                                '~100 Hz on I2C.')
-    p_stream.add_argument('-d', '--driver', default=None,
-                          help='Driver module name (e.g. iam20680), used to '
+    p_stream.add_argument('-p', '--personality', default=None,
+                          help='Click personality name (e.g. iam20680), used to '
                                'fetch scale/unit metadata so the stream prints '
                                'named fields instead of hex. Ignored where the '
                                'device serves its own descriptors (I2C, '

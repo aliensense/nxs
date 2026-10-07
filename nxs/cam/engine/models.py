@@ -94,7 +94,14 @@ Step = Union[CmdStep, DeviceStep, ReadStep, ExpectStep, RetryBlockStep]
 
 
 class ExpectFailedError(RuntimeError):
-    """Raised when an ``ExpectStep`` predicate does not hold in time."""
+    """Raised when an ``ExpectStep`` predicate does not hold in time. ``wait``
+    names what was read (the step's comment, else the register), and
+    ``timeout_ms`` is a polled wait's budget, 0 for a one-shot check."""
+
+    def __init__(self, message: str, wait: str = "", timeout_ms: int = 0) -> None:
+        super().__init__(message)
+        self.wait = wait
+        self.timeout_ms = timeout_ms
 
 
 @dataclass(frozen=True)

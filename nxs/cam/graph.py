@@ -16,15 +16,15 @@ from nxs.cam import hubimage as hi
 from nxs.cam.contracts import InfeasibleConfig, LinkSpec, Topology
 
 
-def address_entries(pack, spec: LinkSpec) -> List[Tuple[int, int]]:
+def address_entries(hub, spec: LinkSpec) -> List[Tuple[int, int]]:
     """The `(alias, target)` pairs a link's serializer translates: every
     pod at an alias, and the head when the host reaches it at another
-    address than it straps (the pack's `_address_map` rule)."""
-    from nxs.cam.packs import native_sensor_address
+    address than it straps (the hub's `_address_map` rule)."""
+    from nxs.cam.hubs import native_sensor_address
 
     entries = [(int(u.alias_addr), int(u.target_addr)) for u in spec.nxs_units
                if int(u.alias_addr) != int(u.target_addr)]
-    native = native_sensor_address(pack, spec)
+    native = native_sensor_address(hub, spec)
     if spec.host_addr is not None and int(spec.host_addr) != native:
         entries.append((int(spec.host_addr), native))
     if len(entries) > 2:
@@ -64,30 +64,30 @@ def run_timing(sen, mode: str, frame_length: Optional[int] = None) -> Dict[str, 
     return {LINE_TIME_PARAM: line_ns, FRAME_PERIOD_PARAM: int(lines) * line_ns}
 
 
-def homogeneous(pack, links: List[LinkSpec], modes: Dict[str, str]) -> bool:
+def homogeneous(hub, links: List[LinkSpec], modes: Dict[str, str]) -> bool:
     """Whether a pair runs one sensor kind in one mode at one address: the
     walk then starts both sensors before the timing fix, as the captured
     program does."""
-    from nxs.cam.packs import sensor_address
+    from nxs.cam.hubs import sensor_address
 
     a, b = links
     return (a.sensor_compatible == b.sensor_compatible and modes[a.name] == modes[b.name]
-            and sensor_address(pack, a) == sensor_address(pack, b))
+            and sensor_address(hub, a) == sensor_address(hub, b))
 
 
-def port_spec(pack, topology: Topology, links: List[LinkSpec], modes: Dict[str, str],
-              hub: bytes, ser: bytes, sensors: Dict[str, Sensor]) -> _libnxs.PortSpec:
+def port_spec(hub, topology: Topology, links: List[LinkSpec], modes: Dict[str, str],
+              hub_image: bytes, ser: bytes, sensors: Dict[str, Sensor]) -> _libnxs.PortSpec:
     """The spec of the walk of `links` on the port in `modes`: the pair, or
     one link, or a pod alone; `sensors` stages every camera link."""
-    from nxs.cam.packs import sensor_address
+    from nxs.cam.hubs import sensor_address
     from nxs.cam.select import _link_descriptor
     from nxs.personality.records import FRAME_PERIOD_PARAM, LINE_TIME_PARAM
 
-    # An alias is one host address for one device: the pack's rule refuses
+    # An alias is one host address for one device: the hub's rule refuses
     # a collision before anything is mapped.
-    check = getattr(pack.flows(), "require_distinct_host_addresses", None)
+    check = getattr(hub.flows(), "require_distinct_host_addresses", None)
     if check is not None:
-        check(pack, topology)
+        check(hub, topology)
     by_name = {l.name: l for l in links}
     pods = [name for name, spec in by_name.items() if not spec.has_camera]
     if pods and len(links) > 1:
@@ -107,20 +107,20 @@ def port_spec(pack, topology: Topology, links: List[LinkSpec], modes: Dict[str, 
             else dataclasses.replace(topology, links=tuple(links))).with_modes(modes)
     out = []
     for name, spec in by_name.items():
-        facts = (hi.link_facts(pack.descriptor(spec.sensor_compatible), modes[name])
+        facts = (hi.link_facts(hub.descriptor(spec.sensor_compatible), modes[name])
                  if spec.has_camera else dict(hi.POD_ONLY_FACTS))
         link = _libnxs.PortLink(
             name=name, has_camera=bool(spec.has_camera), ser_addr=int(spec.ser_addr),
-            head_addr=sensor_address(pack, spec), lanes=int(facts["lanes"]),
+            head_addr=sensor_address(hub, spec), lanes=int(facts["lanes"]),
             data_type=hi.DATA_TYPES[str(facts["data_type"])], host_csi=bool(facts["host_csi"]),
-            entries=tuple(address_entries(pack, spec)))
+            entries=tuple(address_entries(hub, spec)))
         if spec.has_camera:
             sensor = sensors.get(name)
             if sensor is None:
                 raise InfeasibleConfig(f"link {name}: nothing stages its sensor")
             timed = (sensor.params.line_time is not None
                      and sensor.params.frame_period is not None)
-            periods = (run_timing(_link_descriptor(pack, port, spec), modes[name],
+            periods = (run_timing(_link_descriptor(hub, port, spec), modes[name],
                                   sensor.frame_length) if timed else {})
             link = dataclasses.replace(
                 link, params=sensor.params, mode=int(sensor.mode), trigger=int(sensor.trigger),
@@ -130,6 +130,6 @@ def port_spec(pack, topology: Topology, links: List[LinkSpec], modes: Dict[str, 
                 sensor_image=sensor.image)
         out.append(link)
     return _libnxs.PortSpec(
-        des_addr=int(topology.des_addr), csi_lanes=int(topology.csi_lanes), hub_image=hub,
+        des_addr=int(topology.des_addr), csi_lanes=int(topology.csi_lanes), hub_image=hub_image,
         ser_image=ser, links=tuple(out),
-        homogeneous=len(links) == 2 and homogeneous(pack, links, modes))
+        homogeneous=len(links) == 2 and homogeneous(hub, links, modes))

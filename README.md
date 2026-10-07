@@ -1,7 +1,7 @@
 # nxs
 
 Python SDK and command-line tool for NXS sensor co-processors. The library
-covers personality authoring (a sensor personality is a Python class compiled to VM
+covers personality authoring (a click personality is a Python class compiled to VM
 bytecode) and integration (`open_client()`, decoded sample streams, parameter
 access). The `nxs` CLI is built on the same public imports: personality compile and
 upload, VM control, sample streaming, personality store management, and firmware
@@ -17,17 +17,9 @@ for sample in client.iter_samples():
 
 ## Contracts and agents
 
-Every YAML the tool reads (the suite manifest, unit personality descriptors, camera
-descriptor packs) ships with a JSON Schema under `nxs/schemas/`, enforced by
-editors through the files' `yaml-language-server` modelines and by CI on the
-shipped personalities and packs. `nxs status` validates the suite manifest against
-its schema before the laws run; the pack, descriptor, blob, and topology
-loaders parse strictly (an unknown key or a malformed value is an error naming
-the file). Every read verb also emits its document as JSON (`nxs status --json`,
-`nxs cam1 status --json`, `nxs cam1 caps --json`), each conforming to the shipped
-`surface` contract. Shape is the schema's job; the timing and feasibility laws
-stay in code and answer through `nxs status`: a refusal is one fact line, then
-the lawful alternatives under it.
+Every YAML the tool reads ships with a JSON Schema under `nxs/schemas/`. Among them are the suite manifest, the click and cam personality facts files, the hub manifests and the topology files. Editors enforce the schemas through the files' `yaml-language-server` modelines, and CI enforces them on the shipped personalities and hubs. `nxs status` validates the suite manifest against its schema before the laws run. The hub, facts, blob and topology loaders parse strictly, so an unknown key or a malformed value is an error naming the file.
+
+Every read verb also emits its document as JSON (`nxs status --json`, `nxs cam1 status --json`, `nxs cam1 caps --json`), each conforming to the shipped `surface` contract. Shape is the schema's job. The timing and feasibility laws stay in code and answer through `nxs status`: a refusal is one fact line, then the lawful alternatives under it.
 
 `nxs mcp` serves the same verbs to an AI agent over the Model Context
 Protocol (install the `mcp` extra). Hand-written YAML, the `nxs tune` personality
@@ -160,14 +152,9 @@ integration manual's ROS 2 section.
 
 ## Cameras (nxs cam)
 
-`nxs cam` brings up and drives camera chains (an image sensor behind a
-serializer behind a deserializer link) from **descriptor packs**:
-runtime-discovered bundles that describe the hardware (register maps,
-modes, limits, flow assembly). The tool is hardware-agnostic; the pack is
-the camera's self-description.
+`nxs cam` brings up and drives camera chains, an image sensor behind a serializer behind a deserializer link. Two kinds of node describe the hardware, both found at run time. A **hub** carries the deserializer's and the serializer's facts, the flows that compose a port and the default wiring. A **cam personality** carries one sensor's facts, its program and its register tables, and every link offers every installed one. The tool is hardware-agnostic, and the hub and the cam personality are the camera's self-description.
 
-Commands address the hardware node first: the port, then optionally
-one link:
+Commands address the hardware node first, the port and then optionally one link:
 
 ```
 nxs cam0 status              # presence of every device on every link, then the readbacks
@@ -179,19 +166,9 @@ nxs cam0 capture --frames 60  # delivery at the declared rate, headless
 nxs cam0 off
 ```
 
-`cam0` is the connector's stable name (`nxs switch` installs the platform's
-udev aliases); `A`/`B` are its links. The ports come from the suite
-manifest's `ports:` section (which hub on which bus, which chains behind
-it, the declared mode and sync); a host without a manifest follows the
-booted device tree and the pack's default topology, and `nxs tune --freeze
---ports` writes what it found. The pack ships inside the wheel (a development host names its own with
-`nxs --experimental` and `$NXS_CAM_DESCRIPTORS`); without a pack for the
-described deserializer, the tool says so and where it searched. Authoring a pack for
-your own camera is the Camera Personality Reference (`docs/nxs-camera-personalities.md`
-in a standalone checkout), shipped with the product documentation. The
-guide set on the documentation site
-(https://aliensense.github.io/nxs-docs/guides/) walks from a fresh Jetson
-to a dual camera.
+`cam0` is the connector's stable name, since `nxs switch` installs the platform's udev aliases, and `A` and `B` are its links. The ports come from the suite manifest's `ports:` section: which hub on which bus, which chains behind it, the declared mode and sync. A host without a manifest follows the booted device tree and the hub's default topology, and `nxs tune --freeze --ports` writes what it found.
+
+The hub ships inside the wheel. The cam personalities ship as sealed images in the release assets, and `nxs personality install <directory>` installs one from its source. A development host names its own trees with `$NXS_CAM_HUBS` and `$NXS_CAM_PERSONALITIES` under `nxs --experimental`. Without a hub for the declared deserializer, or a cam personality for the declared sensor, the tool says so and where it searched. Authoring a cam personality is the Cam Personality Reference (`docs/nxs-cam-personalities.md` in a standalone checkout), shipped with the product documentation. The guide set on the documentation site (https://aliensense.github.io/nxs-docs/guides/) walks from a fresh Jetson to a dual camera.
 
 ## Reference
 

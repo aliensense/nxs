@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Tuple
 
 from nxs.cam.contracts import LinkSpec, Topology
 from nxs.cam import port_state
-from nxs.cam import packs, topology as topo_mod, unit_source
+from nxs.cam import hubs, topology as topo_mod, unit_source
 
 
 def _refuse(fact: str, *alternatives: str) -> SystemExit:
@@ -101,7 +101,7 @@ def select_port_links(
         ports, default_port = topo_mod.load_ports(
             getattr(args, "topology", None)
         )
-    except (topo_mod.TopologyError, packs.PackError) as exc:
+    except (topo_mod.TopologyError, hubs.HubError) as exc:
         raise SystemExit(f"nxs: {exc}")
     port = getattr(args, "port", None)
     if port is not None:
@@ -172,6 +172,11 @@ def _refuse_pod_only(topology: Topology, link: LinkSpec, verb: str) -> SystemExi
                    f"nxs --unit {who} {verb}")
 
 
+def _named(port: str, reason: str) -> str:
+    """A refusal's fact named with its port, where it is not already."""
+    return reason if reason.startswith((f"{port}:", f"{port}/")) else f"{port}: {reason}"
+
+
 def _require_up(topology: Topology, links: List[LinkSpec],
                 verb: str) -> None:
     """Refuse a running-stream verb on links the port record says are not up."""
@@ -185,10 +190,10 @@ def _require_up(topology: Topology, links: List[LinkSpec],
                       f"nxs {port} {need} on")
 
 
-def _pack_for(topology: Topology):
+def _hub_for(topology: Topology):
     try:
-        return packs.pack_for(topology)
-    except packs.PackError as exc:
+        return hubs.for_topology(topology)
+    except hubs.HubError as exc:
         raise SystemExit(f"nxs: {exc}")
 
 
@@ -210,20 +215,20 @@ def _per_link(values, links: List[LinkSpec], what: str) -> Dict[str, Any]:
     return {l.name: v for l, v in zip(links, values)}
 
 
-def _with_sensors(pack, topology: Topology, links: List[LinkSpec],
+def _with_sensors(hub, topology: Topology, links: List[LinkSpec],
                   sensors: Dict[str, str]) -> Tuple[Topology, List[LinkSpec]]:
-    """The topology with the named sensors on the selected links (a pack
-    sensor name or compatible, checked against the pack)."""
+    """The topology with the named sensors on the selected links (a hub
+    sensor name or compatible, checked against the hub)."""
     if not sensors:
         return topology, links
     resolved: Dict[str, str] = {}
     for name, token in sensors.items():
         try:
-            resolved[name] = pack.descriptor(str(token)).compatible
-        except packs.PackError:
-            have = ", ".join(pack.sensors())
+            resolved[name] = hub.descriptor(str(token)).compatible
+        except hubs.HubError:
+            have = ", ".join(hub.sensors())
             raise SystemExit(
-                f"nxs: no sensor {token!r} in pack {pack.name!r} "
+                f"nxs: no sensor {token!r} in hub {hub.name!r} "
                 f"(sensors: {have})")
     new_links = tuple(
         dataclasses.replace(l, sensor_compatible=resolved[l.name])
@@ -258,27 +263,27 @@ def _remembered_sensors(topology: Topology) -> Topology:
     return dataclasses.replace(topology, links=tuple(new_links))
 
 
-def _declare(pack, topology: Topology, links: List[LinkSpec], args
+def _declare(hub, topology: Topology, links: List[LinkSpec], args
              ) -> Tuple[Topology, List[LinkSpec], Dict[str, str]]:
     """Apply the command's declarations: `--sensor` per selected link
     (else what the port record remembers), `--mode` per selected link. Returns
     the topology, the selected links, and the per-link mode tokens."""
     sensors = _per_link(getattr(args, "sensor", None), links, "sensor")
-    topology, links = _with_sensors(pack, topology, links, sensors)
+    topology, links = _with_sensors(hub, topology, links, sensors)
     modes = _per_link(getattr(args, "mode", None), links, "mode")
     return topology, links, modes
 
-def _link_descriptor(pack, topology: Topology, link: LinkSpec):
-    """A link's sensor descriptor as this port runs it: the pack's own
+def _link_descriptor(hub, topology: Topology, link: LinkSpec):
+    """A link's sensor descriptor as this port runs it: the hub's own
     binding when its flows offer one (the line a pair runs), the plain
     descriptor otherwise."""
-    bind = getattr(pack.flows(), "sensor_descriptor", None)
+    bind = getattr(hub.flows(), "sensor_descriptor", None)
     if bind is not None:
-        return bind(pack, link, topology)
-    return pack.descriptor(link.sensor_compatible)
+        return bind(hub, link, topology)
+    return hub.descriptor(link.sensor_compatible)
 
 
-def _descriptor_among(pack, topology: Topology, link: LinkSpec, port=None):
+def _descriptor_among(hub, topology: Topology, link: LinkSpec, port=None):
     """A link's sensor descriptor as its port runs it (``port``: the names
     of the links up together, the port's when None)."""
     import dataclasses
@@ -287,6 +292,6 @@ def _descriptor_among(pack, topology: Topology, link: LinkSpec, port=None):
         chosen = tuple(l for l in topology.links if l.name in set(port))
         if len(chosen) != len(topology.links):
             topology = dataclasses.replace(topology, links=chosen)
-    return _link_descriptor(pack, topology, link)
+    return _link_descriptor(hub, topology, link)
 
 

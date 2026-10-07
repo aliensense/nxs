@@ -1,7 +1,9 @@
 """ANSI colour helpers and status-print primitives shared by the `nxs`
 verbs."""
 
+import os
 import re
+import sys
 
 GREEN = "\033[32m"
 YELLOW = "\033[33m"
@@ -9,6 +11,18 @@ RED = "\033[31m"
 CYAN = "\033[36m"
 GREY = "\033[90m"
 NC = "\033[0m"
+
+
+def use_color() -> bool:
+    """Whether a verb colours its lines: stdout is a terminal and `NO_COLOR`
+    is not in the environment, whatever its value. A pipe or a file gets
+    plain text."""
+    return sys.stdout.isatty() and "NO_COLOR" not in os.environ
+
+
+def paint(color: str, text: str) -> str:
+    """`text` in `color` where the verbs colour their lines, else as it is."""
+    return f"{color}{text}{NC}" if use_color() else text
 
 
 def status_line(text: str, done: bool = False) -> None:
@@ -19,22 +33,22 @@ def status_line(text: str, done: bool = False) -> None:
 
 def banner(text: str) -> None:
     """Section header: cyan, double-rule decoration. One per major step."""
-    print(f"\n{CYAN}═══ {text} ═══{NC}")
+    print("\n" + paint(CYAN, f"═══ {text} ═══"))
 
 
 def info(text: str) -> None:
     """Tertiary detail: grey, no decoration, for low-signal context."""
-    print(f"{GREY}{text}{NC}")
+    print(paint(GREY, text))
 
 
 def warn(text: str) -> None:
     """Recoverable issue: yellow, no decoration."""
-    print(f"{YELLOW}{text}{NC}")
+    print(paint(YELLOW, text))
 
 
 def err(text: str) -> None:
     """Hard failure: red, no decoration. Pair with a non-zero exit."""
-    print(f"{RED}{text}{NC}")
+    print(paint(RED, text))
 
 
 #: Set by the entry point when the verb was asked for `--json`: a refusal is

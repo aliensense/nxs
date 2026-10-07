@@ -7,14 +7,14 @@ and evaluates them. A sensor module may add ``derive_status(readings)`` lines.""
 
 from __future__ import annotations
 
-import os
-import sys
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
+from nxs import term
+
 from .descriptors import to_int
 
-from . import packs
+from . import hubs
 from .contracts import Topology
 from .descriptors import Descriptor
 
@@ -55,14 +55,24 @@ def _read_register(i2c: Any, device_addr: int, reg_def: Dict[str, Any]) -> int:
 
 
 def _evaluate(i2c: Any, device_addr: int, descriptor: Descriptor,
-              probe: Dict[str, Any]) -> ProbeResult:
-    """One declared probe on a live device."""
+              probe: Dict[str, Any], reads: Optional[Dict[str, Optional[int]]] = None
+              ) -> ProbeResult:
+    """One declared probe on a live device. `reads` is a pass's register
+    cache: a register read once judges every row that shares it, and a
+    register its read clears keeps its value for each of them."""
     name = str(probe["name"])
     desc = str(probe.get("desc", ""))
-    reg_def = descriptor.registers[str(probe["reg"])]
-    try:
-        raw = _read_register(i2c, device_addr, reg_def)
-    except Exception:
+    reg = str(probe["reg"])
+    if reads is None or reg not in reads:
+        try:
+            raw = _read_register(i2c, device_addr, descriptor.registers[reg])
+        except Exception:
+            raw = None
+        if reads is not None:
+            reads[reg] = raw
+    else:
+        raw = reads[reg]
+    if raw is None:
         return ProbeResult(name, None, "no ACK", False, desc)
 
     value = raw & to_int(probe["mask"]) if "mask" in probe else raw
@@ -88,8 +98,11 @@ def run_probes(
     device_addr: int,
     descriptor: Descriptor,
 ) -> List[ProbeResult]:
-    """Evaluate a descriptor's declared status probes on a live device."""
-    return [_evaluate(i2c, device_addr, descriptor, probe)
+    """Evaluate a descriptor's declared status probes on a live device. A
+    register is read once in a pass, so the rows that share one judge the
+    same value, and a register its read clears keeps it for each of them."""
+    reads: Dict[str, Optional[int]] = {}
+    return [_evaluate(i2c, device_addr, descriptor, probe, reads)
             for probe in descriptor.raw("status") or []]
 
 
@@ -127,11 +140,11 @@ def unwalked(lock: Optional[bool]) -> Optional[str]:
     return None
 
 
-def derive_lines(pack, compatible: str,
+def derive_lines(hub, compatible: str,
                  results: List[ProbeResult]) -> List[str]:
     """Ask the chip module for derived status lines, if it offers any."""
     try:
-        module = pack.chip_module(compatible)
+        module = hub.chip_module(compatible)
     except Exception:
         module = None
     hook = getattr(module, "derive_status", None) if module else None
@@ -145,32 +158,32 @@ def derive_lines(pack, compatible: str,
 
 
 def probe_topology(
-    i2c: Any, topology: Topology, pack, links=None,
+    i2c: Any, topology: Topology, hub, links=None,
 ) -> List[Tuple[str, List, List[str]]]:
     """Walk the carrier, des first, then each link through its window; ``links``
     narrows the walk. A direct port has no des and no serializer: its sensor
     is read on the bus itself. Returns sections as (title, probe results,
     derived lines)."""
     sections: List[Tuple[str, List, List[str]]] = []
-    flows = pack.flows()
+    flows = hub.flows()
 
     if topology.is_direct:
         for link in links or topology.links:
-            send = pack.descriptor(link.sensor_compatible)
-            sen_results = run_probes(i2c, packs.sensor_address(pack, link), send)
+            send = hub.descriptor(link.sensor_compatible)
+            sen_results = run_probes(i2c, hubs.sensor_address(hub, link), send)
             sections.append((
                 f"link {link.name} SEN {link.sensor_compatible} (direct)",
                 sen_results,
-                derive_lines(pack, link.sensor_compatible, sen_results),
+                derive_lines(hub, link.sensor_compatible, sen_results),
             ))
         return sections
 
-    desd = pack.descriptor(topology.des_compatible)
+    desd = hub.descriptor(topology.des_compatible)
     des_results = run_probes(i2c, topology.des_addr, desd)
     sections.append((
         f"DES {topology.des_compatible} @ {hex(topology.des_addr)}",
         des_results,
-        derive_lines(pack, topology.des_compatible, des_results),
+        derive_lines(hub, topology.des_compatible, des_results),
     ))
 
     des_alive = any(r.name == "device" and r.ok for r in des_results)
@@ -188,57 +201,53 @@ def probe_topology(
                 behind = "nothing behind it" if why == "link not locked" else "not walked"
                 sections.append((f"link {link.name} {why[5:]}, {behind}", [], []))
                 continue
-            flows.open_window(pack, i2c, topology, link)
-            serd = pack.descriptor(link.ser_compatible)
+            flows.open_window(hub, i2c, topology, link)
+            serd = hub.descriptor(link.ser_compatible)
             ser_results = run_probes(i2c, link.ser_addr, serd)
             sections.append((
                 f"link {link.name} SER {link.ser_compatible} "
                 f"(window {hex(link.des_window)})",
                 ser_results,
-                derive_lines(pack, link.ser_compatible, ser_results),
+                derive_lines(hub, link.ser_compatible, ser_results),
             ))
             if not link.has_camera:
                 continue
             from nxs.cam.identity import answering_address
 
-            send = pack.descriptor(link.sensor_compatible)
-            sen_addr, mapped = answering_address(pack, i2c, link)
+            send = hub.descriptor(link.sensor_compatible)
+            sen_addr, mapped = answering_address(hub, i2c, link)
             sen_results = run_probes(i2c, sen_addr, send)
             # The alias the host reaches the head at while the port is up;
             # before the first `on` nothing maps it and the head answers
             # at its own address, on every link the hub merges.
             if mapped:
                 at = f" @{sen_addr:#04x}"
-            elif int(packs.sensor_address(pack, link)) != sen_addr:
+            elif int(hubs.sensor_address(hub, link)) != sen_addr:
                 at = f" (at its own address {sen_addr:#04x}; port not up)"
             else:
                 at = ""
             sections.append((
                 f"link {link.name} SEN {link.sensor_compatible}{at}",
                 sen_results,
-                derive_lines(pack, link.sensor_compatible, sen_results),
+                derive_lines(hub, link.sensor_compatible, sen_results),
             ))
-        flows.close_windows(pack, i2c, topology)
+        flows.close_windows(hub, i2c, topology)
 
     return sections
-
-
-def _use_color() -> bool:
-    return sys.stdout.isatty() and not os.environ.get("NO_COLOR")
 
 
 class _C:
     """Zero-dependency ANSI palette (empty strings when color is off)."""
 
     def __init__(self) -> None:
-        on = _use_color()
+        on = term.use_color()
         self.bold = "\033[1m" if on else ""
         self.dim = "\033[2m" if on else ""
-        self.green = "\033[32m" if on else ""
-        self.red = "\033[31m" if on else ""
-        self.cyan = "\033[36m" if on else ""
-        self.yellow = "\033[33m" if on else ""
-        self.off = "\033[0m" if on else ""
+        self.green = term.GREEN if on else ""
+        self.red = term.RED if on else ""
+        self.cyan = term.CYAN if on else ""
+        self.yellow = term.YELLOW if on else ""
+        self.off = term.NC if on else ""
 
 
 def render(sections: List[Tuple[str, List, List[str]]]) -> None:

@@ -3,7 +3,7 @@ Autodetect lists USB-attached ports only (`port.vid is not None`): one match
 is picked silently, several prompt, none returns the empty string."""
 
 from nxs.extras import require
-from nxs.term import RED, YELLOW, NC
+from nxs import term
 
 serial = require("cyphal", "serial", "the cyphal transport")
 list_ports = require("cyphal", "serial.tools.list_ports", "the cyphal transport")
@@ -49,7 +49,8 @@ def autodetect_serial_port() -> str:
     if len(candidates) == 1:
         return candidates[0].device
     if len(candidates) > 1:
-        print(f"\n{YELLOW}Multiple USB serial ports found:{NC}")
+        print()
+        term.warn("Multiple USB serial ports found:")
         for i, p in enumerate(candidates, 1):
             desc = p.description or "(no description)"
             print(f"  {i}) {p.device}  — {desc}")
@@ -60,5 +61,5 @@ def autodetect_serial_port() -> str:
             try:
                 return candidates[int(a) - 1].device
             except (ValueError, IndexError):
-                print(f"{RED}Invalid choice — try again{NC}")
+                term.err("Invalid choice — try again")
     return ""

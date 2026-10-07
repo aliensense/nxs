@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://aliensense.dev/schemas/cam-overlay.schema.json",
-  "title": "Camera descriptor overlay",
-  "description": "Board-measured values layered over a chip descriptor. Carries only what it overrides; every limit it states must be sourced 'experimental', because a value that is merely transcribed belongs in the part description instead.",
+  "title": "Camera facts overlay",
+  "description": "Board-measured values layered over a chip's facts. Carries only what it overrides; every limit it states must be sourced 'experimental', because a value that is merely transcribed belongs in the part description instead.",
   "type": "object",
   "additionalProperties": false,
   "required": [

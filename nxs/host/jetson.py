@@ -3,7 +3,7 @@
 
 """The Jetson host on the p3768 carrier. The booted capture contract is the
 device tree; this module reads it (through ``nxs.host.jetson_dt``), generates it from
-the pack (``jetson_overlay``), compiles it with ``dtc``, installs it under an
+the hub (``jetson_overlay``), compiles it with ``dtc``, installs it under an
 extlinux boot label, and speaks to the Argus capture stack."""
 
 from __future__ import annotations
@@ -335,15 +335,15 @@ class JetsonHost(Host):
         return dt.lane_mismatch(bus, declared, sysfs_i2c=self._sysfs_i2c)
 
     # --- the generated contract ------------------------------------------
-    def overlay(self, pack, port: str, lanes: int,
+    def overlay(self, hub, port: str, lanes: int,
                 sensors: Optional[List[str]] = None, direct: bool = False,
                 node_addr: Optional[int] = None, fps: Optional[float] = None,
                 bit_depth: Optional[int] = None) -> str:
         # A port without a hub tops its rows out at the sensor's own ceiling.
         layout = {"lanes": None if direct else int(lanes), "default_fps": fps,
                   "bit_depth": bit_depth}
-        table = tables.capture_table(pack, sensors, **layout)
-        return gen.overlay_dts(port, int(lanes), table, tables.pool_sensors(pack, sensors, **layout),
+        table = tables.capture_table(hub, sensors, **layout)
+        return gen.overlay_dts(port, int(lanes), table, tables.pool_sensors(hub, sensors, **layout),
                                direct=direct, node_addr=node_addr)
 
     def compile(self, dts: str, out: Path) -> Path:
@@ -394,7 +394,8 @@ class JetsonHost(Host):
             if str(target) not in names:
                 names.append(str(target))
         for dtbo, target in zip(dtbos, targets):
-            self.put(target, Path(dtbo).read_bytes())
+            self.put(target, data := Path(dtbo).read_bytes())
+            self.record_installed_overlay(target.name, data)
         kept = backup.exists()
         if text and not kept:
             self.put(backup, text.encode())
@@ -481,6 +482,12 @@ class JetsonHost(Host):
             return {}
         entry = default_label(text)
         return {"entry": entry, "overlays": label_overlays(text, entry) if entry else []}
+
+    def refresh_overlay(self, compiled: Path) -> str:
+        target = BOOT_DTBO_DIR / compiled.name
+        self.put(target, data := compiled.read_bytes())
+        self.record_installed_overlay(target.name, data)
+        return str(target)
 
     def boot_entry_ports(self) -> List[str]:
         try:

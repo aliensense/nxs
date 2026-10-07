@@ -5,7 +5,7 @@
 personality a unit holds carries the descriptor trailer; this module reads
 it over the bus, decodes it, and keeps it in the operator's state directory
 so that `pack_for` can adopt it without touching the bus and `on` runs on a
-robot that holds no descriptor pack."""
+robot that holds no hub."""
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ STALE_PEEKS = {ERRNO_ENOTSUP: "of another format version", ERRNO_EBADF: "that do
 
 @dataclasses.dataclass(frozen=True)
 class UnitPersonality:
-    """The camera personality a unit holds: its slot, the image name the
+    """The cam personality a unit holds: its slot, the image name the
     unit reports, the trailer's CRC-32, the descriptor it decodes to (None
     when a caller's cache was already current), and how its `mode` and
     `trigger` params are staged."""
@@ -58,9 +58,9 @@ class UnitPersonality:
         return self.descriptor.compatible if self.descriptor is not None else ""
 
     def summary(self) -> str:
-        """`camera personality <name> (<compatible>), N modes`."""
+        """`cam personality <name> (<compatible>), N modes`."""
         n = len(self.modes)
-        return (f"camera personality {self.name} ({self.compatible}), "
+        return (f"cam personality {self.name} ({self.compatible}), "
                 f"{n} mode{'s' if n != 1 else ''}")
 
 
@@ -74,11 +74,11 @@ def cache_path(topology: Topology, link: LinkSpec) -> Path:
 def cache_descriptor(topology: Topology, link: LinkSpec, descriptor: Descriptor,
                      slot: int, crc: int, params: Optional[ParamMap] = None,
                      name: Optional[str] = None,
-                     image_crc: Optional[int] = None, pack=None) -> Path:
+                     image_crc: Optional[int] = None, hub=None) -> Path:
     """Write the descriptor a unit served, with the slot it lives in, the
     trailer CRC-32 a refresh compares, the staging facts of its params, and
     the image's CRC-32 when the upload knew it. A tree descriptor is encoded
-    with `pack`, the pack the staged trailer was built with, so the cached
+    with `hub`, the hub the staged trailer was built with, so the cached
     rows are the unit's. Returns the file written."""
     from nxs.personality.records import (decode_trailer, encode_trailer,
                                          mode_values, param_map)
@@ -86,7 +86,7 @@ def cache_descriptor(topology: Topology, link: LinkSpec, descriptor: Descriptor,
     if descriptor.from_unit:
         doc = _descriptor_doc(descriptor)
     else:
-        records = encode_trailer(descriptor, pack=pack)
+        records = encode_trailer(descriptor, hub=hub)
         doc = decode_trailer(records)
         params = params or param_map(records)
     if params is None:
@@ -171,7 +171,7 @@ def forget(topology: Topology, link: LinkSpec) -> None:
 
 
 def slot_kind(client, slot: int) -> Optional[str]:
-    """`'driver'`, `'camera'`, or None for an empty slot, from the peek view;
+    """`'click'`, `'cam'`, or None for an empty slot, from the peek view;
     None too on a transport without one."""
     if not isinstance(client, SupportsSlotPeek):
         return None
@@ -186,11 +186,11 @@ def slot_kind(client, slot: int) -> Optional[str]:
 
 
 class UnreadableSlot(RuntimeError):
-    """A store slot holds a camera personality whose trailer this nxs
+    """A store slot holds a cam personality whose trailer this nxs
     cannot decode; `slot` names it for `store rm <slot>`."""
 
     def __init__(self, slot: int, why: str) -> None:
-        super().__init__(f"slot {slot} holds a camera personality this nxs cannot "
+        super().__init__(f"slot {slot} holds a cam personality this nxs cannot "
                          f"read ({why})")
         self.slot = slot
 
@@ -208,12 +208,12 @@ class StaleSlot(UnreadableSlot):
 
 def read_unit_personality(client, known_crc: Optional[int] = None
                           ) -> Optional[UnitPersonality]:
-    """The camera personality in the unit's store, read over an open
+    """The cam personality in the unit's store, read over an open
     client: the first camera slot whose descriptor trailer carries an
-    IDENTITY record (driver and empty slots are refused by the unit and
+    IDENTITY record (click personality and empty slots are refused by the unit and
     skipped). With `known_crc`, a trailer of that CRC-32 is not decoded and
     the returned personality carries no descriptor: the caller's cache is
-    current. None when the unit holds no camera personality or the
+    current. None when the unit holds no cam personality or the
     transport cannot read trailers; UnreadableSlot when a slot's trailer
     does not decode; StaleSlot, naming the first such slot, when the unit
     holds none it can read and a slot whose image it refuses to describe."""
@@ -231,7 +231,7 @@ def read_unit_personality(client, known_crc: Optional[int] = None
                 raise
             stale = stale or StaleSlot(slot, STALE_PEEKS[exc.code], str(exc))
             continue
-        if kind == "driver":
+        if kind == "click":
             continue
         try:
             data = client.read_personality_info(slot)
@@ -279,7 +279,7 @@ def refresh_from_unit(topology: Topology, link: LinkSpec, opener=None
                       ) -> Optional[UnitPersonality]:
     """Read the unit behind a link under the bus lock and bring the cache
     up to date: a trailer whose CRC-32 matches the cache is not decoded or
-    rewritten; a unit holding no camera personality drops the cache.
+    rewritten; a unit holding no cam personality drops the cache.
     Returns the unit's personality (the cached descriptor when unchanged),
     or None."""
     client = _unit_client(topology, link, opener)
@@ -319,7 +319,7 @@ def last_run_text(state: int) -> str:
 
 def unit_status(topology: Topology, link: LinkSpec, opener=None
                 ) -> Optional[Dict[str, Any]]:
-    """What the link's unit holds and last ran: the camera personality's
+    """What the link's unit holds and last ran: the cam personality's
     name, slot, sensor and mode values, the run state, and the values the
     run recorded by parameter name; `summary` is the one line `status`
     prints. None when the link carries no unit or it holds no camera
@@ -355,7 +355,7 @@ def unit_status(topology: Topology, link: LinkSpec, opener=None
 
 def unit_personality(topology: Topology, link: LinkSpec, opener=None
                      ) -> Optional[Tuple[int, Descriptor]]:
-    """`(slot, descriptor)` of the camera personality the link's unit holds,
+    """`(slot, descriptor)` of the cam personality the link's unit holds,
     read fresh (the cache follows), or None."""
     found = refresh_from_unit(topology, link, opener)
     if found is None or found.descriptor is None:
@@ -371,7 +371,7 @@ def _sensor_personality(topology: Topology, link: LinkSpec, opener=None) -> Opti
         return None
     try:
         with port_state.BusLock():
-            name = client.read_driver_name()
+            name = client.read_personality_name()
     finally:
         close = getattr(client, "close", None)
         if close is not None:
@@ -389,10 +389,10 @@ def unit_personalities(topology: Topology, link: LinkSpec, opener=None
     held: List[Dict[str, Any]] = []
     name = _sensor_personality(topology, link, opener)
     if name is not None:
-        held.append({"kind": "sensor", "name": name, "text": f"sensor personality {name}"})
+        held.append({"kind": "click", "name": name, "text": f"click personality {name}"})
     camera = unit_status(topology, link, opener)
     if camera is not None:
-        held.append({"kind": "camera",
+        held.append({"kind": "cam",
                      **{k: v for k, v in camera.items() if k != "summary"},
                      "text": camera["summary"]})
     return held

@@ -194,7 +194,7 @@ class _Emitter:
             if (self._last_op not in self._YIELDABLE_OPCODES and
                     target_op not in self._YIELDABLE_OPCODES):
                 # SLEEP_US(0) yields to the runner without blocking on DRDY,
-                # which a stream-driver inner loop has no semantic for.
+                # which a stream-personality inner loop has no semantic for.
                 self.emit_u16(Op.SLEEP_US, 0)
 
         self._on_emit(opcode)
@@ -255,7 +255,7 @@ class _TraceReadValue:
 
 
 # Bus kind tags. The AST compiler picks the opcode family by these when the
-# driver writes `self.read(...)` in a measure loop.
+# personality writes `self.read(...)` in a measure loop.
 BUS_REGISTER = "register"
 BUS_STREAM = "stream"
 
@@ -272,7 +272,7 @@ OpErrorCode = OpErrors.OpErrorCode
 class TracedSlice:
     """Trace-side handle on a `sample_buf` slice produced by `read_n` /
     `read_until`; carries the buffer offset and length for `.expect()`."""
-    driver: Any
+    personality: Any
     buf_off: int
     length: int
 
@@ -293,14 +293,14 @@ class TracedSlice:
                 f"TracedSlice.expect: expected ({len(expected_bytes)} B) "
                 f"longer than slice ({self.length} B)")
 
-        em = self.driver._emitter
-        L_FAIL = self.driver._fresh_label("ex_fail")
-        L_DONE = self.driver._fresh_label("ex_done")
+        em = self.personality._emitter
+        L_FAIL = self.personality._fresh_label("ex_fail")
+        L_DONE = self.personality._fresh_label("ex_done")
 
         # Scoped scratch: the LOAD_U8/CMP_EQ temporaries die with the chain.
-        with self.driver._regs.scope():
-            byte_r = self.driver._regs.get("__byte_tmp")
-            match_r = self.driver._regs.get("__match_tmp")
+        with self.personality._regs.scope():
+            byte_r = self.personality._regs.get("__byte_tmp")
+            match_r = self.personality._regs.get("__match_tmp")
             for i, want in enumerate(expected_bytes):
                 em.emit(Op.LOAD_U8, byte_r, self.buf_off + i)
                 em.emit_cmp(Op.CMP_EQ, byte_r, want, match_r)

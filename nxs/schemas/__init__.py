@@ -17,11 +17,11 @@ from . import validator
 
 #: Schema names, by the document family they describe.
 SUITE = "suite"
-UNIT_DRIVER = "unit-driver"
-CAM_DESCRIPTOR = "cam-descriptor"
+CLICK_PERSONALITY = "click-personality"
+CAM_PERSONALITY = "cam-personality"
 CAM_OVERLAY = "cam-overlay"
 BLOB = "blob"
-PACK = "pack"
+HUB = "hub"
 EXPERIMENTAL = "experimental"
 TOPOLOGY = "topology"
 SURFACE = "surface"

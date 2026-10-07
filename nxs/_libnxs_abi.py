@@ -30,7 +30,7 @@ class _State(ctypes.Structure):
                 ("probe_retries", ctypes.c_uint8), ("store_count", ctypes.c_uint8),
                 ("active_slot", ctypes.c_uint8), ("sample_size", ctypes.c_uint8),
                 ("sample_count", ctypes.c_uint16), ("descriptor_epoch", ctypes.c_uint16),
-                ("driver_name", ctypes.c_char * _NAME_LEN)]
+                ("personality_name", ctypes.c_char * _NAME_LEN)]
 
 
 class _ParamInfo(ctypes.Structure):

@@ -45,7 +45,7 @@ def tool_build() -> Optional[str]:
 
 def other_build(found: Optional[str]) -> Optional[str]:
     """The refusal's fact when an assets manifest names a build other than
-    this wheel's: the wheel runs the hub images and the pack its own build
+    this wheel's: the wheel runs the hub images and the hub its own build
     compiled, so assets of another build of the same version disagree with
     it. None when they agree or either side names none."""
     own = tool_build()

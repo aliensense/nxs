@@ -20,7 +20,7 @@ from nxs.ros2_cli import (
     cmd_ros2,
 )
 from nxs.assets_cli import add_assets_parser, cmd_assets
-from nxs.setup_cli import COMPLETION_TARGET, print_pack_hint
+from nxs.setup_cli import COMPLETION_TARGET, print_hub_hint
 from nxs.store_cli import (
     add_store_parser,
     cmd_cycle,
@@ -149,7 +149,7 @@ __all__ = [
     "cmd_timesync",
     "cmd_upload",
     "main",
-    "print_pack_hint",
+    "print_hub_hint",
 ]
 
 
@@ -218,10 +218,14 @@ def _warn_if_suite_managed(args):
 
     for unit in cfg.units:
         if any(link.identity() == identity for link in unit.links):
-            print(f"note: unit '{unit.name}' is suite-managed — this change "
-                  f"reverts on `nxs switch`; keep it with "
-                  f"`nxs tune --freeze --unit {unit.name}`", file=sys.stderr)
+            print(suite_managed_note(unit.name), file=sys.stderr)
             return
+
+
+def suite_managed_note(name: str) -> str:
+    """The note a change on a declared unit gets: `switch` undoes it."""
+    return (f"note: unit '{name}' is suite-managed — this change reverts on `nxs switch`; "
+            f"keep it with `nxs tune --freeze --unit {name}`")
 
 
 # The verbs that must reach an off-contract device: `probe` reports the
@@ -282,8 +286,8 @@ def build_parser():
                         help="show program's version number and exit")
     parser.add_argument('--experimental', action='store_true',
                         default=experimental.enabled(),
-                        help='unlock the experimental surface: a pack root and '
-                             'its overlays ($NXS_CAM_DESCRIPTORS, '
+                        help='unlock the experimental surface: a hub root and '
+                             'its overlays ($NXS_CAM_HUBS, $NXS_CAM_PERSONALITIES, '
                              '$NXS_CAM_EXPERIMENTAL), a development personality store')
     parser.add_argument('-t', '--transport', choices=['i2c', 'cyphal-serial', 'cyphal-can'],
                         default=_default_transport(),
@@ -340,8 +344,9 @@ def build_parser():
                              'options each offers — no TUI')
     p_tune.add_argument('--set', action='append', default=[],
                         metavar='CHANNEL[:SECTION]:FIELD=VALUE',
-                        help='set one declared value from its options '
-                             '(repeatable); saves with a timestamped .bak')
+                        help='set a declared value from its options; CHANNEL is '
+                             'a port (cam1), a link (cam1/A) or a unit; repeat '
+                             'for a batch, saved once with a timestamped .bak')
     p_tune.add_argument('--schema', action='store_true',
                         help="The rig's rules as JSON Schema: the manifest schema "
                              'narrowed by the nodes on this rig, for validating a '
@@ -362,6 +367,8 @@ def build_parser():
                              'the units')
     p_tune.add_argument('--unit', dest='only_unit', default=None,
                         help='with --freeze: one unit by name')
+    p_tune.add_argument('--port', dest='only_port', default=None,
+                        help='with --freeze --ports: one camera port by name')
     p_tune.add_argument('--dry-run', action='store_true',
                         help='with --freeze: print the would-be block, '
                              'write nothing')

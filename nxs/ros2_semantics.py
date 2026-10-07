@@ -204,7 +204,7 @@ FIX_TYPES_WITH_FIX = (2, 3, 4)
 FIX_TYPES_WITH_TIME = (2, 3, 4, 5)
 
 def navsat_status_from_fix_type(fix_type: int) -> int:
-    """NavSatStatus.status for the driver's `fix_type`: GNSS-derived positions
+    """NavSatStatus.status for the personality's `fix_type`: GNSS-derived positions
     pass as NAVSAT_STATUS_FIX, everything else (unknown vocabulary included)
     gates as NO_FIX."""
     return NAVSAT_STATUS_FIX if fix_type in FIX_TYPES_WITH_FIX \
@@ -419,13 +419,13 @@ def join_topic(base: str, unit_name: Optional[str], rel: str) -> str:
     parts = (sanitize_ros_name(p) for p in (base, unit_name, rel) if p)
     return "/".join(parts)
 
-def sensor_plans_imu(driver: str,
+def sensor_plans_imu(personality: str,
                      config: Optional[Dict[str, object]] = None) -> bool:
-    """True when the named shipped driver's compiled output plans an `imu`
+    """True when the named shipped click personality's compiled output plans an `imu`
     publication; a resolution or compile failure also returns True."""
     try:
-        from nxs.descriptor import load_driver
-        img = load_driver(driver)().compile(dict(config or {}))
+        from nxs.suite.reconcile import load_click_personality
+        img = load_click_personality(personality)().compile(dict(config or {}))
         return any(p.topic == 'imu'
                    for p in plan_publications(img.output_fields))
     except Exception:

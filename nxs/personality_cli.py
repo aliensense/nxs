@@ -3,9 +3,10 @@
 
 """The `personality` verb group. On a unit, `nxs [<port> <link>] personality
 upload|status|show|rm`: `upload` resolves its argument in one order (an
-explicit file, the personality store, a built-in driver, a pack sensor
-pair), compiles what needs compiling, and lands a driver in the VM or a
-camera personality in a store slot; `nxs upload` is the same verb. `show`
+explicit file, the personality store, a built-in click personality, an
+installed cam personality), compiles what needs compiling, and lands a
+click personality in the VM or a
+cam personality in a store slot; `nxs upload` is the same verb. `show`
 prints a personality's metadata and never its bytecode. On the host,
 `personality check|install` (`nxs.personality`) judge and
 install personalities; a unit's slots are `nxs store ls`."""
@@ -20,7 +21,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from nxs.client import ERRNO_EEXIST, DeviceRefused, SupportsSlotPeek, peek_slot
-from nxs.compiler import CameraSensor, CompileError, SensorDriver
+from nxs.compiler import CamPersonality, CompileError, ClickPersonality
 from nxs.image import (IMAGE_KIND_NAMES, ImageKind, deserialize, format_refusal,
                        parse_trailer, peek_format, serialize, trailer_bytes)
 
@@ -34,8 +35,8 @@ ASSET_NAME = "nxs-assets-<version>.tar.gz"
 MAX_SLOTS = 8
 
 KIND_IMAGE = "image"
-KIND_DRIVER = "driver"
-KIND_CAMERA = "camera"
+KIND_CLICK = "click"
+KIND_CAM = "cam"
 
 
 def store_dir() -> str:
@@ -115,17 +116,17 @@ class CompileFailed(Exception):
 class Source:
     """What a personality argument resolved to."""
 
-    kind: str                       # KIND_IMAGE, KIND_DRIVER, KIND_CAMERA
-    origin: str                     # file, store, built-in, pack
+    kind: str                       # KIND_IMAGE, KIND_CLICK, KIND_CAM
+    origin: str                     # file, store, built-in, hub
     name: str
     path: Optional[str] = None
     image: Optional[bytes] = None
     image_kind: Optional[int] = None
     driver_cls: Optional[type] = None
     descriptor: Any = None
-    #: The pack a pack source belongs to: its serializer tail counts in the
+    #: The hub a hub source belongs to: its serializer tail counts in the
     #: capture rows the trailer carries.
-    pack: Any = None
+    hub: Any = None
 
     @property
     def where(self) -> str:
@@ -137,8 +138,8 @@ class Source:
 def resolve(token: str) -> Source:
     """The source behind an `upload` argument: an existing file
     (a `.nxs` of either kind, a `.py`, or the `.yaml` of a source pair),
-    else `<store>/<name>.nxs`, else a built-in or store driver, else a pack
-    sensor with a behaviour class beside its descriptor."""
+    else `<store>/<name>.nxs`, else a built-in or store click personality,
+    else a cam personality with a behaviour class beside its facts."""
     if os.path.isfile(token):
         return _resolve_file(token)
     name = token.lower()
@@ -150,16 +151,16 @@ def resolve(token: str) -> Source:
         return _image_source(stored, name, origin="store")
 
     from nxs.suite import personality_file
-    from nxs.suite.reconcile import DriverNotFound, load_unit_driver
+    from nxs.suite.reconcile import ClickPersonalityNotFound, load_click_personality
     try:
-        cls = load_unit_driver(name)
-    except DriverNotFound as e:
+        cls = load_click_personality(name)
+    except ClickPersonalityNotFound as e:
         not_a_driver = str(e)
     else:
         path = personality_file(name, "py")
         return _class_source(cls, path or _module_file(cls), name,
                              origin="store" if path else "built-in")
-    found = _pack_source(name)
+    found = _registry_source(name)
     if found is not None:
         return found
     raise ResolveError(f"No personality or file '{token}': {not_a_driver}", prefix="")
@@ -184,7 +185,7 @@ def _resolve_file(path: str) -> Source:
 
 
 def _class_in(path: str, label: str) -> Optional[type]:
-    """The driver class a source file defines, None when it defines none;
+    """The personality class a source file defines, None when it defines none;
     registered like an imported module so the class finds its sibling
     descriptor. A file that fails to import is an error, never None."""
     from nxs.personality import load_source
@@ -197,25 +198,25 @@ def _class_in(path: str, label: str) -> Optional[type]:
                            f"{import_failure_detail(e, path)}") from None
     for attr in dir(mod):
         obj = getattr(mod, attr)
-        if (isinstance(obj, type) and issubclass(obj, SensorDriver)
-                and obj is not SensorDriver and obj.__module__ == mod.__name__):
+        if (isinstance(obj, type) and issubclass(obj, ClickPersonality)
+                and obj is not ClickPersonality and obj.__module__ == mod.__name__):
             return obj
     return None
 
 
 def _load_class(path: str, label: str) -> type:
-    """The one driver class a source file defines."""
+    """The one personality class a source file defines."""
     cls = _class_in(path, label)
     if cls is None:
-        raise ResolveError(f"No SensorDriver found in {label}", stderr=False, prefix="")
+        raise ResolveError(f"No ClickPersonality found in {label}", stderr=False, prefix="")
     return cls
 
 
 def _class_source(cls: type, path: Optional[str], name: str, origin: str) -> Source:
-    """A driver class as a source; a camera class needs its datasheet
-    descriptor, the `<name>.yaml` beside its file."""
-    if not issubclass(cls, CameraSensor):
-        return Source(KIND_DRIVER, origin, name, path=path, driver_cls=cls)
+    """A personality class as a source; a cam personality needs its facts,
+    the `<name>.yaml` beside its file."""
+    if not issubclass(cls, CamPersonality):
+        return Source(KIND_CLICK, origin, name, path=path, driver_cls=cls)
     yaml_path = f"{os.path.splitext(path)[0]}.yaml" if path else None
     if not yaml_path or not os.path.isfile(yaml_path):
         # A behaviour class alone compiles (a development image); without its
@@ -224,13 +225,13 @@ def _class_source(cls: type, path: Optional[str], name: str, origin: str) -> Sou
         print(f"note: no datasheet beside {path or cls.__name__} "
               f"({os.path.basename(yaml_path) if yaml_path else 'no source file'}): "
               f"the image carries no descriptor trailer", file=sys.stderr)
-        return Source(KIND_CAMERA, origin, name, path=path, driver_cls=cls)
-    return Source(KIND_CAMERA, origin, name, path=path, driver_cls=cls,
+        return Source(KIND_CAM, origin, name, path=path, driver_cls=cls)
+    return Source(KIND_CAM, origin, name, path=path, driver_cls=cls,
                   descriptor=_descriptor_at(yaml_path))
 
 
 def _descriptor_at(yaml_path: str):
-    """The descriptor of a source pair: the pack layout (`<x>/<x>.yaml`)
+    """The descriptor of a source pair: the hub layout (`<x>/<x>.yaml`)
     loads with its blobs and provenance, a flat pair by its facts alone."""
     import yaml as _yaml
 
@@ -251,42 +252,50 @@ def _descriptor_at(yaml_path: str):
         raise ResolveError(f"{yaml_path}: {e}") from None
 
 
-def _pack_source(name: str) -> Optional[Source]:
-    from nxs.cam import packs
+def _registry_source(name: str) -> Optional[Source]:
+    """A cam personality by name or compatible from the registry (its
+    shipped facts and the behaviour class beside them), else a hub chip's
+    program class (the executor's image) from the hub that ships it; None
+    when nothing installed carries the name."""
+    from nxs.cam import cam_personalities, hubs
 
     try:
-        found = packs.all_packs()
-    except packs.PackError:
-        return None
-    for pack in found:
-        # A personality is compiled from the shipped descriptor: a bench
-        # overlay attached to the pack never reaches the unit's records.
-        try:
-            descriptor = pack.shipped_descriptor(name)
-        except packs.PackError:
-            continue
-        source = pack.chip_source(name)
-        if descriptor.role != "SEN":
-            # A hub chip's program class beside its physics: the executor's
-            # image; a chip with physics alone is no personality.
-            from nxs.compiler import HubDevice
-            cls = _class_in(str(source), descriptor.name) if source is not None else None
-            if cls is None or not issubclass(cls, HubDevice):
-                continue
-            return Source(KIND_CAMERA, "pack", descriptor.name, path=str(source),
-                          driver_cls=cls, descriptor=descriptor, pack=pack)
+        registry = cam_personalities.registry()
+        directory = registry.directory(name)
+    except cam_personalities.RegistryError:
+        directory = None
+    if directory is not None:
+        # A personality is compiled from the shipped facts: a bench overlay
+        # never reaches the unit's records.
+        descriptor = registry.shipped(name)
+        source = registry.source(name)
         if source is None:
             raise ResolveError(
-                f"pack sensor {name!r} ({descriptor.compatible}) ships no behaviour "
+                f"cam personality {name!r} ({descriptor.compatible}) ships no behaviour "
                 f"class ({descriptor.name}.py beside {descriptor.name}.yaml): "
                 f"nothing to compile")
         cls = _load_class(str(source), descriptor.name)
-        if not issubclass(cls, CameraSensor):
+        if not issubclass(cls, CamPersonality):
             raise ResolveError(
-                f"{source}: {cls.__name__} is not a CameraSensor; a pack sensor's "
-                f"behaviour class compiles to a camera personality")
-        return Source(KIND_CAMERA, "pack", descriptor.name, path=str(source),
-                      driver_cls=cls, descriptor=descriptor, pack=pack)
+                f"{source}: {cls.__name__} is not a CamPersonality; a cam personality's "
+                f"behaviour class compiles to a cam personality")
+        return Source(KIND_CAM, "registry", descriptor.name, path=str(source),
+                      driver_cls=cls, descriptor=descriptor)
+    try:
+        found = hubs.discover()
+    except hubs.HubError:
+        return None
+    from nxs.compiler import HubDevice
+    for hub in found:
+        if hub._own(name) is None:
+            continue
+        descriptor = hub.shipped_descriptor(name)
+        source = hub.chip_source(name)
+        cls = _class_in(str(source), descriptor.name) if source is not None else None
+        if cls is None or not issubclass(cls, HubDevice):
+            continue
+        return Source(KIND_CAM, "hub", descriptor.name, path=str(source),
+                      driver_cls=cls, descriptor=descriptor, hub=hub)
     return None
 
 
@@ -328,27 +337,27 @@ def parse_config(pairs) -> Dict[str, Any]:
 
 
 def compile_source(source: Source, config: Dict[str, Any]):
-    """`(compiled, image bytes)` for a driver or camera source; a camera
+    """`(compiled, image bytes)` for a click or cam personality source; a cam
     personality's trailer is the datasheet's records with the compiled
     param indices. CompileFailed carries the user-facing line."""
-    drv_cls = source.driver_cls
+    cls = source.driver_cls
     user_supplied = set(config)
     try:
-        compiled = drv_cls().compile(dict(config))
+        compiled = cls().compile(dict(config))
     except (CompileError, FileNotFoundError, ValueError) as e:
         raise CompileFailed(f"Error: {e}") from None
     from nxs.check import sensor_allowed_keys
-    allowed = sensor_allowed_keys(drv_cls, compiled)
+    allowed = sensor_allowed_keys(cls, compiled)
     unknown = user_supplied - allowed
     if unknown:
         raise CompileFailed(f"Unknown config keys: {', '.join(sorted(unknown))}\n"
                             f"Valid: {', '.join(sorted(allowed))}", stderr=False)
-    if (source.kind == KIND_CAMERA and source.descriptor is not None
+    if (source.kind == KIND_CAM and source.descriptor is not None
             and compiled.kind != ImageKind.HUB):
         from nxs.personality import records
         try:
             compiled.trailer = records.encode_trailer(source.descriptor, compiled.params,
-                                                      pack=source.pack)
+                                                      hub=source.hub)
         except records.RecordError as e:
             raise CompileFailed(f"Error: {e}") from None
     try:
@@ -374,7 +383,7 @@ _SOURCE_SUFFIXES = (".py", ".yaml", ".yml")
 
 def cmd_upload(t, args) -> int:
     """`upload <name|file>`: compile and land a personality of either kind."""
-    token = getattr(args, "target", None) or args.driver
+    token = getattr(args, "target", None) or args.personality
     output = getattr(args, "output", None)
     # A compiled image has its params baked in: the flags that compile are
     # refused before the file is even read.
@@ -421,7 +430,7 @@ def cmd_upload(t, args) -> int:
 
 
 def _land(t, args, source: Source, img: bytes, kind: int, name: str, compiled) -> int:
-    """Upload the image: a driver runs, a camera personality lands in a
+    """Upload the image: a click personality runs, a cam personality lands in a
     store slot (refused on a transport that cannot save one), and the
     link's cache learns the descriptor."""
     from nxs.cli import _upload_and_run
@@ -433,7 +442,7 @@ def _land(t, args, source: Source, img: bytes, kind: int, name: str, compiled) -
     if kind != ImageKind.CAMERA:
         return _upload_and_run(t, img)
     if not _can_save(t):
-        print("error: a camera personality runs from a flash slot, and this transport "
+        print("error: a cam personality runs from a flash slot, and this transport "
               "cannot save one", file=sys.stderr)
         return 1
     slot = _pick_slot(t, name, getattr(args, "slot", None))
@@ -449,7 +458,7 @@ def _land(t, args, source: Source, img: bytes, kind: int, name: str, compiled) -
             return 0
         print(f"Save refused: {e}", file=sys.stderr)
         return 1
-    print(f"Uploaded camera personality {name} to slot {slot}; the camera "
+    print(f"Uploaded cam personality {name} to slot {slot}; the camera "
           f"verbs run it from there under the bus token.")
     _remember(args, source, img, compiled, slot, name)
     return 0
@@ -460,9 +469,9 @@ def _can_save(t) -> bool:
 
 
 def _pick_slot(t, name: str, wanted: Optional[int]) -> Optional[int]:
-    """The slot a camera personality occupies once saved, read from the
+    """The slot a cam personality occupies once saved, read from the
     store: the one asked for, else the slot already holding this name, else
-    the slot holding the unit's camera personality (a unit runs one; the
+    the slot holding the unit's cam personality (a unit runs one; the
     upload replaces it), else a slot whose image the unit refuses to
     describe (another format version: the upload reinstalls it), else the
     first empty one. The unit keeps its store packed: a save overwrites an
@@ -535,7 +544,7 @@ def _remember(args, source: Source, img: bytes, compiled, slot: int, name: str) 
     unit_source.cache_descriptor(topology, link, descriptor, slot=slot,
                                  crc=records.trailer_crc(trailer), params=params,
                                  name=name, image_crc=zlib.crc32(img) & 0xFFFFFFFF,
-                                 pack=source.pack)
+                                 hub=source.hub)
 
 
 def port_link_for(args):
@@ -589,29 +598,34 @@ def write_manifest(directory: str, version: str, build: Optional[str] = None) ->
     return manifest
 
 
-def compile_pack(pack_root: str, out_dir: str) -> List[str]:
-    """Compile every sensor of the pack at `pack_root` that ships a
-    behaviour class into `<out_dir>/<name>.nxs`; returns the names built."""
-    from nxs.cam import packs
+def compile_images(cam_root: str, hub_root: str, out_dir: str) -> List[str]:
+    """Compile every cam personality under `cam_root` that ships a behaviour
+    class, and every hub chip under `hub_root` with a program class, into
+    `<out_dir>/<name>.nxs`; returns the names built."""
+    from nxs.cam import cam_personalities, hubs
 
-    # The pack under compilation is the one its hub classes compose from:
-    # not the interpreter's installed pack, which ships no sensors.
-    (pack,) = packs.prime([Path(pack_root)])
+    # The trees under compilation are what the program classes compose
+    # from: not the interpreter's installed hub, which ships no sensor.
+    registry = cam_personalities.prime([Path(cam_root)])
+    found = hubs.prime([Path(hub_root)])
     os.makedirs(out_dir, exist_ok=True)
     built = []
-    hubs = [c for c in pack.chips if c not in pack.sensors()]
-    for name in pack.sensors() + hubs:
-        source_path = pack.chip_source(name)
+    sources = [(name, registry.source(name), registry.shipped(name), None)
+               for name in registry.names()]
+    for hub in found:
+        sources += [(chip, hub.chip_source(chip), hub.shipped_descriptor(chip), hub)
+                    for chip in hub.chips]
+    for name, source_path, descriptor, hub in sources:
         if source_path is None:
             continue
-        # A physics module beside a descriptor (a head the host programs)
+        # A physics module beside the facts (a head the host programs)
         # defines no class; only a behaviour class compiles to an image.
         driver_cls = _class_in(str(source_path), name)
         if driver_cls is None:
             continue
-        source = Source(KIND_CAMERA, "pack", name, path=str(source_path),
-                        driver_cls=driver_cls, descriptor=pack.shipped_descriptor(name),
-                        pack=pack)
+        source = Source(KIND_CAM, "hub" if hub is not None else "registry", name,
+                        path=str(source_path), driver_cls=driver_cls, descriptor=descriptor,
+                        hub=hub)
         _compiled, img = compile_source(source, {})
         with open(os.path.join(out_dir, f"{name}{IMAGE_SUFFIX}"), "wb") as fh:
             fh.write(img)

@@ -1,6 +1,6 @@
-"""The driver DSL compiler as a package: the field and parameter descriptors, the
-bytecode emitter, the measure-loop compiler, the driver base classes, and the
-register, camera, and stream drivers. `nxs.compiler` re-exports every name."""
+"""The personality DSL compiler as a package: the field and parameter descriptors, the
+bytecode emitter, the measure-loop compiler, the personality base classes, and the
+register, cam and stream personalities. `nxs.compiler` re-exports every name."""
 
 from nxs.dsl.errors import CompileError
 from nxs.dsl.fields import (
@@ -35,13 +35,13 @@ from nxs.dsl.emit import (
     TracedSlice,
 )
 from nxs.dsl.loop import _ASTCompiler
-from nxs.dsl.base import SensorDriver
-from nxs.dsl.register import RegisterDriver, SLEEP_ROW, _source_dir, load_table
-from nxs.dsl.camera import CameraSensor
+from nxs.dsl.base import ClickPersonality
+from nxs.dsl.register import RegisterClickPersonality, SLEEP_ROW, _source_dir, load_table
+from nxs.dsl.camera import CamPersonality
 from nxs.dsl.hub import HubDevice
 from nxs.dsl.stream import (
-    I2cCommandDriver,
-    StreamDriver,
+    I2cCommandClickPersonality,
+    StreamClickPersonality,
     ChecksumDescriptor,
     ChecksumFletcher,
 )
@@ -77,14 +77,14 @@ __all__ = [
     "BUS_STREAM",
     "OpErrorCode",
     "TracedSlice",
-    "SensorDriver",
-    "RegisterDriver",
+    "ClickPersonality",
+    "RegisterClickPersonality",
     "SLEEP_ROW",
     "load_table",
-    "CameraSensor",
+    "CamPersonality",
     "HubDevice",
-    "I2cCommandDriver",
-    "StreamDriver",
+    "I2cCommandClickPersonality",
+    "StreamClickPersonality",
     "ChecksumDescriptor",
     "ChecksumFletcher",
 ]

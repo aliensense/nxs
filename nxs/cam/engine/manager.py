@@ -333,7 +333,9 @@ class Manager:
         )
         self._record_settle(step, what, step.timeout_ms, False)
         raise ExpectFailedError(
-            f"expect {what} within {step.timeout_ms} ms: {detail}"
+            f"expect {what} within {step.timeout_ms} ms: {detail}",
+            wait=step.comment or what,
+            timeout_ms=step.timeout_ms,
         )
 
     def _record_settle(self, step: ExpectStep, what: str, elapsed_ms: int,

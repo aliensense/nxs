@@ -46,16 +46,16 @@ exclude = ["nxs.tests*"]
 
 # The vendored DSDL ships in the wheel so `aliensense-nxs[cyphal]` is self-contained; the
 # ros2/ data (launch file, RViz config) ships too, found via `nxs ros2 --launch-file`.
-# The quiet descriptor pack (packs/<pack>: the manifest, the flows, the
-# topology, the serdes descriptors with their blobs, the pack license) is
-# exported there by release.sh before the build and is git-ignored.
+# The quiet hub (hubs/<hub>: the manifest, the flows, the wiring, the
+# serdes facts with their blobs, the hub license) is exported there by
+# release.sh before the build and is git-ignored.
 [tool.setuptools.package-data]
 nxs = [
     "dsdl/**/*.dsdl", "dsdl/*.md", "dsdl/LICENSE-*", "ros2/*.launch.py", "ros2/*.rviz",
-    "host/*.rules", "drivers/*.yaml", "schemas/*.json",
-    "packs/*/pack.yaml", "packs/*/topology.yaml", "packs/*/flows.py", "packs/*/flows/*.py",
-    "packs/*/LICENSE-*",
-    "packs/*/*/*.yaml", "packs/*/*/*.py", "packs/*/*/blobs/*.yaml",
+    "host/*.rules", "click_personalities/*/*.py", "click_personalities/*/*.yaml", "schemas/*.json",
+    "hubs/*/hub.yaml", "hubs/*/topology.yaml", "hubs/*/flows.py", "hubs/*/flows/*.py",
+    "hubs/*/LICENSE-*",
+    "hubs/*/*/*.yaml", "hubs/*/*/*.py", "hubs/*/*/blobs/*.yaml",
     "_lib/libnxs.*",
 ]
 

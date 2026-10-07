@@ -1,4 +1,4 @@
-"""Declarative SPI frame schemas. A driver declares its framing (CRC, reserved
+"""Declarative SPI frame schemas. A personality declares its framing (CRC, reserved
 bits, pipelined reads) as a `SpiFrame`; the compiler emits the exact on-wire
 bytes per access. Fields are MSB-first and `width` is a multiple of 8."""
 

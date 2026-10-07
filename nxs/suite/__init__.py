@@ -12,22 +12,25 @@ PERSONALITY_DIR = "/opt/aliensense/personalities"
 #: The store's earlier location, read after PERSONALITY_DIR and never
 #: written, so an install that filled it keeps resolving.
 EARLIER_PERSONALITY_DIR = "/opt/aliensense/patches"
-#: A third store, read last.
-DRIVERS_DIR = "/opt/aliensense/drivers"
+#: The click personalities the wheel ships, in the store's shape, read last:
+#: a store name shadows a shipped one.
+SHIPPED_CLICK_PERSONALITIES_DIR = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "..", "click_personalities"))
 
 
-def personality_dirs(drivers_dir=None):
+def personality_dirs(personalities_dir=None):
     """The directories a personality name resolves in: the one given, else
-    every store, the current location first."""
-    if drivers_dir is not None:
-        return [drivers_dir]
-    return [PERSONALITY_DIR, EARLIER_PERSONALITY_DIR, DRIVERS_DIR]
+    every store, the current location first; the wheel's own come last
+    either way."""
+    if personalities_dir is not None:
+        return [personalities_dir, SHIPPED_CLICK_PERSONALITIES_DIR]
+    return [PERSONALITY_DIR, EARLIER_PERSONALITY_DIR, SHIPPED_CLICK_PERSONALITIES_DIR]
 
 
-def personality_file(name: str, ext: str, drivers_dir=None):
+def personality_file(name: str, ext: str, personalities_dir=None):
     """`<dir>/<name>/<name>.<ext>` or `<dir>/<name>.<ext>` in the first
     store directory that carries the personality, or None."""
-    for directory in personality_dirs(drivers_dir):
+    for directory in personality_dirs(personalities_dir):
         for candidate in (os.path.join(directory, name, f"{name}.{ext}"),
                           os.path.join(directory, f"{name}.{ext}")):
             if os.path.exists(candidate):

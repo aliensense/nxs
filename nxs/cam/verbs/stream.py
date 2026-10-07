@@ -13,7 +13,7 @@ from nxs.cam import port_state
 from nxs.cam.port_state import port_capture_id
 from nxs.cam import capture, viewers
 from nxs.cam.identity import _require_nxs_hub
-from nxs.cam.select import _pack_for, _port_name, _refuse, _refuse_pod_only, _require_up, select_port_links
+from nxs.cam.select import _hub_for, _port_name, _refuse, _refuse_pod_only, _require_up, select_port_links
 from nxs.cam.verbs import verify
 
 
@@ -40,8 +40,8 @@ def cmd_stream(args: argparse.Namespace) -> int:
     if not selected:
         raise _refuse(f"nxs: no link is up on {_port_name(topology)}",
                       f"nxs {_port_name(topology)} <link> on")
-    pack = _pack_for(topology)
-    flows = pack.flows()
+    hub = _hub_for(topology)
+    flows = hub.flows()
     # A link without a capture id on this boot gets no viewer: say why
     # (the missing VC overlay, or a port not up) instead of silence.
     for link in selected:
@@ -52,7 +52,7 @@ def cmd_stream(args: argparse.Namespace) -> int:
     for stopped in viewers.stop_viewers(topology, selected):
         term.info(f"replacing viewer for link {stopped}")
 
-    gate = verify.csi_gate(pack, flows, topology)
+    gate = verify.csi_gate(hub, flows, topology)
 
     exposure, gain = getattr(args, "exposure", None), getattr(args, "gain", None)
     if (exposure is None) != (gain is None):
@@ -81,13 +81,16 @@ def cmd_capture(args: argparse.Namespace) -> int:
     if capture_id is None:
         raise SystemExit(verify._no_capture_id(topology, link))
 
-    pack = _pack_for(topology)
-    flows = pack.flows()
-    gate = verify.csi_gate(pack, flows, topology)
+    hub = _hub_for(topology)
+    flows = hub.flows()
+    gate = verify.csi_gate(hub, flows, topology)
 
     snapshot_dir = getattr(args, "snapshot", None)
     if snapshot_dir:
         Path(snapshot_dir).mkdir(parents=True, exist_ok=True)
+    # The tool's own viewer on the link holds its capture session: stopped
+    # here, past the refusals, just before the consumer takes the session.
+    verify.stop_viewers_for_count(topology, [link], "the capture")
     result = capture.headless_capture(
         hints, capture_id, gate, frames=args.frames,
         timeout_s=args.timeout, snapshot_dir=snapshot_dir,
@@ -133,7 +136,8 @@ def _capture_port(args: argparse.Namespace, topology, selected) -> int:
     if getattr(args, "snapshot", None):
         raise _refuse("snapshots come from one link at a time",
                       f"nxs {_port_name(topology)} <link> capture --snapshot ...")
-    outputs = verify.count(topology, selected, _pack_for(topology),
+    verify.stop_viewers_for_count(topology, selected, "the capture")
+    outputs = verify.count(topology, selected, _hub_for(topology),
                     {link.name: args.frames for link in selected}, timeout_s=args.timeout)
     port = _port_name(topology)
     rc = 0

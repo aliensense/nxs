@@ -59,7 +59,8 @@ def cmd_switch(args) -> int:
 
 def _switch(args) -> int:
     from nxs.suite.reconcile import switch_suite
-    from nxs.suite.switch_cam import camera_steps
+    from nxs.suite.switch_cam import (PORT_REFUSED, _owned_ports, _port_is_up, camera_steps,
+                                      ports_again_step, strapped_units)
 
     config_path = default_config_path()
     # The host's steps need no declaration (a fresh host boots no camera bus, and the
@@ -69,12 +70,18 @@ def _switch(args) -> int:
         cfg = load_manifest(config_path)
         if cfg is None:
             return 1
+    refused = False
     if args.only_unit is None:
         # The camera side first: the host, the pods, the boot table, the
-        # capture stack, the ports. A reboot it asks for ends the run.
+        # capture stack, the ports. A reboot it asks for ends the run. A
+        # port whose bring-up refused keeps its verdict, and the units
+        # follow: once the alias phase ran its pods answer at their
+        # aliases, and a pod still where it straps is skipped.
         rc = camera_steps(cfg, dry_run=args.dry_run, fdt=getattr(args, 'fdt', None),
                           config_path=config_path)
-        if rc != 0:
+        if rc == PORT_REFUSED:
+            refused = True
+        elif rc != 0:
             return rc
     if cfg is None:
         load_manifest(config_path)        # the refusal names `nxs generate`
@@ -82,7 +89,8 @@ def _switch(args) -> int:
     state = SuiteState.load(default_state_path())
     reports = switch_suite(cfg, state, dry_run=args.dry_run,
                            only_unit=args.only_unit,
-                           accept_new_serial=args.accept_new_serial)
+                           accept_new_serial=args.accept_new_serial,
+                           skip=strapped_units(cfg) if refused else None)
     if not reports and args.only_unit is not None:
         print(f"nxs switch: no unit named {args.only_unit!r} in the manifest",
               file=sys.stderr)
@@ -98,7 +106,26 @@ def _switch(args) -> int:
         if not report.ok:
             print(f"    {report.error}")
             failed += 1
+    rc = 0
+    if args.only_unit is None:
+        # A pod that took new firmware restarted behind a port recorded up;
+        # a port whose bring-up refused keeps its verdict.
+        down = [n for n in _owned_ports(cfg) if not _port_is_up(n)] if refused else []
+        rc = ports_again_step(cfg, [report.name for report in reports if report.restarted],
+                              dry_run=args.dry_run, config_path=config_path, exclude=down)
     if failed:
         print(f"{failed}/{len(reports)} unit(s) failed", file=sys.stderr)
+    return _final_status(rc, refused=refused, failed=bool(failed))
+
+
+def _final_status(ports_rc: int, *, refused: bool, failed: bool) -> int:
+    """The run's exit status: a reboot a port asked for ends it with 3
+    whatever else happened, a refused port or a failed unit is 1, and the
+    ports' own refusal code never leaves the tool."""
+    from nxs.suite.switch_cam import PORT_REFUSED
+
+    if ports_rc == 3:
+        return 3
+    if refused or failed or ports_rc == PORT_REFUSED:
         return 1
-    return 0
+    return ports_rc

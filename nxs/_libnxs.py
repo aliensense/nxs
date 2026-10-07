@@ -272,7 +272,7 @@ class Refusal:
 
 @dataclass(frozen=True)
 class PersonalityParams:
-    """Where a sensor personality's parameter table takes its values; None
+    """Where a cam personality's parameter table takes its values; None
     for a parameter the personality does not declare."""
     mode: int
     trigger: Optional[int] = None

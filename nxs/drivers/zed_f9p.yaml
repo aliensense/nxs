@@ -1,8 +1,0 @@
-# yaml-language-server: $schema=../schemas/unit-driver.schema.json
-# ZED-F9P driver for NXS VM.
-# Parameter capabilities; order fixes the wire's param
-# indices, so entries never reorder.
-meta:
-  driver: zed_f9p
-params:
-  - {name: rate, values: [1, 2, 5, 10], default: 1, unit: Hz}

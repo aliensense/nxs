@@ -39,8 +39,8 @@ def _call(fn, *args, **kwargs):
     return fn(*args, **{k: v for k, v in kwargs.items() if k in params})
 
 
-def _law_module(pack, descriptor):
-    chip_module = getattr(pack, "chip_module", None)
+def _law_module(hub, descriptor):
+    chip_module = getattr(hub, "chip_module", None)
     if chip_module is not None:
         module = chip_module(descriptor.compatible)
         if module is not None:
@@ -49,14 +49,14 @@ def _law_module(pack, descriptor):
     return chips.bind(descriptor)
 
 
-def _lane_law(pack):
-    """The pack's lane law for one camera, `lane_ceiling(lanes, contract)`;
-    None for a pack whose flows state none (a port without a hub)."""
-    flows = getattr(pack, "flows", None)
+def _lane_law(hub):
+    """The hub's lane law for one camera, `lane_ceiling(lanes, contract)`;
+    None for a hub whose flows state none (a port without a hub)."""
+    flows = getattr(hub, "flows", None)
     return getattr(flows(), "lane_ceiling", None) if flows is not None else None
 
 
-def derived_rows(pack, descriptor, lanes: Optional[int] = None,
+def derived_rows(hub, descriptor, lanes: Optional[int] = None,
                  default_fps: Optional[float] = None) -> List[Dict[str, Any]]:
     """The descriptor's `capture.table` with every row's `line_length`,
     `max_fps` and `default_fps` in place, for a port of `lanes` CSI lanes
@@ -65,7 +65,7 @@ def derived_rows(pack, descriptor, lanes: Optional[int] = None,
     and no such mode is refused by name). The top rate is the mode's own
     ceiling (the family's datasheet frame at the mode's line, INCK / (HMAX
     x V_TR)) or one camera's lane law on the lanes, whichever is lower, and
-    the ceiling alone without lanes or without the pack's lane law (a port
+    the ceiling alone without lanes or without the hub's lane law (a port
     without a hub); the default is the declared rate, FPS_DEFAULT without
     one, never above the top nor, on the frame law, the mode's own
     ceiling, and a table-only part's stated rate is its only rate. A
@@ -75,11 +75,11 @@ def derived_rows(pack, descriptor, lanes: Optional[int] = None,
     cap = descriptor.raw("capture") or {}
     rows: List[Dict[str, Any]] = []
     laws: Dict[str, Any] = {}
-    lane_law = _lane_law(pack) if lanes is not None else None
+    lane_law = _lane_law(hub) if lanes is not None else None
 
     def module():
         if not laws:
-            laws["module"] = _law_module(pack, descriptor)
+            laws["module"] = _law_module(hub, descriptor)
         return laws["module"]
 
     def ceiling_for(mode: str) -> float:

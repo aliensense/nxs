@@ -240,12 +240,42 @@ class BusLock:
             except BlockingIOError:
                 if time.monotonic() >= deadline:
                     self._fh.close()
-                    raise BusHeld(f"another nxs cam run holds {lock_path()} — wait for it")
+                    raise BusHeld(f"{bus_holder('another nxs cam run')} holds {lock_path()} — wait for it")
                 time.sleep(poll_s)
 
     def __exit__(self, *exc: Any) -> None:
         fcntl.flock(self._fh, fcntl.LOCK_UN)
         self._fh.close()
+
+
+def bus_holder(unnamed: Optional[str] = None) -> Optional[str]:
+    """Who holds the bus lock, as the kernel's lock table and the holder's
+    command line say (`nxsd (pid 9590)`, `nxs cam1 on (pid 123)`), else
+    `unnamed`: no holder, this process itself, or one the host does not let
+    this run read. Asked after a wait met the lock held."""
+    try:
+        held = os.stat(lock_path())
+        inode = f"{os.major(held.st_dev):02x}:{os.minor(held.st_dev):02x}:{held.st_ino}"
+        with open("/proc/locks") as table:
+            pid = next(int(row[-4]) for row in map(str.split, table)
+                       if row[-3] == inode and "FLOCK" in row and row[1] != "->")
+        argv = Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace").split("\0")[:-1]
+    except (OSError, StopIteration, ValueError):
+        return unnamed
+    if argv and os.path.basename(argv[0]).startswith("python"):
+        argv = argv[1:]
+    if pid == os.getpid() or not argv:
+        return unnamed
+    return f"{' '.join([os.path.basename(argv[0]), *argv[1:4]])} (pid {pid})"
+
+
+def held_text(hint: str) -> str:
+    """The line for a bus another run holds past HELD_WAIT_S: the holder the
+    kernel's lock table names, else `another nxs run` with `hint`, what
+    holds a bus that long."""
+    holder = bus_holder()
+    held = f"holds the bus after {HELD_WAIT_S:g} s of waiting"
+    return f"{holder} {held}" if holder else f"another nxs run {held} ({hint})"
 
 
 def port_name(topology: Topology) -> str:
@@ -632,7 +662,7 @@ def set_sync(source: str, fps: Optional[float] = None,
     ``pulse_exposure`` and ``trigger_vmax`` carry the generator plan
     (whether the pulse sets the synced links' exposure, the frame each
     link runs); ``ae`` who sets the camera links' exposure and gain (the
-    pack's `pair_ae`: `follow`, `locked` or `per_link`)."""
+    hub's `pair_ae`: `follow`, `locked` or `per_link`)."""
     record = _load()
     sync: Dict[str, Any] = {"source": source, "fps": fps}
     if links:

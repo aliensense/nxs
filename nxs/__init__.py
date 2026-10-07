@@ -1,18 +1,18 @@
-"""nxs: sensor driver compiler, client SDK, and suite tooling for NXS. `Sample`
-here is the driver DSL's measure-loop return type; the decoded stream sample
+"""nxs: personality compiler, client SDK, and suite tooling for NXS. `Sample`
+here is the personality DSL's measure-loop return type; the decoded stream sample
 `open_client(...).iter_samples()` yields is `nxs.client.Sample`."""
 
 from importlib.metadata import PackageNotFoundError, version as _installed_version
 
 from nxs.client import NxsClient
 from nxs.compiler import (
-    CameraSensor,
+    CamPersonality,
     CompiledDriver,
-    I2cCommandDriver,
-    RegisterDriver,
+    I2cCommandClickPersonality,
+    RegisterClickPersonality,
     Sample,
-    SensorDriver,
-    StreamDriver,
+    ClickPersonality,
+    StreamClickPersonality,
 )
 from nxs.profiles import I2cProfile, SpiProfile
 from nxs.transports import open_client
@@ -30,15 +30,15 @@ def _version() -> str:
 __version__ = _version()
 
 __all__ = [
-    "CameraSensor",
+    "CamPersonality",
     "CompiledDriver",
-    "I2cCommandDriver",
+    "I2cCommandClickPersonality",
     "I2cProfile",
     "NxsClient",
-    "RegisterDriver",
+    "RegisterClickPersonality",
     "Sample",
-    "SensorDriver",
+    "ClickPersonality",
     "SpiProfile",
-    "StreamDriver",
+    "StreamClickPersonality",
     "open_client",
 ]

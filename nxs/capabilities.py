@@ -10,7 +10,7 @@ from nxs._generated_constants import Calibration as CalConstants
 from nxs._generated_constants import FieldSemantics
 from nxs._generated_constants import NxsRegisters
 from nxs._generated_constants import Personality
-from nxs.descriptor import IDENTITY_M
+from nxs.click_facts import IDENTITY_M
 from nxs.device_errors import CAM_VERDICT_REASON, DeviceRefused, err_reason
 
 
@@ -58,8 +58,8 @@ class SupportsSlotPeek(ABC):
 
     @abstractmethod
     def read_slot_info(self, slot: int):
-        """Driver metadata for a stored slot, or None if empty.
-        `slot == ACTIVE_SLOT` (0xFF) returns the active driver instead
+        """Personality metadata for a stored slot, or None if empty.
+        `slot == ACTIVE_SLOT` (0xFF) returns the active personality instead
         of a stored slot."""
 
 class SupportsFaultCounters(ABC):
@@ -230,12 +230,12 @@ def rotation_code(name: str) -> int:
 class CalibrationRecord:
     """The device's per-unit calibration record, host view. ``m``/``b`` are
     sensor-frame affines indexed like ``CAL_VECTORS``, ``orientation`` is a
-    ROTATION_* code composed on top, and a driver tag gates its bucket."""
+    ROTATION_* code composed on top, and a personality tag gates its bucket."""
     orientation: int = 0
     m: Tuple[Tuple[float, ...], ...] = (IDENTITY_M,) * 3
     b: Tuple[Tuple[float, ...], ...] = ((0.0, 0.0, 0.0),) * 3
     encoder_zero: float = 0.0
-    driver_tags: Tuple[int, ...] = (0, 0, 0)
+    personality_tags: Tuple[int, ...] = (0, 0, 0)
     encoder_tag: int = 0
 
     def bucket_guard(self, vec: int, active_tag: int) -> int:
@@ -243,7 +243,7 @@ class CalibrationRecord:
         `Calibration.BucketGuard` code: `BOUND` solved against this sensor,
         `UNGUARDED` carrying no identity, `STALE` never applied."""
         guard = CalConstants.BucketGuard
-        tag = (self.driver_tags[vec] if vec < len(self.driver_tags)
+        tag = (self.personality_tags[vec] if vec < len(self.personality_tags)
                else self.encoder_tag)
         if tag == 0:
             return guard.UNGUARDED
@@ -256,7 +256,7 @@ class CalibrationRecord:
         flat_b = [v for row in self.b for v in row]
         return _CAL_STRUCT.pack(CalConstants.RECORD_VERSION, self.orientation,
                                 *flat_m, *flat_b, self.encoder_zero,
-                                *self.driver_tags, self.encoder_tag)
+                                *self.personality_tags, self.encoder_tag)
 
     @classmethod
     def unpack(cls, data: bytes) -> "CalibrationRecord":
@@ -274,7 +274,7 @@ class CalibrationRecord:
                    m=tuple(tuple(flat_m[v * 9:v * 9 + 9]) for v in range(3)),
                    b=tuple(tuple(flat_b[v * 3:v * 3 + 3]) for v in range(3)),
                    encoder_zero=fields[38],
-                   driver_tags=tuple(fields[39:42]),
+                   personality_tags=tuple(fields[39:42]),
                    encoder_tag=fields[42])
 
     def replace_vector(self, vec: int, m: Tuple[float, ...],
@@ -282,13 +282,13 @@ class CalibrationRecord:
         """Copy with one bucket's affine + tag swapped."""
         ms = list(self.m)
         bs = list(self.b)
-        tags = list(self.driver_tags)
+        tags = list(self.personality_tags)
         ms[vec] = tuple(m)
         bs[vec] = tuple(b)
         tags[vec] = tag
         return CalibrationRecord(orientation=self.orientation, m=tuple(ms),
                                  b=tuple(bs), encoder_zero=self.encoder_zero,
-                                 driver_tags=tuple(tags),
+                                 personality_tags=tuple(tags),
                                  encoder_tag=self.encoder_tag)
 
 class SupportsCalibration(ABC):
@@ -356,32 +356,32 @@ def cam_run_state_name(code: int) -> str:
     return CamRunState._NAMES.get(code, str(code))
 
 class SupportsCameraRun(ABC):
-    """The unit runs a stored camera personality once on its pod-side bus
+    """The unit runs a stored cam personality once on its pod-side bus
     (`Cmd::CAM_RUN`) while the host stays off the sensor, and serves the
     personality's descriptor trailer back page by page."""
 
     @abstractmethod
     def cam_stage_params(self, slot: int, values) -> None:
-        """Stage run parameters for the camera personality in store slot
+        """Stage run parameters for the cam personality in store slot
         `slot`: `values` maps a parameter index to the value the next
         `cam_run(slot)` applies to its RAM copy of the program (nothing on
         the unit is patched). The stage holds one value per index, is armed
         by peeking the slot, and is dropped by a peek of another slot, so
         stage then run without a `store ls` between. DeviceRefused with
-        `CAM_RUN_ERR_REASON` on an empty or driver slot; a value the
+        `CAM_RUN_ERR_REASON` on an empty slot or a click personality's; a value the
         parameter does not accept refuses the run itself with EINVAL."""
 
     @abstractmethod
     def cam_read_params(self, slot: int, indices) -> Dict[int, int]:
-        """Read run parameters of the camera personality in store slot
+        """Read run parameters of the cam personality in store slot
         `slot` by index, under its peek view: for each index the staged
         value, else the value the slot's last completed run ended with,
         else the compiled default. DeviceRefused with `CAM_RUN_ERR_REASON`
-        on an empty or driver slot."""
+        on an empty slot or a click personality's."""
 
     @abstractmethod
     def cam_run(self, slot: int) -> None:
-        """Start the camera personality in store slot `slot`; returns on
+        """Start the cam personality in store slot `slot`; returns on
         the accept (DeviceRefused with `CAM_RUN_ERR_REASON` on ENOEXEC /
         ENOENT / EBUSY / EINVAL). Progress and the verdict come from
         `read_cam_state`."""

@@ -25,12 +25,12 @@ class _ValueCompiler:
                 if off != existing:
                     self._em.emit(Op.SHL64, off, 0, existing)  # copy result in
                     if owned:
-                        self._driver._work.free(off)
+                        self._personality._work.free(off)
                 return
             # First binding. A bare `y = self.cN` / `y = <wide local>` (not
             # owned) is copied into a fresh slot so the local owns its storage.
             if not owned:
-                named = self._driver._work.alloc()
+                named = self._personality._work.alloc()
                 self._em.emit(Op.SHL64, off, 0, named)
                 off = named
             self._wide_locals[var_name] = off
@@ -39,7 +39,7 @@ class _ValueCompiler:
         # Narrow assignment. If `var_name` was wide before, release its slot.
         old = self._wide_locals.pop(var_name, None)
         if old is not None:
-            self._driver._work.free(old)
+            self._personality._work.free(old)
         dst = self._regs.get(var_name)
 
         # Constant assignment (`flag = 0`) -> LOAD_IMM.
@@ -69,7 +69,7 @@ class _ValueCompiler:
             if method == "read":
                 reg = self._eval_const(value.args[0])
                 if self._frame is not None:
-                    # FRAME driver: clock the composed wire frame, not a plain
+                    # FRAME personality: clock the composed wire frame, not a plain
                     # REG_READ (which would clock unframed garbage on the bus).
                     dw = self._frame.data_byte_width()
                     if len(value.args) > 1 and self._eval_const(value.args[1]) != dw:
@@ -79,9 +79,9 @@ class _ValueCompiler:
                     signed, endian, dev = self._read_kwargs(value.keywords)
                     if dev is not None:
                         raise CompileError(
-                            f"dev= targets an I2C companion; a FRAME driver "
+                            f"dev= targets an I2C companion; a FRAME personality "
                             f"is SPI and declares none (line {value.lineno}).")
-                    self._driver._emit_frame_read(reg, dst, signed, endian)
+                    self._personality._emit_frame_read(reg, dst, signed, endian)
                     return
                 if len(value.args) > 1:
                     # read(reg, width[, signed=, endian=, dev=]): burst `width`
@@ -121,8 +121,8 @@ class _ValueCompiler:
                 if self._frame is None:
                     raise CompileError(
                         f"self.read_words(...) requires a FRAME schema on "
-                        f"the driver class (line {value.lineno}). Plain-"
-                        f"register drivers should use self.read_burst(...).")
+                        f"the personality class (line {value.lineno}). Plain-"
+                        f"register personalities should use self.read_burst(...).")
                 start_reg = self._eval_const(value.args[0])
                 num_words = self._eval_const(value.args[1])
                 # read_words bounds its output against the floating FRAME slot
@@ -142,7 +142,7 @@ class _ValueCompiler:
                             f"unknown keyword {kw.arg!r} on xfer; the only "
                             f"supported keyword is width= (line {value.lineno})")
                     width = self._eval_const(kw.value)
-                off = self._driver._emit_xfer(word, width)
+                off = self._personality._emit_xfer(word, width)
                 if width == 1:
                     self._em.emit(Op.LOAD_U8, dst, off)
                 elif width == 2:
@@ -158,7 +158,7 @@ class _ValueCompiler:
                 into, dev = self._into_kwarg(value.keywords, value.lineno)
                 if dev is not None:
                     raise CompileError(
-                        f"dev= targets an I2C companion; a stream driver "
+                        f"dev= targets an I2C companion; a stream personality "
                         f"has none (line {value.lineno}).")
                 self._claim_data_span(into, count, "read", value.lineno)
                 self._em.emit(Op.UART_READ, count, into)
@@ -196,7 +196,7 @@ class _ValueCompiler:
 
         raise CompileError(
             f"Unsupported assignment value: self.{method}(...) "
-            f"on {self._bus_kind} driver (line {value.lineno})")
+            f"on {self._bus_kind} personality (line {value.lineno})")
 
     def _compile_verify_checksum(self, value, dst: int):
         """Emit the Fletcher-verify loop; `dst` accumulates the mismatch count.
@@ -328,7 +328,7 @@ class _ValueCompiler:
         if isinstance(node, ast.Name):
             return node.id in self._wide_locals
         if self._is_self_method(node):  # bare `self.<attr>` → a coefficient?
-            return isinstance(getattr(self._driver, node.attr, None), WideRef)
+            return isinstance(getattr(self._personality, node.attr, None), WideRef)
         return False
 
     def _eval_narrow_reg(self, node) -> int:
@@ -353,25 +353,25 @@ class _ValueCompiler:
         if self._is_wide(node):
             return self._eval_wide(node)
         reg = self._eval_narrow_reg(node)
-        off = self._driver._work.alloc()
+        off = self._personality._work.alloc()
         self._em.emit(Op.CVT64, reg, off)
         return off, True
 
     def _wide_result_unary(self, a_off, a_owned):
         """Destination for a unary wide op: reuse an owned operand (handlers
         read before write), else a fresh slot."""
-        return a_off if a_owned else self._driver._work.alloc()
+        return a_off if a_owned else self._personality._work.alloc()
 
     def _wide_result_binary(self, a_off, a_owned, b_off, b_owned):
         """Destination for a binary wide op: reuse an owned operand, freeing
         the other owned temp; else a fresh slot."""
         if a_owned:
             if b_owned:
-                self._driver._work.free(b_off)
+                self._personality._work.free(b_off)
             return a_off
         if b_owned:
             return b_off
-        return self._driver._work.alloc()
+        return self._personality._work.alloc()
 
     def _eval_wide(self, node):
         """Compile an already-wide `node` to (work_off, owned); the caller
@@ -379,7 +379,7 @@ class _ValueCompiler:
         if isinstance(node, ast.Name):
             return self._wide_locals[node.id], False
         if self._is_self_method(node):
-            return getattr(self._driver, node.attr).off, False
+            return getattr(self._personality, node.attr).off, False
         if isinstance(node, ast.BinOp):
             op = node.op
             if isinstance(op, ast.Mult):
@@ -436,13 +436,13 @@ class _ValueCompiler:
             r = self._regs.get("__narrow_scratch")
             self._em.emit(Op.TRUNC64, off, r)
             if owned:
-                self._driver._work.free(off)
+                self._personality._work.free(off)
             return r
         return self._eval_narrow_reg(node)
 
     def _emit_frame_burst(self, start_reg: int, num_words: int):
         """Emit a FRAME-aware pipelined read of N consecutive registers. Output
-        packs at [0, num_words * dw); one rotating TX/RX slot sits at the buffer
+        hubs at [0, num_words * dw); one rotating TX/RX slot sits at the buffer
         tail, and each RX is MEMCPY'd out before the next TX overwrites it."""
         frame = self._frame
         fw = frame.byte_width
@@ -497,7 +497,7 @@ class _ValueCompiler:
                     st_off, st_mask, st_expect = frame.status_byte()
             except (ValueError, KeyError) as e:
                 raise CompileError(
-                    f"{type(self._driver).__name__}: FRAME verification is "
+                    f"{type(self._personality).__name__}: FRAME verification is "
                     f"not expressible on-device: {e}") from None
 
         with self._regs.scope():

@@ -3,7 +3,8 @@
 
 """`nxs mcp`: the nxs verbs as tools an AI agent can call. Every tool runs the
 `nxs` command line as a subprocess, so the agent gets the same verbs and
-refusals; needs the `mcp` extra (`pip install 'aliensense-nxs[mcp]'`), runs where the buses are."""
+refusals; needs the `mcp` extra (`nxs mcp` names its install line), runs where
+the buses are."""
 
 from __future__ import annotations
 
@@ -146,7 +147,7 @@ def samples(unit: Optional[str] = None, count: int = 5) -> dict:
 
 def status(port: Optional[str] = None, link: Optional[str] = None) -> dict:
     """Health. Without a port: the declared-vs-actual tree from the
-    declaration. With a port: the descriptor-driven diagnosis (link locks,
+    declaration. With a port: the facts-driven diagnosis (link locks,
     video lock per pipe, CSI gate, sensor timing readbacks)."""
     if port is None:
         return _call_json(["status", "--json"])
@@ -167,7 +168,7 @@ def on(port: str, link: Optional[str] = None, mode: Optional[str] = None,
     declared link together). `mode` is a mode token (WxH, WxH-rawN, or a mode name)
     among the modes `caps` lists, `fps` a rate inside the mode's lawful range (the
     declared rate without one, else 30 fps inside the range), `sensor` names the
-    pack sensor; dry_run prints the plan without touching the bus. The port is up
+    hub sensor; dry_run prints the plan without touching the bus. The port is up
     once two seconds of frames counted on every camera link arrive at its rate; a
     link that delivers less is refused naming the rates delivered."""
     argv = _node(port, link, "on")
@@ -211,7 +212,7 @@ def get(port: str, link: str, knob: str) -> str:
 def set_knob(port: str, link: Optional[str], knob: str, value: str,
              dry_run: bool = False, fps: Optional[float] = None,
              exposure_us: Optional[float] = None) -> str:
-    """Change a knob under the pack's laws; an infeasible value is refused
+    """Change a knob under the hub's laws; an infeasible value is refused
     naming the lawful alternatives. `sync` is the port's frame sync (`link`
     omitted): `fsync` starts the hub's generator at `fps`, one pulse per
     frame, with the synced sensors on their trigger, `free_run` returns to
@@ -220,7 +221,8 @@ def set_knob(port: str, link: Optional[str], knob: str, value: str,
     exposure needs a higher rate. A new sync or `fps` is counted for two
     seconds on the links it changes; one they do not deliver is refused
     naming the rates delivered, and the previous sync or rate comes back.
-    dry_run prints the write stream. Refused on a live sibling link."""
+    dry_run prints the write stream. A camera knob is refused on a live
+    sibling link; a knob the camera does not have goes to the link's unit."""
     argv = _node(port, link, "set", knob, str(value))
     if fps is not None:
         argv += ["--fps", str(float(fps))]
@@ -245,7 +247,7 @@ def suite_get() -> dict:
 def suite_schema() -> dict:
     """The rig's rules as JSON Schema (2020-12): the declaration schema narrowed
     by the nodes on this rig. Each port lists the keys its nodes bring, each
-    link the sensors its port's pack serves, each sensor its modes and each
+    link the sensors its port's hub serves, each sensor its modes and each
     mode the rates the laws give it on the port; a unit's personality lists
     its config keys.
     Validate a declaration against it before writing it. It is necessary,
@@ -253,14 +255,26 @@ def suite_schema() -> dict:
     return _call_json(["tune", "--schema", "--json"])
 
 
-def suite_set(channel: str, field: str, value: str,
-              section: Optional[str] = None) -> dict:
-    """Set one declared value from its offered options (see suite_get) and save
-    the declaration with a timestamped backup; the result carries the check
-    findings. Nothing converges until `switch` (units) or `reload` (ports)."""
-    address = f"{channel}:{section}:{field}" if section else f"{channel}:{field}"
-    rc, out = _run(["tune", "--set", f"{address}={value}", "--json"],
-                   timeout=60.0)
+def suite_set(channel: Optional[str] = None, field: Optional[str] = None,
+              value: Optional[str] = None, section: Optional[str] = None,
+              sets: Optional[List[str]] = None) -> dict:
+    """Set declared values from their offered options (see suite_get) and save
+    the declaration once, with a timestamped backup; the result carries the
+    check findings. One value as `channel`, `field` and `value` (`section`
+    when the field repeats in the channel), or a batch as `sets`, each
+    `CHANNEL[:SECTION]:FIELD=VALUE`, applied in order before the save: a hub
+    with its links' sensors, a mode with the rate it moves. Nothing converges
+    until `switch` (units) or `reload` (ports)."""
+    specs = list(sets or [])
+    if channel is not None or field is not None or value is not None:
+        if not (channel and field) or value is None:
+            raise Refusal("suite_set: channel, field and value go together")
+        address = f"{channel}:{section}:{field}" if section else f"{channel}:{field}"
+        specs.append(f"{address}={value}")
+    if not specs:
+        raise Refusal("suite_set: nothing to set — pass channel, field and value, or sets")
+    argv = ["tune"] + [arg for spec in specs for arg in ("--set", spec)] + ["--json"]
+    rc, out = _run(argv, timeout=60.0)
     try:
         return json.loads(out)
     except json.JSONDecodeError:
@@ -290,10 +304,19 @@ def reload() -> dict:
         raise Refusal(out)
 
 
-def freeze(unit: Optional[str] = None, dry_run: bool = False) -> str:
-    """Adopt live tuning into the declaration (the device wins): one unit
-    by name, or every declared unit. The live-first flow's last step."""
-    argv = ["tune", "--freeze"] + (["--unit", unit] if unit else [])
+def freeze(unit: Optional[str] = None, dry_run: bool = False, ports: bool = False,
+           port: Optional[str] = None) -> str:
+    """Adopt live tuning into the declaration (the device wins): one unit by
+    name, every declared unit, or with `ports` the camera ports as the booted
+    overlay and the live state have them (`port` narrows to one). The
+    live-first flow's last step."""
+    argv = ["tune", "--freeze"]
+    if ports or port:
+        argv.append("--ports")
+    if port:
+        argv += ["--port", port]
+    if unit:
+        argv += ["--unit", unit]
     if dry_run:
         argv.append("--dry-run")
     return _call(argv, timeout=180.0)
@@ -311,7 +334,7 @@ def upload(name: str, port: Optional[str] = None, link: Optional[str] = None,
            unit: Optional[str] = None, params: Optional[List[str]] = None,
            slot: Optional[int] = None, compile_only: bool = False) -> str:
     """Compile and upload a personality (a name, a `.nxs`, a `.py`, or the
-    `.yaml` of a source pair) to a unit: a driver runs, a camera personality
+    `.yaml` of a source pair) to a unit: a click personality runs, a cam personality
     lands in a store slot the camera verbs run it from. The unit is the node
     (`port`, `link`), a declared `unit`, or the one unit answering on the
     camera buses. `params` are `key=value` strings (mode=1). With
@@ -365,7 +388,7 @@ TOOLS: List[ToolSpec] = [
              "hardware.yaml, the report of what answered, and seeds suite.yaml when "
              "there is none. A unit on a bare bus running nothing is named by "
              "trying every personality on it",
-             "no pack and no camera port, or the wiring file is not writable"),
+             "no hub and no camera port, or the wiring file is not writable"),
     ToolSpec("status", status, "the declaration against the rig, or a port's "
                                "presence and health",
              "port?, link?", "none (reads identity and status registers)",
@@ -379,8 +402,8 @@ TOOLS: List[ToolSpec] = [
              "decimation for the read and puts the previous value back",
              "no personality measuring, or the unit does not answer"),
     ToolSpec("caps", caps, "what the sensor offers, with the laws",
-             "port, link?", "none (descriptor data)",
-             "no descriptor pack covers the chip", read_only=True),
+             "port, link?", "none (reads facts)",
+             "no hub serves the port, or nothing installed describes its sensor", read_only=True),
     ToolSpec("on", on, "bring a link or the whole port up",
              "port, link?, sensor?, mode?, fps?, dry_run?",
              "writes the program, trains links, follows video lock, counts two "
@@ -391,7 +414,7 @@ TOOLS: List[ToolSpec] = [
              "sensors to standby, CSI gate closed, viewers stopped, each pod's head parked",
              "kernel-owned hub"),
     ToolSpec("capture", capture, "headless delivery proof", "port, link, frames?, timeout_s?",
-             "opens a capture session on the up link",
+             "opens a capture session on the up link, the tool's viewer on it stopped first",
              "the link is not up, or the frames were not delivered"),
     ToolSpec("get", get, "read a knob: the port's sync, the sensor's, the unit's",
              "port, link, knob",
@@ -400,10 +423,11 @@ TOOLS: List[ToolSpec] = [
     ToolSpec("set", set_knob, "change a knob under the laws, sync being the port's "
                               "frame sync",
              "port, link?, knob, value, dry_run?, fps?, exposure_us?",
-             "writes sensor registers. Sync starts or stops the hub's generator, and "
+             "writes sensor registers, or the link's unit for a knob that is its "
+             "personality's parameter. Sync starts or stops the hub's generator, and "
              "a sync or fps change counts two seconds of frames",
              "an unlawful value, with the lawful alternatives. A sync or rate the "
-             "links do not deliver, the previous one restored. A live sibling link. "
+             "links do not deliver, the previous one restored. A live sibling link, for a camera knob. "
              "The port is not up"),
     ToolSpec("suite_get", suite_get, "the declaration as options", "—",
              "none", "no camera port on the host and no declaration",
@@ -411,10 +435,11 @@ TOOLS: List[ToolSpec] = [
     ToolSpec("suite_schema", suite_schema, "the rig's rules as JSON Schema", "—",
              "none", "the declaration does not parse",
              read_only=True, idempotent=True),
-    ToolSpec("suite_set", suite_set, "set one declared value from its options",
-             "channel, field, value, section?",
-             "writes suite.yaml (a timestamped backup, created when absent)",
-             "the value is not among the options, or the field is ambiguous"),
+    ToolSpec("suite_set", suite_set, "set declared values from their options, one or a batch",
+             "channel?, field?, value?, section?, sets?",
+             "writes suite.yaml once (a timestamped backup, created when absent)",
+             "a value not among the options, a field that repeats without its section, "
+             "or a knob a set moved that the batch does not name"),
     ToolSpec("switch", switch, "apply the saved declaration to the units",
              "dry_run?, accept_new_serial?",
              "retunes or re-uploads the personality on units whose entry differs",
@@ -422,12 +447,13 @@ TOOLS: List[ToolSpec] = [
     ToolSpec("reload", reload, "apply the saved declaration to the ports", "—",
              "nxsd reconverges changed ports",
              "the declaration is out of tune, or nxsd is not running"),
-    ToolSpec("freeze", freeze, "adopt live tuning into the declaration",
-             "unit?, dry_run?", "writes suite.yaml", "unit unreachable"),
+    ToolSpec("freeze", freeze, "adopt live tuning into the declaration: the units', or the camera ports'",
+             "unit?, ports?, port?, dry_run?", "writes suite.yaml",
+             "unit unreachable, or a port no host bus answers to"),
     ToolSpec("upload", upload,
              "compile and upload a personality to a unit (or compile only)",
              "name, port?, link?, unit?, params?, slot?, compile_only?",
-             "a driver runs, and a camera personality lands in a store slot",
+             "a click personality runs, and a cam personality lands in a store slot",
              "an unknown name, a source that does not compile, a full store, or several "
              "units that answer with none named"),
     ToolSpec("host_info", host_info, "the capture host and what it booted",
@@ -500,9 +526,10 @@ def cmd_mcp(args) -> int:
     if getattr(args, "doc_table", False):
         print(doc_table())
         return 0
+    from nxs.extras import require
     try:
-        import mcp  # noqa: F401
-    except ImportError:
-        raise SystemExit("nxs mcp needs: pip install 'aliensense-nxs[mcp]'")
+        require("mcp", "mcp", "nxs mcp")
+    except ImportError as exc:
+        raise SystemExit(str(exc)) from None
     build_server().run(transport="stdio")
     return 0

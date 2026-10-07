@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Aliensense.
 # SPDX-License-Identifier: Apache-2.0
 
-"""What a hub image is compiled from and staged with: the pack a hub chip
+"""What a hub image is compiled from and staged with: the hub a hub chip
 belongs to, the reference ports its phases are composed on, and the
 parameter vocabulary the images and the walk (`nxs_port_up`) share."""
 
@@ -27,32 +27,32 @@ DATA_TYPES = {"RAW10": 0, "RAW12": 1}
 CSI_LANES = (2, 4)
 
 
-def pack_of(chip: str):
-    """The discoverable pack that ships `chip` with flows for its hub."""
-    from nxs.cam import packs
+def of_chip(chip: str):
+    """The discoverable hub whose own chips include `chip`."""
+    from nxs.cam import hubs
 
-    for pack in packs.discover():
-        if chip in pack.chips and pack.flows_for:
-            return pack
-    raise InfeasibleConfig(f"no discoverable pack ships {chip} with its flows")
+    try:
+        return hubs.of_chip(chip)
+    except hubs.HubError as exc:
+        raise InfeasibleConfig(str(exc)) from None
 
 
-def reference_topology(pack, sensors: Dict[str, str], csi_lanes: int = 2,
+def reference_topology(hub, sensors: Dict[str, str], csi_lanes: int = 2,
                        modes: Optional[Dict[str, str]] = None) -> Topology:
-    """A two-link port of the pack's hub with `sensors` (link name ->
+    """A two-link port of the hub's hub with `sensors` (link name ->
     compatible), each link in its mode from `modes` (link name -> mode
     name; the laws' choice for a link it leaves out), a pod on each link
     at the seeded aliases: what a hub image's phases are composed on."""
-    ser = next(c for c in pack.chips if pack.descriptor(c).role == "SER")
+    ser = next(c for c in hub.chips if hub.descriptor(c).role == "SER")
     links = tuple(
         LinkSpec(name=name, des_window=0x21 + i, csi_vc=1 - i,
                  sensor_compatible=sensors[name],
-                 ser_compatible=pack.descriptor(ser).compatible,
+                 ser_compatible=hub.descriptor(ser).compatible,
                  mode=(modes or {}).get(name),
                  nxs_units=(NxsUnitSpec(0x31 + i, 0x30),))
         for i, name in enumerate(("A", "B")))
-    return Topology(carrier=f"{pack.name}/cam0", i2c_bus="/dev/i2c-0", csi_lanes=csi_lanes,
-                    des_compatible=pack.flows_for[0], links=links)
+    return Topology(carrier=f"{hub.name}/cam0", i2c_bus="/dev/i2c-0", csi_lanes=csi_lanes,
+                    des_compatible=hub.flows_for[0], links=links)
 
 
 #: The facts a link with a pod and no camera stages the hub image with:

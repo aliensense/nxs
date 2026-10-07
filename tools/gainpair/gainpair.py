@@ -23,7 +23,7 @@ sample to the first in-step one, or to the run's end) and the widest gap
 among them in dB.
 
 The heads, the register and its dB step are the ones nxsd's follower copies,
-the pack's `build_follow` for the port: the port record's leader and follower,
+the hub's `build_follow` for the port: the port record's leader and follower,
 else the port's first two camera links (a pair `camera.gain_db` locks).
 `--leader`, `--follower` and `--reg` replace the addresses and the register.
 The bus is the libnxs handle (ADR 0003).
@@ -86,7 +86,7 @@ class Summary:
 def plan_for(port) -> Tuple[FollowPlan, str, float]:
     """What nxsd's follower copies on a declared port (`port`, the manifest's
     port spec), the port's bus and the rate its record runs the leader at."""
-    from nxs.cam import packs, port_state
+    from nxs.cam import hubs, port_state
     from nxs.cam import topology as cam_topo
     from nxs.cam.contracts import ContractError
 
@@ -97,12 +97,12 @@ def plan_for(port) -> Tuple[FollowPlan, str, float]:
                  else [link.name for link in topology.camera_links][:2])
         if len(names) < 2:
             raise SystemExit(f"gainpair: {port.name} runs no pair")
-        pack = packs.pack_for(topology)
-        build = getattr(pack.flows(), "build_follow", None)
+        hub = hubs.for_topology(topology)
+        build = getattr(hub.flows(), "build_follow", None)
         if build is None:
-            raise SystemExit(f"gainpair: pack {pack.name} names no gain register to follow")
-        plan = build(pack, topology, *names)
-    except (ContractError, cam_topo.TopologyError, packs.PackError) as exc:
+            raise SystemExit(f"gainpair: hub {hub.name} names no gain register to follow")
+        plan = build(hub, topology, *names)
+    except (ContractError, cam_topo.TopologyError, hubs.HubError) as exc:
         raise SystemExit(f"gainpair: {exc}") from exc
     rate = port_state.running_rate(port_state.port_record(topology), names[0])
     return plan, topology.i2c_bus, float(rate or DEFAULT_FPS)

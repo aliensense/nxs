@@ -1,21 +1,21 @@
-"""Command-response I²C drivers, byte-stream (UART) drivers, and the checksum descriptors."""
+"""Command-response I²C personalities, byte-stream (UART) personalities, and the checksum descriptors."""
 
 from __future__ import annotations
 
 from typing import Optional
 
 from nxs.opcodes import Op
-from nxs.dsl.base import SensorDriver
+from nxs.dsl.base import ClickPersonality
 from nxs.dsl.emit import BUS_REGISTER, BUS_STREAM, OpErrorCode, TracedSlice
 from nxs.dsl.errors import CompileError
 from nxs.dsl.loop import _ASTCompiler
 
 
-class I2cCommandDriver(SensorDriver):
+class I2cCommandClickPersonality(ClickPersonality):
     """Base class for command-response I²C sensors (a barometer's CONVERT
     and ADC READ): `send_command` writes a raw command, `sleep_ms` waits
     the conversion, `read` fetches the result behind its read opcode, and
-    the measure loop compiles as a register driver's does."""
+    the measure loop compiles as a register personality's does."""
 
     BUS_KIND = BUS_REGISTER
 
@@ -30,7 +30,7 @@ class I2cCommandDriver(SensorDriver):
         self._emitter.emit(Op.MEMCPY_IMM, 0, len(cmd), *cmd)
         self._emitter.emit(Op.BUS_WRITE_RAW, 0, len(cmd))
 
-class StreamDriver(SensorDriver):
+class StreamClickPersonality(ClickPersonality):
     """Base class for sensors on a byte-stream bus (UART)."""
 
     BUS_KIND = BUS_STREAM
@@ -308,7 +308,7 @@ class StreamDriver(SensorDriver):
                 em.label(L_TIMEOUT)
                 em.emit(Op.ERROR, OpErrorCode.TIMEOUT)
             em.label(L_DONE)
-        return TracedSlice(driver=self, buf_off=0, length=count)
+        return TracedSlice(personality=self, buf_off=0, length=count)
 
     def store_sample(self) -> None:
         """Commit one fixed-length sample (the compile-time `set_sample_size`
@@ -348,10 +348,10 @@ class StreamDriver(SensorDriver):
 # checksum is right again on the next reload with no per-vendor opcode.
 
 class ChecksumDescriptor:
-    """Abstract base; subclasses implement `_emit(driver, start_off, length,
-    dst_off)` to inject the checksum bytecode into the driver's emitter."""
+    """Abstract base; subclasses implement `_emit(personality, start_off, length,
+    dst_off)` to inject the checksum bytecode into the personality's emitter."""
 
-    def _emit(self, driver, start_off: int, length: int, dst_off: int) -> None:
+    def _emit(self, personality, start_off: int, length: int, dst_off: int) -> None:
         raise NotImplementedError
 
 
@@ -359,19 +359,19 @@ class ChecksumFletcher(ChecksumDescriptor):
     """Two-byte Fletcher-8: CK_A = sum(byte_i) & 0xFF, CK_B = sum(CK_A after
     each byte) & 0xFF (UBX, TCP/IP, NTP). Writes `[CK_A, CK_B]` at `dst_off`."""
 
-    def _emit(self, driver, start_off: int, length: int, dst_off: int) -> None:
-        em = driver._emitter
-        L_TOP = driver._fresh_label("ck_fl_top")
-        L_DONE = driver._fresh_label("ck_fl_done")
+    def _emit(self, personality, start_off: int, length: int, dst_off: int) -> None:
+        em = personality._emitter
+        L_TOP = personality._fresh_label("ck_fl_top")
+        L_DONE = personality._fresh_label("ck_fl_done")
 
         # Scoped scratch: five registers, dead once the loop finishes; without
         # the scope a probe's read_n + .expect names would push past 8.
-        with driver._regs.scope():
-            ck_a = driver._regs.get("__ck_a")
-            ck_b = driver._regs.get("__ck_b")
-            cursor = driver._regs.get("__ck_cursor")
-            byte_r = driver._regs.get("__ck_byte")
-            match_r = driver._regs.get("__ck_match")
+        with personality._regs.scope():
+            ck_a = personality._regs.get("__ck_a")
+            ck_b = personality._regs.get("__ck_b")
+            cursor = personality._regs.get("__ck_cursor")
+            byte_r = personality._regs.get("__ck_byte")
+            match_r = personality._regs.get("__ck_match")
 
             em.emit_u32(Op.LOAD_IMM, ck_a, 0)
             em.emit_u32(Op.LOAD_IMM, ck_b, 0)

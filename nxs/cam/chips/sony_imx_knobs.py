@@ -272,7 +272,8 @@ class _KnobMixin:
     def _gain_max(self) -> int:
         return to_int(self._d.limits["gain_max"])
 
-    def _gain_db_max(self) -> Optional[float]:
+    def gain_db_max(self) -> Optional[float]:
+        """The highest analog gain in dB the register holds, None without the dB law."""
         law = self._gain_db_law()
         if law is None:
             return None
@@ -282,7 +283,7 @@ class _KnobMixin:
         """Live analog gain register value, refused above `gain_max`."""
         maximum = self._gain_max()
         if not 0 <= int(value) <= maximum:
-            db_max = self._gain_db_max()
+            db_max = self.gain_db_max()
             in_db = f" (0..{db_max:g} dB)" if db_max is not None else ""
             raise InfeasibleConfig(
                 f"gain {value} outside 0..{maximum}{in_db}",
@@ -293,7 +294,7 @@ class _KnobMixin:
     def knob_gain_db(self, db: float) -> List[Dict[str, Any]]:
         """Analog gain in dB: reg = dB * gain_reg_per_db, up to gain_max."""
         num, den = self._gain_db_law()
-        max_db = self._gain_db_max()
+        max_db = self.gain_db_max()
         if not 0 <= db <= max_db:
             raise InfeasibleConfig(
                 f"gain {db:g} dB outside 0..{max_db:g} dB",

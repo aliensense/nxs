@@ -1,11 +1,11 @@
 # Copyright (c) 2026 Aliensense.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The installed personalities as a descriptor source. Every camera image
-under the personality store carries its sensor's descriptor trailer; the
-pack adopts those descriptors so a host that holds no sensor source, the
-robot with the descriptor pack and the personalities asset, still knows
-every head its overlays and verbs may meet."""
+"""The sealed cam personality images as a source of facts. Every camera
+image under the personality store carries its sensor's facts in its
+trailer; the registry reads them so a host that holds no sensor source,
+the robot with the wheel and the personalities asset, still knows every
+head its overlays and verbs may meet."""
 
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ def installed_images() -> List[Path]:
 
 
 def installed_descriptors() -> List[Descriptor]:
-    """The descriptor of every installed camera image. A driver image is
+    """The descriptor of every installed camera image. A click personality image is
     passed over; an image this tool cannot read is named on stderr and
     passed over, so one stray file never stops the camera verbs."""
     from nxs.personality import records
@@ -65,6 +65,6 @@ def installed_descriptors() -> List[Descriptor]:
             compiled = deserialize(img)
             out.append(records.descriptor_from_trailer(trailer_bytes(compiled.trailer)))
         except (OSError, ValueError, records.RecordError) as exc:
-            print(f"nxs: {path}: not a readable camera personality ({exc})",
+            print(f"nxs: {path}: not a readable cam personality ({exc})",
                   file=sys.stderr)
     return out

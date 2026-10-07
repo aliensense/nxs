@@ -18,16 +18,16 @@ from nxs.cam.contracts import InfeasibleConfig, LinkSpec, Topology
 from nxs.cam.port_state import port_name
 
 
-def declared_name(pack, link: LinkSpec) -> str:
+def declared_name(hub, link: LinkSpec) -> str:
     """The personality name of the sensor a link declares."""
-    return str(pack.descriptor(link.sensor_compatible).name)
+    return str(hub.descriptor(link.sensor_compatible).name)
 
 
-def holds_declared(found, pack, link: LinkSpec) -> bool:
+def holds_declared(found, hub, link: LinkSpec) -> bool:
     """Whether the personality read from the pod is the declared sensor's."""
     if found is None:
         return False
-    sen = pack.descriptor(link.sensor_compatible)
+    sen = hub.descriptor(link.sensor_compatible)
     compatible = str(found.descriptor.compatible) if found.descriptor is not None else ""
     return compatible == sen.compatible or str(found.name).lower() == str(sen.name).lower()
 
@@ -74,13 +74,13 @@ def held_stale(stale, topology: Topology, link: LinkSpec) -> str:
     return f"{name or 'a personality image'} {stale.what}"
 
 
-def held_instead(found, pack, link: LinkSpec) -> Optional[str]:
+def held_instead(found, hub, link: LinkSpec) -> Optional[str]:
     """What the pod holds in place of the declared personality in the
     build this host holds: `nothing`, `an earlier <Name>`, or another
     sensor's `<Name>`. None when it holds that build, the one a run staged
     from this host's parameter table lands on."""
-    if holds_declared(found, pack, link):
-        if _current_build(found, declared_name(pack, link)):
+    if holds_declared(found, hub, link):
+        if _current_build(found, declared_name(hub, link)):
             return None
         return f"an earlier {found.name}"
     return str(found.name) if found is not None and found.name else "nothing"
@@ -140,14 +140,14 @@ def _unanswered(topology: Topology, link: LinkSpec, exc: OSError) -> Optional[st
     return f"{where}: no pod answers at {alias:#04x} or at {own:#04x} ({_failure(exc)})"
 
 
-def param_names(pack, link: LinkSpec) -> list:
+def param_names(hub, link: LinkSpec) -> list:
     """The parameter table of the link's declared personality as this host
-    holds it (the store's image, else the pack's class compiled): what a
+    holds it (the store's image, else the hub's class compiled): what a
     pod that `converge` brought to the declaration stages by index."""
     from nxs import personality_cli
     from nxs.image import deserialize
 
-    name = declared_name(pack, link)
+    name = declared_name(hub, link)
     try:
         source = personality_cli.resolve(name)
     except personality_cli.ResolveError as exc:
@@ -160,7 +160,7 @@ def param_names(pack, link: LinkSpec) -> list:
     return [p.name for p in compiled.params]
 
 
-def converge(client, pack, topology: Topology, link: LinkSpec, *,
+def converge(client, hub, topology: Topology, link: LinkSpec, *,
              unit_name: Optional[str] = None, dry_run: bool = False) -> Optional[str]:
     """Bring the pod reached over `client` to the link's declaration.
     Returns the action line when the declared personality was uploaded
@@ -171,7 +171,7 @@ def converge(client, pack, topology: Topology, link: LinkSpec, *,
     a read of its store."""
     from nxs import personality_cli
 
-    name = declared_name(pack, link)
+    name = declared_name(hub, link)
     who = unit_name or f"@{link.nxs_units[0].alias_addr:#04x}"
     where = f"{port_name(topology)}/{link.name}"
     stale = None
@@ -191,7 +191,7 @@ def converge(client, pack, topology: Topology, link: LinkSpec, *,
     # An earlier build of the declared personality is replaced too: the
     # assets moved. So is an image of another format version, which the
     # upload saves over in its slot.
-    held = held_stale(stale, topology, link) if stale is not None else held_instead(found, pack, link)
+    held = held_stale(stale, topology, link) if stale is not None else held_instead(found, hub, link)
     if held is None:
         if found.descriptor is not None:
             unit_source.cache_descriptor(topology, link, found.descriptor, slot=found.slot,

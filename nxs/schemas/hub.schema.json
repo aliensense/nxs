@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aliensense.github.io/nxs-docs/schemas/hub.schema.json",
+  "title": "NXS hub manifest (hub.yaml)",
+  "description": "The hub's index: its own chips (the deserializer and the serializer), the flows module that composes a port from them and the deserializers it serves, the default wiring, and the golden references its composer is diffed against. Cam personalities are not the hub's: every installed one is offered on its links.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "hub",
+    "api",
+    "chips",
+    "flows",
+    "flows_for"
+  ],
+  "properties": {
+    "hub": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_\\-]*$"
+    },
+    "api": {
+      "type": "integer",
+      "enum": [
+        1
+      ],
+      "description": "The hub manifest API this SDK speaks; the loader refuses any other by name."
+    },
+    "chips": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_]*$"
+      }
+    },
+    "flows": {
+      "type": "string",
+      "description": "The flow-assembly module (a .py file) or package (a directory with __init__.py), relative to the hub."
+    },
+    "flows_for": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "pattern": "^[a-z0-9_\\-]+,[a-z0-9_\\-]+$"
+      }
+    },
+    "topology": {
+      "type": "string",
+      "pattern": "\\.ya?ml$"
+    },
+    "golden": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "flow",
+        "files"
+      ],
+      "properties": {
+        "flow": {
+          "type": "string"
+        },
+        "files": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

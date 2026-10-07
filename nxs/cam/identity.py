@@ -32,20 +32,20 @@ def identity_facts(descriptor) -> Optional[Tuple[int, int, int]]:
     return to_int(reg), to_int(want), to_int(meta.get("device_id_width", 1))
 
 
-def _verify_hub_identity(pack, topology: Topology, i2c: CamI2c) -> None:
+def _verify_hub_identity(hub, topology: Topology, i2c: CamI2c) -> None:
     """Declare + verify: refuse a hub whose silicon identity is not the
     declared part (an ACK proves only an address). A port that names no
     hub has none to verify."""
     if topology.is_direct:
         return
-    facts = identity_facts(pack.descriptor(topology.des_compatible))
+    facts = identity_facts(hub.descriptor(topology.des_compatible))
     if facts is None:
-        # A hub the pack cannot identify is a hub the tool never programs:
+        # A hub the hub cannot identify is a hub the tool never programs:
         # the identity read is the gate every write stands behind.
         raise _refuse(
             f"hub descriptor {topology.des_compatible} declares no identity "
             f"register (meta.device_id_reg / device_id)",
-            "declare the register in the pack")
+            "declare the register in the hub")
     reg, want, width = facts
     try:
         got = _identity_read(i2c, topology.des_addr, reg, width)
@@ -70,21 +70,21 @@ def acks(i2c: CamI2c, addr: int) -> bool:
         return False
 
 
-def answering_address(pack, i2c: CamI2c, link: LinkSpec) -> Tuple[int, bool]:
+def answering_address(hub, i2c: CamI2c, link: LinkSpec) -> Tuple[int, bool]:
     """Where the link's sensor answers now, through an open window: its host
     alias while the link's serializer maps it (the port up), else its own
     address (the port down, nothing mapped). Returns (address, at_alias)."""
-    from nxs.cam import packs
+    from nxs.cam import hubs
 
-    alias = int(packs.sensor_address(pack, link))
-    native = int(packs.native_sensor_address(pack, link))
+    alias = int(hubs.sensor_address(hub, link))
+    native = int(hubs.native_sensor_address(hub, link))
     if alias != native and acks(i2c, alias):
         return alias, True
     return native, False
 
 
-def detect_sensor(pack, i2c: CamI2c, link: LinkSpec) -> Tuple[Optional[str], Optional[str]]:
-    """Through an open link window: which of the pack's identity-bearing
+def detect_sensor(hub, i2c: CamI2c, link: LinkSpec) -> Tuple[Optional[str], Optional[str]]:
+    """Through an open link window: which of the hub's identity-bearing
     sensors answers with its id. Returns (compatible, detail); (None, None)
     when none does. The probe goes where the link's sensor answers: the
     alias its serializer maps while the port is up, else the link's
@@ -92,8 +92,12 @@ def detect_sensor(pack, i2c: CamI2c, link: LinkSpec) -> Tuple[Optional[str], Opt
     host = getattr(link, "host_addr", None)
     declared = getattr(link, "sensor_addr", None)
     mapped = host is not None and acks(i2c, int(host))
-    for chip in pack.sensors():
-        desc = pack.descriptor(chip)
+    # The declared sensor is the hypothesis: it is tried first, so two heads
+    # that share an identity register and id never shadow it.
+    wanted = getattr(link, "sensor_compatible", None)
+    candidates = sorted(hub.sensors(), key=lambda c: hub.descriptor(c).compatible != wanted)
+    for chip in candidates:
+        desc = hub.descriptor(chip)
         facts = identity_facts(desc)
         if facts is None:
             continue
@@ -137,7 +141,7 @@ def _require_nxs_hub(topology: Topology, verb: str) -> None:
                       f"nxs {_port_name(topology)} status")
 
 
-def _declared_camera(pack, topology: Topology, links: List[LinkSpec],
+def _declared_camera(hub, topology: Topology, links: List[LinkSpec],
                      modes: Dict[str, str], args) -> Dict[str, str]:
     """Fill the mode from the manifest's camera declaration where no `--mode`
     names one. A declared free-run fps (a link's, else the port's) is the
@@ -152,7 +156,7 @@ def _declared_camera(pack, topology: Topology, links: List[LinkSpec],
         token = link.mode or topology.camera_mode
         if token is None:
             continue
-        send = pack.descriptor(link.sensor_compatible)
+        send = hub.descriptor(link.sensor_compatible)
         modes[link.name] = resolve_mode(send, token)
     return modes
 

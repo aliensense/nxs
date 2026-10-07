@@ -7,16 +7,27 @@ declaration against the rig, node by node. Neither writes a register; `--json`
 gives the surfaces."""
 
 import errno
+import functools
 import json
+import operator
 import os
 
 from nxs import term
 
 
 # Hub detection sweeps the des control address; the device-id register
-# separates a real hub from an address squatter, the packs name the silicon.
+# separates a real hub from an address squatter, the hubs name the silicon.
 HUB_ADDRESSES = (0x6A,)
 SENSOR_ADDRESSES = (0x1A, 0x1D)
+
+
+def unit_addresses(hub: bool, extra=()) -> list:
+    """The unit addresses a sweep of a leaf bus asks, in order: the standard
+    ones, every pod address where a hub answers on the bus, and `extra`."""
+    from nxs.generate import POD_ADDRESSES
+    from nxs.suite.scan import I2C_ADDRESSES
+
+    return sorted(set(I2C_ADDRESSES) | set(extra) | (set(POD_ADDRESSES) if hub else set()))
 
 
 def _scan_bus(bus: str, extra=()):
@@ -31,20 +42,19 @@ def _scan_bus(bus: str, extra=()):
         try:
             with _libnxs.Bus.open(path) as handle:
                 dev_id = handle.read(addr, b"\x00\x0d", 1)[0]
-            from nxs.cam.packs import hub_classes
+            from nxs.cam.hubs import hub_classes
             kind = hub_classes().get(dev_id)
             found["hubs"].append(
                 (addr, f"hub {kind}" if kind else f"id 0x{dev_id:02X}"))
         except Exception:
             continue
-    from nxs.suite.scan import I2C_ADDRESSES
     try:
         handle = _libnxs.Bus.open(path)
     except OSError as exc:
         found["readable"], found["errno"] = False, exc.errno or errno.EIO
         return found
     with handle:
-        for addr in sorted(set(I2C_ADDRESSES) | set(extra)):
+        for addr in unit_addresses(bool(found["hubs"]), extra):
             try:
                 t = _libnxs_unit.I2cUnit.on_bus(handle, addr)
             except OSError:
@@ -65,7 +75,34 @@ def _scan_bus(bus: str, extra=()):
                     found["sensors"].append(addr)
             except OSError:
                 continue
+    if found["hubs"]:
+        found["units"] = _each_pod_once(found["units"])
     return found
+
+
+def _each_pod_once(units):
+    """The pods behind a hub, each listed once. A pod answers at its link's
+    alias, and where the hub maps the aliases at the address every pod straps
+    too: there the pods answer together, and the serial read is the AND of
+    theirs. That answer is left out when the aliased pods account for it. It
+    stays without a serial when a pod with no alias answers in it, and as it
+    reads when it is no merge of the aliased pods: a pod of its own."""
+    from nxs._generated_constants import NxsDevices
+
+    strap = int(NxsDevices.RBDevice.NXS)
+    aliased = [(addr, serial) for addr, serial in units if addr != strap]
+    shared = next((serial for addr, serial in units if addr == strap), None)
+    if shared is None or not aliased:
+        return units
+    unnamed = [(strap, "?")] + aliased
+    try:
+        together = functools.reduce(operator.and_, (int(serial, 16) for _addr, serial in aliased))
+        answer = int(shared, 16)
+    except ValueError:
+        return unnamed
+    if answer == together:
+        return aliased
+    return unnamed if answer & together == answer else units
 
 
 def _sweep() -> list:
@@ -175,13 +212,13 @@ def _next_after_probe(anything: bool) -> str:
 def _holds_descriptor(directory: str) -> bool:
     """Whether a store directory is an installed personality: a unit's
     carries its descriptor, as `locate` reads one, and a camera's the chip
-    directory beside its pack.yaml (`<name>/<name>.yaml`); Python's
+    directory beside its hub.yaml (`<name>/<name>.yaml`); Python's
     bytecode cache carries neither."""
     name = os.path.basename(directory)
     if os.path.isfile(os.path.join(directory, name, f"{name}.yaml")):
         return True
     try:
-        return any(entry.endswith(".yaml") and entry != "pack.yaml"
+        return any(entry.endswith(".yaml") and entry != "hub.yaml"
                    for entry in os.listdir(directory))
     except OSError:
         return False
@@ -279,6 +316,7 @@ def tree_payload(cfg, path):
     if cfg.ports:
         from nxs.cam import cli as cam_cli
         from nxs.cam import topology as cam_topo
+        from nxs.cam.verbs.status import daemon_refusal
         # The manifest's ports keyed by carrier, to pair a declared port
         # with the live topology behind it. Its own name: `ports` is the
         # rendered list this builds.
@@ -321,6 +359,13 @@ def tree_payload(cfg, path):
                 except Exception as e:
                     entry["error"] = f"bus unavailable: {e}"
                     ok = False
+                # A port whose bring-up nxsd stopped: the refusal it recorded
+                # is the port's finding, as the port status says it.
+                refused = daemon_refusal(name, topology)
+                if refused is not None:
+                    entry["findings"].append(
+                        Finding(f"ports.{name}", refused.fact, refused.alternatives).to_dict())
+                    ok = False
                 # A followed pair whose gain nothing copies is the port's gap.
                 gap = cam_cli.follow_gap(topology, cam_cli.pair_gain(topology))
                 if gap is not None:
@@ -360,7 +405,7 @@ def tree_payload(cfg, path):
                     entry["findings"].append(off.to_dict())
                     ok = False
                 entry.update({"route": row.link, "serial": row.serial,
-                              "fw": row.fw_version, "personality": row.driver,
+                              "fw": row.fw_version, "personality": row.personality,
                               "vm": row.vm_state, "sync": row.sync,
                               "cal": row.cal, "drift": row.drift,
                               "samples": row.samples, "outputs": row.outputs,
@@ -433,7 +478,7 @@ def _render_units(units, indent="  ", personality=True):
         names = by_serial.get(serial) or [u["name"]]
         if serial:
             rendered.add(serial)
-        labels = {"fw": "fw", "personality": "sensor personality"}
+        labels = {"fw": "fw", "personality": "click personality"}
         keys = ("fw", "personality") if personality else ("fw",)
         extra = "  ".join(f"{labels[k]} {u[k]}" for k in keys if u.get(k) and u[k] != "-")
         ident = f"serial {serial}  " if serial else ""

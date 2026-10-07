@@ -1,4 +1,4 @@
-"""What a compile yields: the image kind, the compiled driver, its report, and the measure loop's `Sample`."""
+"""What a compile yields: the image kind, the compiled personality, its report, and the measure loop's `Sample`."""
 
 from __future__ import annotations
 
@@ -22,8 +22,8 @@ class CompiledDriver:
     output_fields: List[dict] = field(default_factory=list)
     params: List[ParamDescriptor] = field(default_factory=list)
     patch_map: List[PatchEntry] = field(default_factory=list)
-    # Probe metadata from the driver's class attributes (`WHO_AM_I_REG`,
-    # `WHO_AM_I_VALUES`, `I2C_ADDRS`); empty for stream drivers.
+    # Probe metadata from the personality's class attributes (`WHO_AM_I_REG`,
+    # `WHO_AM_I_VALUES`, `I2C_ADDRS`); empty for stream personalities.
     who_am_i_reg: int = 0
     who_am_i_values: List[int] = field(default_factory=list)
     i2c_addrs: List[int] = field(default_factory=list)
@@ -31,7 +31,7 @@ class CompiledDriver:
     # required whenever the values are empty.
     who_am_i_skip_reason: Optional[str] = None
     # Bus-config trailer: one register-access profile per supported bus.
-    # None means no trailer (a stream driver with no UART profile).
+    # None means no trailer (a stream personality with no UART profile).
     bus_config: Optional[list] = None
     # Image kind (`ImageKind.DRIVER` measures; `CAMERA` runs once under the
     # host's token) and the header flag byte.
@@ -66,7 +66,7 @@ class CompiledDriver:
 
 def compile_report(compiled: CompiledDriver) -> str:
     """The bytecode budget of a compiled personality as text: one line per
-    budget entry, the totals, and the caps. A camera personality's report
+    budget entry, the totals, and the caps. A cam personality's report
     names each select() block and its dispatch overhead."""
     lines = []
     for label, size in compiled.budget:

@@ -249,7 +249,7 @@ class Unit(NxsClient, SupportsRecovery, SupportsTimeSync, SupportsIdentify, Supp
     def identify(self) -> None:
         self._check(_load().nxs_unit_identify(self._live()), "identify")
 
-    # ── the driver VM ─────────────────────────────────────
+    # ── the personality VM ─────────────────────────────────────
     def _state(self) -> _State:
         out = _State()
         self._check(_load().nxs_unit_read_state(self._live(), ctypes.byref(out)), "state")
@@ -267,8 +267,8 @@ class Unit(NxsClient, SupportsRecovery, SupportsTimeSync, SupportsIdentify, Supp
     def vm_reset(self) -> None:
         self._check(_load().nxs_unit_vm_reset(self._live(), _RESET_SETTLE_MS), "reset")
 
-    def read_driver_name(self) -> str:
-        return self._state().driver_name.decode()
+    def read_personality_name(self) -> str:
+        return self._state().personality_name.decode()
 
     def read_sample_size(self) -> int:
         return int(self._state().sample_size)
@@ -393,7 +393,7 @@ class Unit(NxsClient, SupportsRecovery, SupportsTimeSync, SupportsIdentify, Supp
     def _descriptor_token(self) -> int:
         return self.read_descriptor_epoch()
 
-    # ── camera personalities ──────────────────────────────
+    # ── cam personalities ──────────────────────────────
     def cam_stage_params(self, slot: int, values) -> None:
         staged = dict(values)
         if len(staged) > MAX_PARAMS:
@@ -720,7 +720,7 @@ class Unit(NxsClient, SupportsRecovery, SupportsTimeSync, SupportsIdentify, Supp
 
 
 class I2cUnit(Unit, SupportsCameraRun):
-    """The unit over I²C: the register map, which also runs camera personalities."""
+    """The unit over I²C: the register map, which also runs cam personalities."""
 
 
 class CyphalUnit(Unit, SupportsEgressDecimation):

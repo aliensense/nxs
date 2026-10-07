@@ -1,11 +1,11 @@
 # Copyright (c) 2026 Aliensense.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The descriptor trailer of a camera personality: the records a datasheet
+"""The descriptor trailer of a cam personality: the records a datasheet
 descriptor compiles into, and the descriptor a unit's trailer decodes back
 to. The unit stores the trailer opaquely and serves it page by page; the
 host reads modes, controls, laws, and capture facts from it and never
-needs the descriptor pack on the robot.
+needs the hub on the robot.
 
 Record layouts (all integers little-endian; `TrailerRecord` numbers the
 types, `IDENTITY` and `PROGRAM` extend that vocabulary above the
@@ -106,7 +106,7 @@ u8, order u8, flags u8 (bit0 the value prints as an integer, bit1 a
 non-zero value warns, bit2 a mask follows, bit3 an expected value
 follows), mask u32 and expect u32 as flagged, a decode count u8, then per
 entry value u32 and text len u8 + bytes. A probe's `desc` stays in the
-pack.
+hub.
 """
 
 from __future__ import annotations
@@ -146,18 +146,18 @@ __all__ = [
 
 # ── encode ───────────────────────────────────────────────────────────
 
-def encode_trailer(descriptor: Descriptor, params=None, pack=None) -> List[Tuple[int, bytes]]:
+def encode_trailer(descriptor: Descriptor, params=None, hub=None) -> List[Tuple[int, bytes]]:
     """The `(type, bytes)` records of a sensor descriptor: IDENTITY, MODES,
     TRIGGERS, RUN_PARAMS, CONTROLS, LAWS, PROGRAM, and CAPTURE when the
     descriptor carries the capture facts. `params` is the compiled image's
     parameter table (`CompiledDriver.params`), the source of the `mode` and
     `trigger` param indices and of the run parameters; without it the
-    records say the personality stages no param. ``pack`` is the pack the
+    records say the personality stages no param. ``hub`` is the hub the
     descriptor belongs to, whose serializer tail the capture rows' top rate
     counts; without it the rows carry the sensor's own bound. RecordError
     names a fact the records cannot carry."""
     if descriptor.role != "SEN":
-        raise RecordError(f"{descriptor.name}: a camera personality is a "
+        raise RecordError(f"{descriptor.name}: a cam personality is a "
                           f"sensor descriptor, not {descriptor.role}")
     modes = _unit_modes(descriptor)
     if not modes:
@@ -174,7 +174,7 @@ def encode_trailer(descriptor: Descriptor, params=None, pack=None) -> List[Tuple
                (TrailerRecord.CONTROLS, _encode_controls(descriptor)),
                (PROGRAM, _encode_program(descriptor))]
     if descriptor.raw("capture"):
-        records.append((TrailerRecord.CAPTURE, _encode_capture(descriptor, pack)))
+        records.append((TrailerRecord.CAPTURE, _encode_capture(descriptor, hub)))
     status = _encode_status(descriptor)
     if status is not None:
         records.append((TrailerRecord.STATUS, status))
@@ -199,7 +199,7 @@ def _refuse_experimental_facts(descriptor: Descriptor) -> None:
 # ── decode ───────────────────────────────────────────────────────────
 
 def decode_trailer(records: Sequence[Tuple[int, bytes]]) -> Dict[str, Any]:
-    """A descriptor mapping (the shape `cam-descriptor.schema.json` pins)
+    """A descriptor mapping (the shape `cam-personality.schema.json` pins)
     from a personality's trailer records: identity, the registers the
     control rows imply, the modes without blobs, the laws' limits, the
     trigger and sync facts, the program settles, and the capture table.
@@ -211,7 +211,7 @@ def decode_trailer(records: Sequence[Tuple[int, bytes]]) -> Dict[str, Any]:
             by_type.setdefault(int(rec_type), bytes(payload))
     if IDENTITY not in by_type:
         raise RecordError("the trailer carries no IDENTITY record: not a "
-                          "camera personality this tool reads")
+                          "cam personality this tool reads")
     identity = _decode_identity(by_type[IDENTITY])
     family_id, limits = _decode_laws(by_type.get(TrailerRecord.LAWS, b""))
     family = _FAMILY_NAMES.get(family_id)
@@ -224,7 +224,7 @@ def decode_trailer(records: Sequence[Tuple[int, bytes]]) -> Dict[str, Any]:
     rows = _decode_controls(by_type.get(TrailerRecord.CONTROLS, b"\x00"))
 
     meta: Dict[str, Any] = {
-        "compatible": identity["compatible"], "role": "SEN", "kind": "camera",
+        "compatible": identity["compatible"], "role": "SEN", "kind": "cam",
         "chip": family, "i2c_addr": identity["i2c_addr"],
         "reg_bits": identity["reg_bits"], "val_bits": identity["val_bits"],
     }

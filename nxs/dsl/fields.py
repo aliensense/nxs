@@ -17,7 +17,7 @@ FIELD_SEMANTICS = {name.lower(): code
                    for code, name in FieldSemantics.FieldSemantic._NAMES.items()}
 SEMANTIC_NAMES = {v: k for k, v in FIELD_SEMANTICS.items()}
 
-# Field-name spellings that drivers use for a canonical semantic.
+# Field-name spellings that personalities use for a canonical semantic.
 _SEMANTIC_ALIASES = {
     'temp': 'temperature',
     'freq': 'frequency',

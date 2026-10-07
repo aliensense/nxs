@@ -5,11 +5,12 @@
 ids, mode table), its generation and installation, the capture consumer and
 the capture daemon. Everything the camera verbs need from the platform goes
 through one `Host`; a port implements a subclass and a detector. The SerDes
-pack and the sensor plugins never name a host."""
+hub and the sensor plugins never name a host."""
 
 from __future__ import annotations
 
 import glob
+import hashlib
 import os
 import platform
 import subprocess
@@ -43,6 +44,26 @@ class Host:
         when the host installs none or carries no such file."""
         del name
         return None
+
+    def record_installed_overlay(self, name: str, data: bytes) -> None:
+        """Note the digest of an overlay this boot installed. The next boot
+        carries that file, so the reboot rule then knows what it booted."""
+        records = _overlay_records()
+        entry = records.setdefault(name, {})
+        entry["installed"] = {"sha256": hashlib.sha256(data).hexdigest(), "boot": _boot_id()}
+        _write_overlay_records(records)
+
+    def booted_overlay_digest(self, name: str) -> Optional[str]:
+        """The sha256 of the overlay of that name the running boot carries,
+        None when no install of it is on record. An install recorded under
+        an earlier boot is the file this boot took."""
+        records = _overlay_records()
+        entry = records.get(name) or {}
+        installed = entry.get("installed")
+        if installed and installed.get("boot") != _boot_id():
+            entry = records[name] = {"booted": installed["sha256"]}
+            _write_overlay_records(records)
+        return entry.get("booted")
 
     def booted_lanes(self, bus: str) -> Optional[int]:
         """The CSI lane count the booted contract fixed for a port's bus,
@@ -138,7 +159,7 @@ class Host:
         raise NotImplementedError(f"{self.name}: no camera bus installer")
 
     # --- generating and installing the contract --------------------------
-    def overlay(self, pack, port: str, lanes: int,
+    def overlay(self, hub, port: str, lanes: int,
                 sensors: Optional[List[str]] = None, direct: bool = False,
                 node_addr: Optional[int] = None, fps: Optional[float] = None,
                 bit_depth: Optional[int] = None) -> str:
@@ -161,6 +182,11 @@ class Host:
         the base tree; the entry keeps the contract files of the ports in
         `declared` (None: of every port it names) and drops the others. One
         report line per file, per dropped file and one for the entry."""
+        raise NotImplementedError(f"{self.name}: no contract installer")
+
+    def refresh_overlay(self, compiled: Path) -> str:
+        """Put a compiled contract file at its installed place, the boot
+        configuration untouched; returns the installed path."""
         raise NotImplementedError(f"{self.name}: no contract installer")
 
     def boot_state(self) -> Dict[str, Any]:
@@ -396,3 +422,36 @@ def set_current(host: Optional[Host]) -> None:
 
 def env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
+
+
+#: Where the host notes the overlays it installed, per name: the install's
+#: digest and boot, and the digest the running boot carries.
+OVERLAY_RECORDS = "booted-overlays.yaml"
+
+
+def _boot_id() -> str:
+    from nxs.cam import port_state
+    return port_state._boot_id() or ""
+
+
+def _overlay_records() -> Dict[str, Dict[str, Any]]:
+    import yaml
+
+    from nxs.cam import port_state
+    try:
+        doc = yaml.safe_load((port_state.state_dir() / OVERLAY_RECORDS).read_text())
+    except (OSError, yaml.YAMLError):
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
+def _write_overlay_records(records: Dict[str, Dict[str, Any]]) -> None:
+    import yaml
+
+    from nxs.cam import port_state
+    path = port_state.state_dir() / OVERLAY_RECORDS
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(yaml.safe_dump(records, sort_keys=True))
+    except OSError:
+        pass

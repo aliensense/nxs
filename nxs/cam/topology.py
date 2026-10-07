@@ -5,7 +5,7 @@
 its deserializer, and the GMSL links behind it; a port that names no
 deserializer is direct, its one link the sensor wired to the host. Files
 are strict-parsed; without a file the manifest, the platform, then the
-pack default apply."""
+hub default apply."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from nxs.suite.schema_ports import port_signature
 
 from .contracts import LinkSpec, NxsUnitSpec, SyncSpec, Topology
 from .descriptors import to_int
-from . import packs
+from . import hubs
 
 _CARD_KEYS = {"carrier", "i2c_bus", "des_addr", "des_compatible",
               "csi_lanes", "sync", "links", "node_addrs"}
@@ -227,33 +227,33 @@ def _ports_from_suite() -> Optional[Tuple[Dict[int, Topology], int]]:
         raise TopologyError(f"{path}: {exc}") from exc
 
 
-#: The channel each hub link rides and its window when no pack states
-#: them; the serializer is the pack's alone.
+#: The channel each hub link rides and its window when no hub states
+#: them; the serializer is the hub's alone.
 _LINK_VC = {"A": 1, "B": 0}
 _LINK_WINDOW = {"A": 0x21, "B": 0x22}
 
 
 def _hub_rules(hub_compatible: str) -> Tuple[Optional[str], Dict[str, int], Dict[str, int]]:
-    """The pack's rules for the links behind `hub_compatible`: its
+    """The hub's rules for the links behind `hub_compatible`: its
     serializer chip, the window per link and the channel per link; the
-    defaults above when no pack serves the hub."""
+    defaults above when no hub serves the hub."""
     try:
-        found = packs.discover()
-    except packs.PackError:
+        found = hubs.discover()
+    except hubs.HubError:
         found = []
-    for pack in found:
+    for hub in found:
         try:
-            desd = pack.descriptor(hub_compatible)
-        except Exception:        # noqa: BLE001 (another pack's chip)
+            desd = hub.descriptor(hub_compatible)
+        except Exception:        # noqa: BLE001 (another hub's chip)
             continue
         if desd.role != "DES":
             continue
-        ser = next((pack.descriptor(c).compatible for c in pack.chips
-                    if pack.descriptor(c).role == "SER"), None)
+        ser = next((hub.descriptor(c).compatible for c in hub.chips
+                    if hub.descriptor(c).role == "SER"), None)
         windows = {str(k): to_int(v) for k, v in (desd.raw("windows") or {}).items()}
         try:
-            vcs = {str(k): int(v) for k, v in dict(pack.flows().LINK_VC).items()}
-        except Exception:        # noqa: BLE001 (a pack whose flows name none)
+            vcs = {str(k): int(v) for k, v in dict(hub.flows().LINK_VC).items()}
+        except Exception:        # noqa: BLE001 (a hub whose flows name none)
             vcs = dict(_LINK_VC)
         return ser, windows or dict(_LINK_WINDOW), vcs
     return None, dict(_LINK_WINDOW), dict(_LINK_VC)
@@ -263,7 +263,7 @@ def port_topology(port, host=None) -> Topology:
     """The port a manifest port declares, as the flows take it, carrying the
     declaration's digest (`declared`); a port spec stands alone and is never
     re-resolved by name. What the declaration leaves out is the host's fact
-    (the bus) or the pack's rule (the serializer, the window and the channel
+    (the bus) or the hub's rule (the serializer, the window and the channel
     of a link behind the hub)."""
     if host is None:
         from nxs import host as host_layer
@@ -278,13 +278,13 @@ def port_topology(port, host=None) -> Topology:
     ser_rule, windows, vcs = (_hub_rules(port.hub_compatible) if port.hub_compatible
                               else (None, {}, {}))
     if port.hub_compatible and ser_rule is None:
-        # No pack names the serializer: a link that names its own stands in
-        # for the others, else the pack default the hub's flows are built on.
+        # No hub names the serializer: a link that names its own stands in
+        # for the others, else the hub default the hub's flows are built on.
         ser_rule = next((l.ser for l in port.links if l.ser), None)
     for l in port.links:
         if port.hub_compatible and l.des_window is None and l.name not in windows:
             raise TopologyError(f"ports.{port.name}.links.{l.name}: no window rule for "
-                                f"a link named {l.name!r} (the pack knows "
+                                f"a link named {l.name!r} (the hub knows "
                                 f"{', '.join(sorted(windows))}); declare des_window")
         if l.csi_vc is None and l.name not in vcs:
             raise TopologyError(f"ports.{port.name}.links.{l.name}: no channel rule for "
@@ -361,16 +361,16 @@ def _booted_node_addrs(host, bus: str) -> Dict[int, int]:
 
 
 def _ports_from_platform() -> Optional[Tuple[Dict[int, Topology], int]]:
-    """One port per platform camera port, shaped by the pack's default port: the
-    port name resolves the bus, the pack supplies the chip family, and the hub
+    """One port per platform camera port, shaped by the hub's default port: the
+    port name resolves the bus, the hub supplies the chip family, and the hub
     is verified by silicon id at first contact."""
     from nxs import host as host_layer
 
     buses = host_layer.current().camera_buses()
     if not buses:
         return None
-    for pack in packs.discover():
-        default = pack.topology_path()
+    for hub in hubs.discover():
+        default = hub.topology_path()
         if default is not None:
             break
     else:
@@ -385,8 +385,8 @@ def _ports_from_platform() -> Optional[Tuple[Dict[int, Topology], int]]:
     else:
         base = raw
         pack_ports = [raw]
-    # A port keeps its own pack port (links, capture ids, lanes differ per
-    # port); the first port only shapes port names the pack does not carry.
+    # A port keeps its own hub port (links, capture ids, lanes differ per
+    # port); the first port only shapes port names the hub does not carry.
     by_name = {
         str(c.get("carrier", "")).rsplit("/", 1)[-1]: c for c in pack_ports
     }
@@ -428,23 +428,23 @@ def _follow_booted_tree(shaped: Dict[str, Any], bus: str) -> None:
 
 
 def discover_ports() -> Tuple[Dict[int, Topology], int]:
-    """The ports as the platform and the packs have them, never the manifest:
-    the booted tree on the platform's buses, else the pack's default topology.
-    Raises packs.PackError when no pack provides a topology either."""
+    """The ports as the platform and the hubs have them, never the manifest:
+    the booted tree on the platform's buses, else the hub's default topology.
+    Raises hubs.HubError when no hub provides a topology either."""
     ports = _ports_from_platform()
     if ports is not None:
         return ports
-    for pack in packs.discover():
-        default = pack.topology_path()
+    for hub in hubs.discover():
+        default = hub.topology_path()
         if default is not None:
             return load_ports(str(default))
-    searched = ", ".join(str(p) for p in packs.search_paths())
-    raise packs.PackError(
-        f"no camera ports found on this platform and no descriptor pack "
+    searched = ", ".join(str(p) for p in hubs.search_paths())
+    raise hubs.HubError(
+        f"no camera ports found on this platform and no hub "
         f"provides a default topology; searched: {searched}")
 
 
-#: `cards`/`default_card` are the pack api 1 spellings of `ports`/`default_port`;
+#: `cards`/`default_card` are the hub api 1 spellings of `ports`/`default_port`;
 #: still accepted, renamed at load.
 _CARD_ALIASES = {"cards": "ports", "default_card": "default_port"}
 
@@ -479,8 +479,8 @@ def _load_topology_document(path: str) -> Dict[str, Any]:
 
 def load_ports(path: Optional[str]) -> Tuple[Dict[int, Topology], int]:
     """Load a port set from ``path``, or without one from the manifest, the
-    platform, then the pack default. Returns (ports by index, default port
-    index); raises TopologyError on a malformed file, packs.PackError with none."""
+    platform, then the hub default. Returns (ports by index, default port
+    index); raises TopologyError on a malformed file, hubs.HubError with none."""
     if not path:
         ports = _ports_from_suite()
         if ports is not None:
@@ -488,17 +488,17 @@ def load_ports(path: Optional[str]) -> Tuple[Dict[int, Topology], int]:
         ports = _ports_from_platform()
         if ports is not None:
             return ports
-        for pack in packs.discover():
-            default = pack.topology_path()
+        for hub in hubs.discover():
+            default = hub.topology_path()
             if default is not None:
                 path = str(default)
                 break
         else:
-            searched = ", ".join(str(p) for p in packs.search_paths())
-            raise packs.PackError(
-                "no topology given and no descriptor pack provides a "
-                f"default; searched: {searched}. Install a pack or set "
-                f"${packs.PACK_ENV}."
+            searched = ", ".join(str(p) for p in hubs.search_paths())
+            raise hubs.HubError(
+                "no topology given and no hub provides a "
+                f"default; searched: {searched}. Install a hub or set "
+                f"${hubs.HUBS_ENV}."
             )
     raw = _load_topology_document(path)
     if "ports" in raw:

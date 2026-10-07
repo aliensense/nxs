@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from .contracts import (FPS_DEFAULT, CsiContract, InfeasibleConfig, LinkSpec, RateRange,
                         Topology, VcGeometry)
 from .descriptors import FREERUN, resolve_mode
-from .packs import sensor_address
+from .hubs import sensor_address
 from .plan import RawConfig, scan_forbidden
 
 #: The transport the port's CSI contract records: the sensor's own lanes.
@@ -46,23 +46,23 @@ def _call(fn, *args, **kwargs):
     return fn(*args, **{k: v for k, v in kwargs.items() if k in params})
 
 
-def sensor_module(pack, link, topology: Optional[Topology] = None):
+def sensor_module(hub, link, topology: Optional[Topology] = None):
     """The law family bound to a link's sensor: the port carries one camera
     at the mode's own line, so the port adds nothing to it."""
     del topology
     compatible = str(getattr(link, "sensor_compatible", link))
-    module = pack.chip_module(compatible)
+    module = hub.chip_module(compatible)
     if module is None:
-        raise InfeasibleConfig(f"sensor {compatible} binds no law family in pack {pack.name}")
+        raise InfeasibleConfig(f"sensor {compatible} binds no law family in hub {hub.name}")
     return module
 
 
-def default_mode(pack, link, topology: Optional[Topology] = None) -> str:
+def default_mode(hub, link, topology: Optional[Topology] = None) -> str:
     """The mode a link runs when nobody names one: the sensor's default."""
-    return str(sensor_module(pack, link, topology).default_mode())
+    return str(sensor_module(hub, link, topology).default_mode())
 
 
-def resolve_modes(pack, links, mode=None,
+def resolve_modes(hub, links, mode=None,
                   topology: Optional[Topology] = None) -> Dict[str, str]:
     """Per-link mode names. ``mode`` is None (the link's declared mode, then
     the port's, then the sensor's default), one token, or {link: token};
@@ -72,7 +72,7 @@ def resolve_modes(pack, links, mode=None,
         token = mode.get(link.name) if isinstance(mode, dict) else mode
         if token is None:
             token = link.mode or (topology.camera_mode if topology is not None else None)
-        module = sensor_module(pack, link, topology)
+        module = sensor_module(hub, link, topology)
         sen = module.descriptor()
         try:
             out[link.name] = resolve_mode(sen, str(token)) if token else str(module.default_mode())
@@ -82,13 +82,13 @@ def resolve_modes(pack, links, mode=None,
     return out
 
 
-def fps_range(pack, topology: Topology, link, mode: str,
+def fps_range(hub, topology: Topology, link, mode: str,
               partner_mode_name: Optional[str] = None) -> RateRange:
     """The free-run rates a link's mode may run at: the family's range, from
     the driver's minimum rate to the datasheet frame at the mode's line. A
     table-only part runs its mode at the one rate its table sets."""
     del partner_mode_name
-    module = sensor_module(pack, link, topology)
+    module = sensor_module(hub, link, topology)
     ceiling = float(_call(module.fps_ceiling, mode))
     floor = float(_call(module.fps_floor, mode=mode))
     if not hasattr(module, "vmax_for_fps"):
@@ -96,13 +96,13 @@ def fps_range(pack, topology: Topology, link, mode: str,
     return RateRange(floor=floor, ceiling=ceiling, binds="datasheet frame")
 
 
-def _rate(pack, module, mode: str, asked: Optional[float], spec: LinkSpec,
+def _rate(hub, module, mode: str, asked: Optional[float], spec: LinkSpec,
           topology: Topology) -> float:
     """The rate the link runs: the asked one, else the link's declared, the
     port's, FPS_DEFAULT inside the mode's range; judged by the mode's
     lawful range."""
     sen = module.descriptor()
-    rates = fps_range(pack, topology, spec, mode)
+    rates = fps_range(hub, topology, spec, mode)
     declared = asked if asked is not None else (spec.fps or topology.camera_fps)
     if declared is None:
         return min(max(FPS_DEFAULT, rates.floor), rates.ceiling)
@@ -142,20 +142,20 @@ def _start_steps(module, spec: LinkSpec, mode: str, rate: float,
     return list(_call(timing, hmax, int(vmax), mode=mode, trigger=FREERUN, **extra)), rate
 
 
-def build_solo(pack, topology: Topology, link: str, mode=None,
+def build_solo(hub, topology: Topology, link: str, mode=None,
                vmax: Optional[int] = None, fps=None) -> Tuple[RawConfig, CsiContract]:
     """The bring-up of the port's link: the unit runs its personality at the
     marker, the host gates on the head answering, then starts it."""
     spec = topology.link(link)
     if isinstance(fps, dict):
         fps = fps.get(link)
-    module = sensor_module(pack, spec, topology)
+    module = sensor_module(hub, spec, topology)
     sen = module.descriptor()
     _stream_gate(module)            # refused here, before anything is composed
-    mode = resolve_modes(pack, [spec], mode, topology=topology)[link]
+    mode = resolve_modes(hub, [spec], mode, topology=topology)[link]
     sen.mode_value(mode)
     lanes = int(topology.csi_lanes)
-    rate = _rate(pack, module, mode, fps, spec, topology)
+    rate = _rate(hub, module, mode, fps, spec, topology)
     mipi = module.export_mipi_contract(mode, fps=rate)
     if int(mipi.lanes) != lanes:
         raise InfeasibleConfig(
@@ -164,7 +164,7 @@ def build_solo(pack, topology: Topology, link: str, mode=None,
     steps, rate = _start_steps(module, spec, mode, rate, vmax)
 
     cfg = RawConfig(f"direct-{link}-{mode}")
-    addr = sensor_address(pack, spec)
+    addr = sensor_address(hub, spec)
     # Nothing translates on the port's own bus: a unit at the sensor's
     # address would take every sensor write, and the sensor every unit write.
     if any(int(u.alias_addr) == int(addr) for u in spec.nxs_units):
@@ -190,8 +190,8 @@ def build_solo(pack, topology: Topology, link: str, mode=None,
     return cfg, csi
 
 
-def build_dual(pack, topology: Topology, mode=None, vmax=None, **_) -> None:
-    del pack, mode, vmax
+def build_dual(hub, topology: Topology, mode=None, vmax=None, **_) -> None:
+    del hub, mode, vmax
     raise InfeasibleConfig("the port's receiver takes one sensor's lanes",
                            alternatives=[f"nxs {topology.carrier.split('/')[-1]} "
                                          f"{l.name} on" for l in topology.links[:1]])
@@ -204,14 +204,14 @@ def _no_sync_generator(topology: Topology) -> InfeasibleConfig:
                                           f"set sync free_run"])
 
 
-def build_fsync(pack, topology: Topology, fps: float, **_) -> None:
-    del pack, fps
+def build_fsync(hub, topology: Topology, fps: float, **_) -> None:
+    del hub, fps
     raise _no_sync_generator(topology)
 
 
-def build_trigger_off(pack, topology: Topology) -> RawConfig:
+def build_trigger_off(hub, topology: Topology) -> RawConfig:
     """Free-run is the only sync the port has: nothing to switch off."""
-    del pack, topology
+    del hub, topology
     return RawConfig("fsync-off")
 
 
@@ -234,42 +234,42 @@ def _gate(module, enable: bool) -> List[Dict[str, Any]]:
     return list((start if enable else stop)())
 
 
-def csi_gate_steps(pack, topology: Topology, enable: bool) -> List[Dict[str, Any]]:
+def csi_gate_steps(hub, topology: Topology, enable: bool) -> List[Dict[str, Any]]:
     """The capture-consumer start choreography's gate: the sensor's own
     stream gate. The caller points `ADR_SENSOR` at the link's sensor."""
-    return _gate(sensor_module(pack, topology.links[0], topology), enable)
+    return _gate(sensor_module(hub, topology.links[0], topology), enable)
 
 
-def build_park(pack, topology: Topology) -> RawConfig:
+def build_park(hub, topology: Topology) -> RawConfig:
     """Park: the sensor in standby, by best effort (a head that never came
     up is already off)."""
     cfg = RawConfig("down")
     for spec in topology.links:
-        cfg.set_address("ADR_SENSOR", sensor_address(pack, spec))
-        steps = _gate(sensor_module(pack, spec, topology), False)
+        cfg.set_address("ADR_SENSOR", sensor_address(hub, spec))
+        steps = _gate(sensor_module(hub, spec, topology), False)
         if steps:
             cfg.add(f"sensor_standby_{spec.name}", steps, best_effort=True)
     return cfg
 
 
-def open_window(pack, i2c, topology: Topology, link=None) -> None:
+def open_window(hub, i2c, topology: Topology, link=None) -> None:
     """Nothing stands between the host and the sensor."""
-    del pack, i2c, topology, link
+    del hub, i2c, topology, link
 
 
-def close_windows(pack, i2c, topology: Topology) -> None:
-    del pack, i2c, topology
+def close_windows(hub, i2c, topology: Topology) -> None:
+    del hub, i2c, topology
 
 
-def links_reachable(pack, i2c, topology: Topology, links) -> bool:
+def links_reachable(hub, i2c, topology: Topology, links) -> bool:
     """The link has no lock to lose: the unit's run is the first contact."""
-    del pack, i2c, topology, links
+    del hub, i2c, topology, links
     return True
 
 
-def train(pack, i2c, topology: Topology, links=None, rounds: int = 0) -> Dict[str, Any]:
+def train(hub, i2c, topology: Topology, links=None, rounds: int = 0) -> Dict[str, Any]:
     """Nothing to train: no link stands between the port and the sensor."""
-    del pack, i2c, topology, links, rounds
+    del hub, i2c, topology, links, rounds
     return {}
 
 
@@ -278,16 +278,16 @@ def _fraction(fps: float) -> List[int]:
     return [value.numerator, value.denominator]
 
 
-def viewer_hints(pack, topology: Topology, mode=None, triggered: bool = False,
+def viewer_hints(hub, topology: Topology, mode=None, triggered: bool = False,
                  link: Optional[str] = None, fps=None, **_) -> Dict[str, Any]:
     """Capture caps for the link's viewer, from its sensor's mode entry: the
     geometry, the rate the sensor runs, the mode's capture index (the
     booted tree's wins where it has one)."""
     del triggered
     spec = topology.link(link) if link else topology.links[0]
-    module = sensor_module(pack, spec, topology)
+    module = sensor_module(hub, spec, topology)
     sen = module.descriptor()
-    resolved = resolve_modes(pack, [spec], mode, topology=topology)[spec.name]
+    resolved = resolve_modes(hub, [spec], mode, topology=topology)[spec.name]
     if isinstance(fps, dict):
         fps = fps.get(spec.name)
     from nxs.host import capture_table as tables
@@ -295,11 +295,11 @@ def viewer_hints(pack, topology: Topology, mode=None, triggered: bool = False,
     m = sen.modes[resolved]
     geo = m["geometry"]
     # The port boots this sensor's rows alone: the session's index is its own.
-    index = tables.port_index(pack, topology, sen, resolved)
+    index = tables.port_index(hub, topology, sen, resolved)
     return {
         "width": int(geo["width"]),
         "height": int(geo["height"]),
-        "framerate": _fraction(_rate(pack, module, resolved, fps, spec, topology)),
+        "framerate": _fraction(_rate(hub, module, resolved, fps, spec, topology)),
         "sensor_mode": 0 if index is None else int(index),
         "crop_bottom": 0,
         "mode": resolved,
@@ -308,10 +308,10 @@ def viewer_hints(pack, topology: Topology, mode=None, triggered: bool = False,
     }
 
 
-def viewer_hints_by_link(pack, topology: Topology, links=None, modes=None,
+def viewer_hints_by_link(hub, topology: Topology, links=None, modes=None,
                          triggered: bool = False, fps=None,
                          **_) -> Dict[str, Dict[str, Any]]:
-    return {spec.name: viewer_hints(pack, topology, modes, triggered=triggered,
+    return {spec.name: viewer_hints(hub, topology, modes, triggered=triggered,
                                     link=spec.name, fps=fps)
             for spec in (links or topology.links)}
 
@@ -322,26 +322,26 @@ def _sensor_knobs(module) -> List[str]:
                   and callable(getattr(module, name)))
 
 
-def knob_names(pack, link=None) -> List[str]:
-    """The live knobs: a link's sensor's, or the union over the pack's sensors."""
+def knob_names(hub, link=None) -> List[str]:
+    """The live knobs: a link's sensor's, or the union over the hub's sensors."""
     if link is not None:
-        return _sensor_knobs(sensor_module(pack, link))
+        return _sensor_knobs(sensor_module(hub, link))
     names: set = set()
-    for chip in pack.sensors():
-        module = pack.chip_module(chip)
+    for chip in hub.sensors():
+        module = hub.chip_module(chip)
         if module is not None:
             names.update(_sensor_knobs(module))
     return sorted(names)
 
 
-def build_knob(pack, topology: Topology, knob: str, value: str, *,
+def build_knob(hub, topology: Topology, knob: str, value: str, *,
                link: Optional[str] = None,
                readings: Optional[Dict[str, int]] = None,
                mode: Optional[str] = None) -> RawConfig:
     """A live-knob plan: the knob's steps on the link's sensor. A knob whose
     arithmetic rides the running timing takes it from ``readings``."""
     spec = topology.link(link) if link else topology.links[0]
-    module = sensor_module(pack, spec, topology)
+    module = sensor_module(hub, spec, topology)
     sen = module.descriptor()
     have = _sensor_knobs(module)
     if knob not in have:
@@ -353,7 +353,7 @@ def build_knob(pack, topology: Topology, knob: str, value: str, *,
         number = value
     steps = _call(getattr(module, f"knob_{knob}"), number, mode=mode, **live)
     cfg = RawConfig(f"set-{knob}")
-    addr = sensor_address(pack, spec)
+    addr = sensor_address(hub, spec)
     cfg.set_address("ADR_SENSOR", addr)
     cfg.add(f"set_{knob}", list(steps))
     scan_forbidden(cfg, {addr: sen.runtime_forbidden})

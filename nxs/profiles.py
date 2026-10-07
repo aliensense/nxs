@@ -1,4 +1,4 @@
-"""Register-bus communication profiles: one per bus a driver supports, baked
+"""Register-bus communication profiles: one per bus a personality supports, baked
 into the image, applied by the firmware per the runtime ``bus`` param. Omitted
 switches take the conventional defaults: 8-bit register addresses and 8-bit
 values; an I²C profile widens both for CCI-style parts."""

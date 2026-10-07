@@ -40,7 +40,7 @@ ROLE_TO_ALIAS: Dict[str, str] = {
 ALIAS_TO_ROLE: Dict[str, str] = {v: k for k, v in ROLE_TO_ALIAS.items()}
 
 #: Default alias block for composed configs. `CMD_UNIT_PROGRAM` marks the
-#: point where a link's unit runs its camera personality; the engine
+#: point where a link's unit runs its cam personality; the engine
 #: never executes it (the CLI splits the plan there).
 STANDARD_ALIASES: Dict[str, Dict[str, Any]] = {
     "commands": {"CMD_WAIT_MILLIS": 2, "CMD_UNIT_PROGRAM": 3},
@@ -51,7 +51,7 @@ STANDARD_ALIASES: Dict[str, Dict[str, Any]] = {
     },
 }
 
-#: The trigger preset every camera personality offers (internal timing).
+#: The trigger preset every cam personality offers (internal timing).
 FREERUN = "freerun"
 
 
@@ -195,11 +195,16 @@ def resolve_mode(descriptor, token: str) -> str:
     if token in modes:
         return token
     token_l = token.lower().replace("×", "x")
+    # `WxH-rawN` names the depth where two modes share a geometry (`mode_token`).
+    depth = None
+    if "-raw" in token_l:
+        token_l, _, suffix = token_l.partition("-raw")
+        depth = int(suffix) if suffix.isdigit() else -1
     matches = []
     unoffered = []
     for name, mode in modes.items():
         geo = mode.get("geometry") or {}
-        if f"{geo.get('width')}x{geo.get('height')}" == token_l:
+        if f"{geo.get('width')}x{geo.get('height')}" == token_l and depth in (None, int(geo.get("bit_depth", -1))):
             (matches if name in offered else unoffered).append(name)
     if len(matches) == 1:
         return matches[0]
@@ -265,7 +270,7 @@ def _refuse_experimental_keys(data: Any, path: Path) -> None:
     if found:
         raise ContractError(
             f"{path}: a shipped descriptor states experimental values {found}; "
-            f"they belong in the pack's experimental overlay (descriptors-experimental)")
+            f"they belong in the experimental overlay (cam_personalities-experimental)")
 
 
 def _deep_merge(base: Dict[str, Any], over: Dict[str, Any]) -> Dict[str, Any]:
@@ -315,7 +320,7 @@ class Descriptor:
         # The descriptor schema is the loader's first gate: an unknown key or
         # a malformed value is refused here, naming the file.
         from nxs import schemas
-        problems = schemas.findings(data, schemas.CAM_DESCRIPTOR, where=str(path))
+        problems = schemas.findings(data, schemas.CAM_PERSONALITY, where=str(path))
         if problems:
             raise ContractError("; ".join(problems))
         self._data: Dict[str, Any] = data
@@ -328,7 +333,7 @@ class Descriptor:
         it (one a unit served): the schema gates it, it carries no blobs,
         and its limits name no sources."""
         from nxs import schemas
-        problems = schemas.findings(data, schemas.CAM_DESCRIPTOR, where=name)
+        problems = schemas.findings(data, schemas.CAM_PERSONALITY, where=name)
         if problems:
             raise ContractError("; ".join(problems))
         self = cls.__new__(cls)

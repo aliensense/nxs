@@ -13,7 +13,7 @@ from nxs.cam.descriptors import to_int
 from nxs.cam.contracts import ContractError, LinkSpec, Topology
 from nxs.cam.diag import unwalked
 from nxs import host as host_layer
-from nxs.finding import Finding
+from nxs.finding import Finding, parse_refusal
 from nxs.cam import port_state
 from nxs.cam import unit_source
 from nxs.cam import run as cam_run
@@ -21,14 +21,14 @@ from nxs.cam import identity as cam_identity
 from nxs.cam.follow import HEARTBEAT_STALE_S
 from nxs.cam.identity import (_identity_read, answering_address, detect_sensor,
                               sensor_identity_line)
-from nxs.cam.select import _pack_for, _port_name, select_port_links
+from nxs.cam.select import _hub_for, _port_name, select_port_links
 from nxs.cam.verbs.sync import PULSE_EXPOSURE, sync_text
-from nxs.cam.verbs.verify import verified_line
+from nxs.cam.verbs.verify import _age, verified_line
 
 #: Why a presence walk read nothing: the bus lock stayed another run's past
 #: the wait, most often nxsd's while it brings the ports up after boot.
-BUS_HELD = ("another nxs run holds the bus after {wait:g} s of waiting "
-            "(nxsd brings the ports up after boot)")
+#: What holds the bus past the wait when the holder wrote no name.
+BUS_HELD_HINT = "nxsd brings the ports up after boot"
 #: The wait before the hub's first register is read again: a hub that has
 #: just come up can miss the first read.
 HUB_RETRY_S = 0.1
@@ -47,10 +47,10 @@ def _hub_answers(i2c, reg: int, addr: int) -> bool:
     return False
 
 
-def _presence_hub(payload: Dict[str, Any], pack, topology: Topology, i2c) -> bool:
+def _presence_hub(payload: Dict[str, Any], hub, topology: Topology, i2c) -> bool:
     """The hub's part of a presence walk, written into `payload`: presence,
     then identity. True when the links may be walked."""
-    desd = pack.descriptor(topology.des_compatible)
+    desd = hub.descriptor(topology.des_compatible)
     # Presence: the hub's first register (REG0 where the descriptor names
     # it, address 0 otherwise) answers.
     first = desd.registers.get("REG0", {}).get("addr", 0)
@@ -60,7 +60,7 @@ def _presence_hub(payload: Dict[str, Any], pack, topology: Topology, i2c) -> boo
     payload["hub"]["present"] = True
     facts = cam_identity.identity_facts(desd)
     if facts is None:
-        # A hub the pack cannot identify is never walked (window
+        # A hub the hub cannot identify is never walked (window
         # selection writes CTRL0): the probe says why and stops.
         payload["ok"] = False
         payload["error"] = (f"hub descriptor {topology.des_compatible} declares "
@@ -71,7 +71,7 @@ def _presence_hub(payload: Dict[str, Any], pack, topology: Topology, i2c) -> boo
     verified = got == id_want
     payload["hub"].update({"id": int(got), "verified": verified})
     if not verified:
-        # Not the silicon the pack describes: no window write and no walk;
+        # Not the silicon the hub describes: no window write and no walk;
         # the report carries the id it read.
         payload["ok"] = False
         return False
@@ -81,8 +81,8 @@ def _presence_hub(payload: Dict[str, Any], pack, topology: Topology, i2c) -> boo
 
 
 def bus_held_text() -> str:
-    """The held-bus line, naming the wait it outlasted."""
-    return BUS_HELD.format(wait=port_state.HELD_WAIT_S)
+    """The held-bus line: the holder as it named itself, and the wait it outlasted."""
+    return port_state.held_text(BUS_HELD_HINT)
 
 
 def _hold_bus(payload: Dict[str, Any]) -> Optional[port_state.BusLock]:
@@ -106,8 +106,8 @@ def presence_payload(topology: Topology,
     bus lock held, so this one is marked held without waiting again."""
     from nxs.schemas import CONTRACT
 
-    pack = _pack_for(topology)
-    flows = pack.flows()
+    hub = _hub_for(topology)
+    flows = hub.flows()
     direct = topology.is_direct
     payload: Dict[str, Any] = {
         "contract": CONTRACT, "port": _port_name(topology),
@@ -144,14 +144,14 @@ def presence_payload(topology: Topology,
         payload["error"] = str(exc)
         return payload
     try:
-        if not direct and not _presence_hub(payload, pack, topology, i2c):
+        if not direct and not _presence_hub(payload, hub, topology, i2c):
             return payload
         payload["walked"] = True
         locks: Dict[str, Optional[bool]] = {}
         if not direct:
             from nxs.cam.diag import link_locks, lock_probes
 
-            desd = pack.descriptor(topology.des_compatible)
+            desd = hub.descriptor(topology.des_compatible)
             locks = link_locks(desd, lock_probes(i2c, topology.des_addr, desd))
         found_sensors: Dict[str, str] = {}
         walked: List[Tuple[LinkSpec, Dict[str, Any]]] = []
@@ -162,10 +162,10 @@ def presence_payload(topology: Topology,
                 payload["links"].append({"name": link.name, "units": [], "ser": why, "sen": why})
                 payload["ok"] = False
                 continue
-            flows.open_window(pack, i2c, topology, link)
+            flows.open_window(hub, i2c, topology, link)
             entry: Dict[str, Any] = {"name": link.name, "units": []}
             walked.append((link, entry))
-            sen_addr, mapped = answering_address(pack, i2c, link)
+            sen_addr, mapped = answering_address(hub, i2c, link)
             entry["sen_addr"] = sen_addr
             entry["mapped"] = mapped
             chain = [("sen", sen_addr)]
@@ -182,9 +182,9 @@ def presence_payload(topology: Topology,
                     if key != "sen" or link.has_camera:
                         payload["ok"] = False
             if link.has_camera:
-                detected, detail = detect_sensor(pack, i2c, link)
+                detected, detail = detect_sensor(hub, i2c, link)
                 ok, text = sensor_identity_line(
-                    link, pack.descriptor(link.sensor_compatible), detected, detail)
+                    link, hub.descriptor(link.sensor_compatible), detected, detail)
                 entry["sensor"] = {"declared": link.sensor_compatible,
                                    "detected": detected, "detail": detail,
                                    "ok": ok, "text": text}
@@ -212,7 +212,7 @@ def presence_payload(topology: Topology,
                             pass
                 entry["units"].append(node)
             payload["links"].append(entry)
-        flows.close_windows(pack, i2c, topology)
+        flows.close_windows(hub, i2c, topology)
         if found_sensors:
             # Detection is remembered: the next `on` runs the sensor
             # that answered, no flag needed.
@@ -324,7 +324,7 @@ FOLLOW_NEXT = "sudo systemctl restart nxsd"
 
 def pair_gain(topology: Topology) -> Optional[Dict[str, Any]]:
     """Who decides the gain of the port's camera links, as `status --json`
-    carries it (`ae`): the part the recorded sync names (the pack's
+    carries it (`ae`): the part the recorded sync names (the hub's
     `pair_ae`), `following` while nxsd copies a followed pair's gain (its
     heartbeat says so and is at most HEARTBEAT_STALE_S old), the
     heartbeat's age, the gain it copies and a stopped follower's reason.
@@ -434,15 +434,15 @@ def cmd_status(args: argparse.Namespace) -> int:
     topology, selected = select_port_links(args)
     # The laws judge the port at the line the delivery check found for it.
     topology = port_state.with_found_lines(topology)
-    pack = _pack_for(topology)
+    hub = _hub_for(topology)
     as_json = getattr(args, "json", False)
     presence = presence_payload(topology, selected or None)
     sections = []
-    hub = presence.get("hub")
+    found = presence.get("hub")
     # The diagnosis reads what answered: behind a present hub, or the
     # walked sensor on the port's own bus. A bus the walk left held is
     # not waited for a second time.
-    answered = hub["present"] if hub is not None else presence["walked"]
+    answered = found["present"] if found is not None else presence["walked"]
     if answered and not presence.get("held"):
         i2c = cam_run.CamI2c(addr=hex(topology.des_addr), bus=topology.i2c_bus)
         # The walk released the lock: a run that took it since holds the bus.
@@ -451,14 +451,14 @@ def cmd_status(args: argparse.Namespace) -> int:
             try:
                 i2c.open()
                 try:
-                    sections = probe_topology(i2c, topology, pack,
+                    sections = probe_topology(i2c, topology, hub,
                                               links=selected or None)
                 finally:
                     i2c.close()
             finally:
                 lock.__exit__(None, None, None)
     payload = status_payload(topology, sections, presence)
-    verdict, whole = verdict_lines(topology, pack, presence, selected or None)
+    verdict, whole = verdict_lines(topology, hub, presence, selected or None)
     payload["verdict"] = {"ok": whole, "lines": verdict}
     # A pair's gain is the port's: nothing copying it fails the port as a
     # link down does.
@@ -481,7 +481,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(f"{_port_name(topology)} on {topology.i2c_bus}, sync {text}")
     for line in pair_gain_lines(topology, payload["ae"], live or {}):
         print(line)
-    seen = verified_line(topology, pack)
+    seen = verified_line(topology, hub)
     if seen:
         print(seen)
     rows = presence_rows(presence)
@@ -534,18 +534,19 @@ def _pod_names(topology: Topology) -> Dict[str, str]:
     return {l.name: l.unit.name for l in port.links if l.unit is not None}
 
 
-def verdict_lines(topology: Topology, pack, presence: Dict[str, Any],
+def verdict_lines(topology: Topology, hub, presence: Dict[str, Any],
                   selected) -> Tuple[List[str], bool]:
     """Declared against actual, one line for the port and one per declared
     link, and whether every declared link is up on a ready capture stack:
     `cam0: hub <compatible> ok, capture stack ready` and
     `cam0/A: <sensor> 1920x1080 RAW10 59.9 fps, up, pod unit-cam0-a
-    (<personality>, head ok)`."""
+    (<personality>, head ok)`. Under links left unknown, the refusal the
+    daemon recorded for the port in this boot (`daemon_refusal`)."""
     from nxs.cam.descriptors import mode_label
     from nxs.host.cli import capture_stack_state
 
     port = _port_name(topology)
-    hub = presence.get("hub")
+    found = presence.get("hub")
     lines: List[str] = []
     ok = True
     # A host without its camera kernel package boots no capture node: the
@@ -559,8 +560,8 @@ def verdict_lines(topology: Topology, pack, presence: Dict[str, Any],
     if presence.get("held"):
         # Nothing was read: the port's line names why, and no link has a state.
         return lines + [f"{port}: {bus_held_text()}"], False
-    if hub is not None:
-        if hub.get("present") and hub.get("verified", True):
+    if found is not None:
+        if found.get("present") and found.get("verified", True):
             head = f"{port}: hub {topology.des_compatible} ok"
         else:
             head = f"{port}: the hub does not answer at {topology.des_addr:#04x}"
@@ -591,8 +592,8 @@ def verdict_lines(topology: Topology, pack, presence: Dict[str, Any],
         mode = modes.get(link.name)
         if mode and link.has_camera:
             try:
-                parts.append(mode_label(pack.descriptor(link.sensor_compatible), mode))
-            except Exception:        # noqa: BLE001 (a mode the pack no longer names)
+                parts.append(mode_label(hub.descriptor(link.sensor_compatible), mode))
+            except Exception:        # noqa: BLE001 (a mode the hub no longer names)
                 parts.append(str(mode))
         rate = port_state.running_rate(record, link.name)
         if rate is not None and link.has_camera:
@@ -642,6 +643,32 @@ def verdict_lines(topology: Topology, pack, presence: Dict[str, Any],
             text += f", pod {who} ({personality}, {head_ok})"
         lines.append(text)
         ok = ok and state == port_state.STATE_UP
+    refused = daemon_refusal(port, topology, selected)
+    if refused is not None:
+        lines += str(refused).splitlines()
     return lines, ok
+
+
+def daemon_refusal(port: str, topology: Topology, links=None) -> Optional[Finding]:
+    """The refusal nxsd's last `on` of the port ended on since this boot, as
+    it recorded it, while a link (of `links`, else the port's) still reads
+    unknown from it: a finding at the port, the fact with the time since,
+    then its next commands, `nxs switch` where it named this verb alone
+    (the daemon runs the `on` again on the reload). None when that `on`
+    ended otherwise, or a step since brought the links up or parked them."""
+    from nxs.daemon import port_verdict
+
+    if not any(port_state.link_state(topology, link) == port_state.STATE_UNKNOWN
+               for link in links or topology.links):
+        return None
+    seen = port_verdict(port)
+    if (seen is None or seen["boot"] != port_state._boot_id()
+            or not seen["verdict"].startswith("refused") or not seen["lines"]):
+        return None
+    fact, nexts = parse_refusal("\n".join(seen["lines"]))
+    nexts = [n for n in nexts if n != f"nxs {port} status"]
+    age = _age(max(0.0, time.time() - seen["at"]))
+    return Finding(port, f"the last bring-up by nxsd stopped {age} ago: {fact.removeprefix(f'{port}: ')}",
+                   nexts or ["nxs switch"])
 
 

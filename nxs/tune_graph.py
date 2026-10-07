@@ -7,8 +7,9 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from nxs.tune import load_model
-from nxs.tune_fields import (NONE, _declared_aliases, _platform_port_buses, _presence, _sweep,
+from nxs.tune_model import _token, load_model
+from nxs.tune_sweep import sweep as _sweep
+from nxs.tune_fields import (NONE, _platform_port_buses,
                              refresh)
 
 STACK_WORDS = {"ready": "capture stack ready",
@@ -73,7 +74,7 @@ def load():
     path = default_config_path()
     declared = load_suite_config(path) if os.path.exists(path) else None
     buses = _platform_port_buses()
-    sweep = _sweep(buses, _declared_aliases(declared)) if buses else {}
+    sweep = _sweep(buses, declared) if buses else {}
     path, cfg, channels = load_model(sweep=sweep)
     return path, cfg, channels, gather_facts(cfg, buses, sweep)
 
@@ -146,13 +147,13 @@ def _rate(facts, name, port, link) -> Optional[float]:
 
 
 def _label(topology, compatible, token) -> str:
-    from nxs.cam import packs
+    from nxs.cam import hubs
     from nxs.cam.descriptors import mode_label, resolve_mode
     try:
-        descriptor = packs.pack_for(topology).descriptor(compatible)
+        descriptor = hubs.for_topology(topology).descriptor(compatible)
         name = token if token in descriptor.modes else resolve_mode(descriptor, token)
         return mode_label(descriptor, name)
-    except Exception:  # noqa: BLE001 (a token the pack no longer names)
+    except Exception:  # noqa: BLE001 (a token the hub no longer names)
         return str(token)
 
 
@@ -165,73 +166,85 @@ def route_text(link, buses) -> str:
 
 
 def build_tree(cfg, channels, facts: Facts) -> List[Node]:
-    """The nodes in reading order: every port sorted by name, declared or not, with
-    its links and its own-bus units, then the units no camera port carries."""
-    by_channel = {ch.name: ch for ch in channels}
+    """The nodes in reading order: every port sorted by name, declared or not,
+    with its links and its own-bus units, then the units no camera port carries."""
+    by_name = {ch.name: ch for ch in channels}
     by_unit = {u.name: u for u in cfg.units}
     seen = set()
     tree = []
-    ports = {ch.name: ch for ch in channels if ch.kind == "port"}
-    for name in sorted(ports):
-        channel = ports[name]
-        if channel.declared and name in cfg.ports:
-            tree.append(_port_node(name, cfg.ports[name], channel, cfg, by_channel, by_unit,
-                                   facts, seen))
-            continue
-        node = Node("port", ("port", name), [name], knobs=_knobs(channel, channel.declare()),
-                    port=name, note=channel.note)
-        bus = facts.buses.get(name)
-        node.children = _bus_units(bus, cfg, by_channel, by_unit, facts, seen)
-        swept = facts.sweep.get(bus)
-        if swept and (swept["hub"] or swept.get("sensors")
-                      or any(c.suffix == "new" for c in node.children)):
-            node.suffix = "new"
-        tree.append(node)
+    for channel in sorted((ch for ch in channels if ch.kind == "port"), key=lambda ch: ch.name):
+        tree.append(_port_node(channel, cfg, by_name, by_unit, facts, seen))
     for channel in channels:
         if channel.kind == "unit" and channel.name not in seen:
             tree.append(_unit_node(channel, by_unit.get(channel.name), facts, seen))
     return tree
 
 
-def _port_node(name, port, channel, cfg, by_channel, by_unit, facts, seen) -> Node:
+def _port_node(channel, cfg, by_name, by_unit, facts, seen) -> Node:
+    name = channel.name
+    port = cfg.ports.get(name) if channel.declared else None
     parts = [name]
-    if port.hub_compatible:
+    if port is not None and port.hub_compatible:
         parts.append(f"NXS Hub {port.hub_compatible}")
     if STACK_WORDS.get(facts.stacks.get(name)):
         parts.append(STACK_WORDS[facts.stacks[name]])
-    swept = facts.sweep.get(port.bus)
-    suffix = "absent" if port.hub_compatible and swept and not swept["hub"] else ""
-    declare = channel.declare()
-    knobs = _knobs(channel, declare, only=("HUB",)) + _knobs(channel, channel.camera())
-    node = Node("port", ("port", name), parts, suffix=suffix, knobs=knobs, port=name,
+    bus = facts.buses.get(name) or (port.bus if port is not None else None)
+    swept = facts.sweep.get(bus)
+    suffix = "absent" if port is not None and port.hub_compatible and swept and not swept["hub"] else ""
+    node = Node("port", ("port", name), parts, suffix=suffix, knobs=_knobs(channel), port=name,
                 note=channel.note)
-    sensor_knobs = {k.name: k for k in _knobs(channel, declare)}
-    for link in port.links:
-        node.children.append(_link_node(name, port, link, channel, by_unit, facts,
-                                        sensor_knobs.get(f"sensor-{link.name}"), seen))
-    node.children.extend(_bus_units(port.bus, cfg, by_channel, by_unit, facts, seen))
+    hub = channel.knobs().get("HUB", NONE)
+    found = (swept or {}).get("links", {})
+    for link in channel.family.links:
+        # A declared port draws its declared links and the ones something
+        # answered on; an undeclared one every letter once a hub is chosen.
+        declared = port is not None and any(l.name == link.letter for l in port.links)
+        told = found.get(link.letter) or {}
+        answered = told.get("sensor") or told.get("head") or told.get("pod")
+        if declared or answered or (port is None and hub != NONE and link.letter in channel.family.letters()):
+            node.children.append(_link_node(link, port, bus, by_name, by_unit, facts, seen))
+    node.children.extend(_bus_units(bus, cfg, by_name, by_unit, facts, seen))
+    if not channel.declared and swept:
+        heads = any(l["sensor"] or l["head"] for l in found.values())
+        fresh = any(n.suffix == "new" for child in node.children for n, _d in child.walk())
+        if swept["hub"] or heads or fresh:
+            node.suffix = "new"
     return node
 
 
-def _link_node(name, port, link, channel, by_unit, facts, sensor_knob, seen) -> Node:
-    key = ("link", name, link.name)
-    state = facts.states.get((name, link.name))
-    figure = _camera_figure(facts, name, port, link)
-    if link.unit is None:
-        parts = [link.name] + ([link.camera] if link.camera else []) + figure
-        return Node("link", key, parts, state=state, port=name,
-                    knobs=[sensor_knob] if sensor_knob else [])
-    unit = link.unit.name
-    seen.add(unit)
-    node = Node("link", key, [link.name, f"{unit} @{link.unit.alias:#04x}"], state=state,
-                suffix=_pod_suffix(facts, port.bus, link.unit.alias), unit=unit, port=name)
-    if link.camera:
-        node.children.append(Node("personality", key + ("camera",), [link.camera] + figure,
-                                  knobs=[sensor_knob] if sensor_knob else [],
-                                  unit=unit, port=name))
-    spec = by_unit.get(unit)
-    sections = [s for s in channel.sections if s.kind == "sensor" and s.unit_name == unit]
-    node.children.extend(_personalities(key, spec, sections, channel, unit=unit, port=name))
+def _link_node(link, port, bus, by_name, by_unit, facts, seen) -> Node:
+    name, letter = link.port_name, link.letter
+    key = ("link", name, letter)
+    spec = next((l for l in port.links if l.name == letter), None) if port is not None else None
+    state = facts.states.get((name, letter))
+    told = (facts.sweep.get(bus) or {}).get("links", {}).get(letter) or {}
+    figure = _camera_figure(facts, name, port, spec) if spec is not None else []
+    sensor = spec.camera if spec is not None else told.get("sensor")
+    pod_token = _token(link.knobs().get("POD", NONE))
+    pod = by_name.get(pod_token) if pod_token != NONE else None
+    if pod is None:
+        # A bare link: the head on the line, its knobs with the link's. A pod
+        # that answered on it undeclared hangs under it, new.
+        head = ([sensor] if sensor else
+                [f"head @{told['head_addr']:#04x}"] if told.get("head") and told.get("head_addr") is not None
+                else [])
+        node = Node("link", key, [letter] + head + figure, state=state, port=name, knobs=_knobs(link))
+        found = by_name.get(_pod_name(name, letter))
+        if found is not None and not found.declared:
+            node.children.append(_unit_node(found, None, facts, seen))
+        return node
+    seen.add(pod.name)
+    alias = (spec.unit.alias if spec is not None and spec.unit is not None
+             else pod.template[0].address if pod.template else None)
+    suffix = ("new" if not pod.declared else _pod_suffix(facts, bus, letter))
+    node = Node("link", key, [letter, f"{pod.name} @{alias:#04x}" if alias is not None else pod.name],
+                state=state, suffix=suffix, unit=pod.name, port=name,
+                knobs=_knobs(link, kinds=("declare",)) + _knobs(pod, kinds=("declare", "mount", "egress", "firmware")),
+                route=pod.template[0] if not pod.declared and pod.template else None, note=pod.note)
+    if sensor:
+        node.children.append(Node("personality", key + ("camera",), [sensor] + figure,
+                                  knobs=_knobs(link, kinds=("camera",)), unit=pod.name, port=name))
+    node.children.extend(_personalities(key, pod, unit=pod.name, port=name))
     return node
 
 
@@ -244,27 +257,34 @@ def _camera_figure(facts, name, port, link) -> List[str]:
     return [" ".join(words)]
 
 
-def _pod_suffix(facts, bus, alias) -> str:
+def _pod_suffix(facts, bus, letter) -> str:
+    """absent for a declared pod whose link the hub walked and found none on."""
     swept = facts.sweep.get(bus)
-    if not swept or alias not in swept.get("probed", ()):
+    link = (swept["links"].get(letter) if swept and swept["hub"] else None)
+    if link is None or not link["walked"]:
         return ""
-    return "" if any(addr == alias for addr, _ in swept["units"]) else "absent"
+    return "" if link["pod"] else "absent"
 
 
-def _bus_units(bus, cfg, by_channel, by_unit, facts, seen) -> List[Node]:
+def _pod_name(port, letter) -> str:
+    from nxs.generate_seed import _unit_name
+    return _unit_name(port, letter)
+
+
+def _bus_units(bus, cfg, by_name, by_unit, facts, seen) -> List[Node]:
     """The units reached over the port's own bus, declared or answering."""
     nodes = []
     if not bus:
         return nodes
     for unit in cfg.units:
-        if unit.name in seen or unit.name not in by_channel:
+        if unit.name in seen or unit.name not in by_name:
             continue
         route = next((l for l in unit.links
                       if l.transport == "i2c" and l.link_ref is None and l.bus == bus), None)
         if route is not None:
-            nodes.append(_unit_node(by_channel[unit.name], unit, facts, seen, route))
-    for channel in by_channel.values():
-        if channel.kind != "unit" or channel.declared or channel.name in seen:
+            nodes.append(_unit_node(by_name[unit.name], unit, facts, seen, route))
+    for channel in by_name.values():
+        if channel.kind != "unit" or channel.declared or channel.name in seen or channel.link_ref:
             continue
         link, _serial = channel.template
         if link.bus == bus:
@@ -274,44 +294,53 @@ def _bus_units(bus, cfg, by_channel, by_unit, facts, seen) -> List[Node]:
 
 def _unit_node(channel, spec, facts, seen, route=None) -> Node:
     """A unit's node: under a port, `name @addr` on the route that reaches it; at
-    the top level, its name and its first route."""
+    the top level, its name and its first route. Its knobs are the pod's or the
+    unit's own; its personalities hang under it."""
     seen.add(channel.name)
     key = ("unit", channel.name)
+    knobs = _knobs(channel, kinds=("declare", "mount", "egress", "firmware"))
     if not channel.declared:
         link, _serial = channel.template
-        return Node("unit", key, [f"{channel.name} @{link.address:#04x}"], suffix="new",
-                    knobs=_knobs(channel, channel.declare()), unit=channel.name, route=link,
-                    freeze="unit", note=channel.note)
+        parts = ([f"{channel.name} @{link.address:#04x}"] if link.transport == "i2c"
+                 else [channel.name, route_text(link, facts.buses)])
+        return Node("unit", key, parts, suffix="new", knobs=knobs,
+                    unit=channel.name, route=link, freeze="unit", note=channel.note)
     if route is not None:
         parts = [f"{channel.name} @{route.address:#04x}"]
     else:
         first = spec.links[0] if spec is not None and spec.links else None
         parts = [channel.name] + ([route_text(first, facts.buses)] if first is not None else [])
     node = Node("unit", key, parts, suffix="absent" if channel.presence == "absent" else "",
-                unit=channel.name, freeze="unit", note=channel.note)
-    sections = [s for s in channel.sections if s.kind == "sensor"]
-    node.children = _personalities(key, spec, sections, channel, unit=channel.name, port=None)
+                knobs=knobs, unit=channel.name, freeze="unit", note=channel.note)
+    node.children = _personalities(key, channel, unit=channel.name, port=None)
     return node
 
 
-def _personalities(key, spec, sections, channel, unit, port) -> List[Node]:
-    """One node per declared sensor personality, its parameters as knobs; a
-    sensor personality freezes with its unit."""
+def _personalities(key, channel, unit, port) -> List[Node]:
+    """One node per click personality the unit declares, its parameters as
+    knobs; a click personality freezes with its unit."""
     nodes = []
-    for index, sensor in enumerate(getattr(spec, "sensors", None) or []):
-        section = next((s for s in sections if s.sensor_index == index), None)
-        knobs = _knobs(channel, section)
-        parts = [sensor.driver] + ([knobs[0].value] if knobs else [])
-        nodes.append(Node("personality", key + (index,), parts, knobs=knobs,
+    for section in channel.sections:
+        if section.kind != "sensor":
+            continue
+        knobs = _knobs(channel, labels=(section.label,))
+        personality = section.label.rsplit("/", 1)[-1]
+        parts = [personality] + ([knobs[0].value] if knobs else [])
+        nodes.append(Node("personality", key + (section.sensor_index,), parts, knobs=knobs,
                           unit=unit, port=port, freeze="unit"))
     return nodes
 
 
-def _knobs(channel, section, only=None) -> List[Knob]:
-    if section is None:
-        return []
-    return [Knob(channel, section, f) for f in section.fields
-            if only is None or f.name in only]
+def _knobs(channel, kinds=None, labels=None) -> List[Knob]:
+    """The channel's knobs, every section's or those of the kinds or labels named."""
+    out = []
+    for section in channel.sections:
+        if kinds is not None and section.kind not in kinds:
+            continue
+        if labels is not None and section.label not in labels:
+            continue
+        out.extend(Knob(channel, section, f) for f in section.fields)
+    return out
 
 
 def token(option):
@@ -360,4 +389,4 @@ def find(tree: List[Node], key) -> Optional[Node]:
 
 
 __all__ = ["Facts", "Knob", "Node", "NONE", "apply_edits", "build_tree", "counts", "find",
-           "gather_facts", "load", "route_text", "token", "_presence"]
+           "gather_facts", "load", "route_text", "token"]

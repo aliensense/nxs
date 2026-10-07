@@ -1,0 +1,8 @@
+# yaml-language-server: $schema=../../schemas/click-personality.schema.json
+# NEO-M9N personality for NXS VM.
+# Parameter capabilities; order fixes the wire's param
+# indices, so entries never reorder.
+meta:
+  personality: neo_m9n
+params:
+  - {name: rate, values: [1, 5, 10, 25], default: 1, unit: Hz}

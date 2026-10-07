@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aliensense.github.io/nxs-docs/schemas/click-personality.schema.json",
+  "title": "NXS click personality facts (<name>.yaml)",
+  "description": "The fact sheet beside a click personality: the parameters it offers, as the options an operator may pick. Entry order fixes the wire's parameter indices, so entries never reorder. Values and defaults are int32 — the descriptor wire carries nothing else — so a fractional physical value is encoded in a smaller integer unit (mHz, mV).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["meta", "params"],
+  "properties": {
+    "meta": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["personality"],
+      "properties": {
+        "personality": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"},
+        "bus": {"type": "string"},
+        "brief": {"type": "string"},
+        "kind": {"enum": ["click"], "description": "The personality kind these facts describe; click when absent."}
+      }
+    },
+    "params": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "values", "default"],
+        "properties": {
+          "name": {"type": "string", "pattern": "^[a-z_][a-z0-9_]*$"},
+          "values": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"$ref": "#/$defs/int32"}
+          },
+          "default": {"$ref": "#/$defs/int32"},
+          "unit": {"type": "string"},
+          "type": {"enum": ["enum", "range"]},
+          "kind": {"enum": ["reload", "live"]}
+        },
+        "if": {"properties": {"type": {"const": "range"}}, "required": ["type"]},
+        "then": {"properties": {"values": {"minItems": 2, "maxItems": 2},
+                                "kind": {"const": "live"}}}
+      }
+    }
+  },
+  "$defs": {
+    "int32": {"type": "integer", "minimum": -2147483648, "maximum": 2147483647}
+  }
+}

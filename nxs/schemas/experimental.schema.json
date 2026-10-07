@@ -2,20 +2,14 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://aliensense.dev/schemas/experimental.schema.json",
   "title": "Experimental manifest (experimental.yaml)",
-  "description": "The index of a pack's experimental material: measured operating points and jump thresholds layered over the shipped descriptors, and the sensors the product does not ship, read only under `nxs --experimental`. Never shipped; the shipped pack manifest never names it.",
+  "description": "The index of the experimental cam personality tree: measured operating points and jump thresholds layered over the shipped facts, read only under `nxs --experimental`. The heads the product does not ship sit beside this file as cam personality directories. Never shipped.",
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "experimental",
     "api",
     "overlays"
   ],
   "properties": {
-    "experimental": {
-      "type": "string",
-      "pattern": "^[a-z][a-z0-9_\\-]*$",
-      "description": "The pack this material belongs to."
-    },
     "api": {
       "type": "integer",
       "enum": [
@@ -24,17 +18,9 @@
     },
     "overlays": {
       "type": "object",
-      "description": "Chip directory -> overlay directory beside this file.",
+      "description": "Cam personality -> overlay directory beside this file.",
       "minProperties": 1,
       "additionalProperties": {
-        "type": "string",
-        "pattern": "^[a-z][a-z0-9_]*$"
-      }
-    },
-    "chips": {
-      "type": "array",
-      "description": "Sensors the product does not ship, joining the pack after its shipped sensors: each a chip directory beside this file.",
-      "items": {
         "type": "string",
         "pattern": "^[a-z][a-z0-9_]*$"
       }

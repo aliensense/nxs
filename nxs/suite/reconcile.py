@@ -6,15 +6,14 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from nxs._generated_constants import CyphalDefaults, RunnerStates
 from nxs.client import SupportsTimeSync, estimate_and_push, push_and_verify
-from nxs.compiler import SensorDriver
-from nxs.descriptor import load_driver
+from nxs.compiler import ClickPersonality
 from nxs.suite import FIRMWARE_DIR
 from nxs.suite.drift import (STORE_SLOTS, UnitDrift, detect_unit_drift,
-                             driver_slots, firmware_drift)
+                             click_slots, firmware_drift)
 from nxs.suite.firmware import find_image, image_identity
 from nxs.suite.schema import (SuiteConfig, UnitSpec, device_runs,
                               parse_version)
@@ -27,29 +26,32 @@ from nxs import transports
 log = logging.getLogger("nxs.suite")
 
 
-class DriverNotFound(Exception):
-    """No driver source for a manifest `driver:` name; message lists the
+class ClickPersonalityNotFound(Exception):
+    """No personality source for a manifest `personality:` name; message lists the
     searched locations and the generation path."""
 
 
 @dataclass
 class UnitReport:
     """One unit's converge result: `actions` done to the device, `notes`
-    observations independent of drift. `converged` derives from `actions` alone."""
+    observations independent of drift. `converged` derives from `actions` alone.
+    `restarted` says the run pushed a firmware image, which restarts the unit
+    (on a dry run, that it would)."""
     name: str
     link: str
     ok: bool = True
     actions: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
     error: str = ""
+    restarted: bool = False
 
 
 def _is_camera_personality(directory: str, name: str) -> bool:
-    """Whether the store entry is a camera personality; both kinds share the
+    """Whether the store entry is a cam personality; both kinds share the
     `<name>/<name>.py` layout and only the descriptor beside the module tells."""
     import yaml
 
-    from nxs.personality import CAMERA, PersonalityError, kind_of
+    from nxs.personality import CAM, PersonalityError, kind_of
 
     for candidate in (os.path.join(directory, name, f"{name}.yaml"),
                       os.path.join(directory, f"{name}.yaml")):
@@ -59,22 +61,19 @@ def _is_camera_personality(directory: str, name: str) -> bool:
             with open(candidate) as handle:
                 doc = yaml.safe_load(handle)
             return kind_of(doc if isinstance(doc, dict) else {},
-                           candidate) == CAMERA
+                           candidate) == CAM
         except (OSError, yaml.YAMLError, PersonalityError):
             return False          # unreadable: let the loader say why
     return False
 
 
-def known_driver_modules(drivers_dir: Optional[str] = None) -> List[str]:
-    """The unit personalities the tool can load: the store first, then the package
-    built-ins; a store name shadows a built-in. Camera personalities are skipped."""
-    import pkgutil
-
-    import nxs.drivers
+def known_click_personalities(personalities_dir: Optional[str] = None) -> List[str]:
+    """The click personalities the tool can load: the store first, then the
+    wheel's own; a store name shadows a shipped one. Cam personalities are skipped."""
     from nxs.suite import personality_dirs
 
     names: List[str] = []
-    for directory in personality_dirs(drivers_dir):
+    for directory in personality_dirs(personalities_dir):
         if not os.path.isdir(directory):
             continue
         for entry in sorted(os.listdir(directory)):
@@ -88,63 +87,58 @@ def known_driver_modules(drivers_dir: Optional[str] = None) -> List[str]:
                 continue
             if not _is_camera_personality(directory, name):
                 names.append(name)
-    names += [m.name for m in pkgutil.iter_modules(nxs.drivers.__path__)
-              if not m.name.startswith("_")]
     seen = set()
     return [n for n in names if not (n in seen or seen.add(n))]
 
 
-def module_for_driver_name(active: str, drivers_dir: Optional[str] = None):
-    """The personality module whose class compiles to the driver name the
+def click_personality_for(active: str, personalities_dir: Optional[str] = None):
+    """The personality module whose class compiles to the personality name the
     device reports (`Fxos8700` -> `fxos8700`), or None."""
-    for name in known_driver_modules(drivers_dir):
+    for name in known_click_personalities(personalities_dir):
         try:
-            cls = load_unit_driver(name, drivers_dir)
-        except DriverNotFound:
+            cls = load_click_personality(name, personalities_dir)
+        except ClickPersonalityNotFound:
             continue
         if cls.__name__ == active:
             return name
     return None
 
 
-def load_unit_driver(name: str, drivers_dir: Optional[str] = None):
-    """Resolve a driver class: the personality store first (`<name>/<name>.py`
-    or a flat `<name>.py`), then the package built-ins."""
+def load_click_personality(name: str, personalities_dir: Optional[str] = None):
+    """Resolve a click personality's class: `<name>/<name>.py` (or a flat
+    `<name>.py`) in the store first, then among the wheel's own."""
     from nxs.personality import load_source
     from nxs.suite import personality_dirs, personality_file
 
-    path = personality_file(name, "py", drivers_dir)
-    if path is not None:
-        try:
-            module = load_source(f"nxs_suite_drivers.{name}", str(path))
-        except Exception as e:
-            raise DriverNotFound(
-                f"{path}: import failed: "
-                f"{import_failure_detail(e, str(path))}") from e
-        classes = [obj for obj in vars(module).values()
-                   if isinstance(obj, type) and issubclass(obj, SensorDriver)
-                   and obj.__module__ == module.__name__]
-        if not classes:
-            raise DriverNotFound(f"{path} defines no SensorDriver subclass")
-        if len(classes) > 1:
-            names = ", ".join(sorted(c.__name__ for c in classes))
-            raise DriverNotFound(
-                f"{path} defines {len(classes)} driver classes ({names}) — "
-                f"one driver per file")
-        return classes[0]
+    path = personality_file(name, "py", personalities_dir)
+    if path is None:
+        searched = ", ".join(f"{d}/{name}/{name}.py" for d in personality_dirs(personalities_dir))
+        raise ClickPersonalityNotFound(
+            f"personality '{name}' not found (searched {searched}). Generate one from the "
+            f"sensor's datasheet with the generate-click-personality skill, then "
+            f"nxs personality install it.")
     try:
-        return load_driver(name)
-    except ImportError:
-        searched = ", ".join(f"{d}/{name}/{name}.py" for d in personality_dirs(drivers_dir))
-        raise DriverNotFound(
-            f"personality '{name}' not found (searched {searched} and the built-in "
-            f"nxs.drivers). Generate one from the sensor's datasheet with "
-            f"the generate-sensor-personality skill, then nxs personality install it.") from None
+        module = load_source(f"nxs_click_personalities.{name}", str(path))
+    except Exception as e:
+        raise ClickPersonalityNotFound(
+            f"{path}: import failed: "
+            f"{import_failure_detail(e, str(path))}") from e
+    classes = [obj for obj in vars(module).values()
+               if isinstance(obj, type) and issubclass(obj, ClickPersonality)
+               and obj.__module__ == module.__name__]
+    if not classes:
+        raise ClickPersonalityNotFound(f"{path} defines no ClickPersonality subclass")
+    if len(classes) > 1:
+        names = ", ".join(sorted(c.__name__ for c in classes))
+        raise ClickPersonalityNotFound(
+            f"{path} defines {len(classes)} personality classes ({names}) — "
+            f"one personality per file")
+    return classes[0]
 
 
 def panel_hash(unit: UnitSpec) -> str:
     """Digest of the deploy-relevant intent: the sensor list and configs."""
-    payload = [{"driver": s.driver, "config": s.config}
+    payload = [{"personality": s.personality, "config": s.config}
                for s in (unit.sensors or [])]
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True).encode()).hexdigest()
@@ -154,20 +148,27 @@ def switch_suite(cfg: SuiteConfig, state: SuiteState, *,
                 dry_run: bool = False, only_unit: Optional[str] = None,
                 accept_new_serial: bool = False, opener=None,
                 firmware_dir: str = FIRMWARE_DIR,
-                drivers_dir: Optional[str] = None) -> List[UnitReport]:
+                personalities_dir: Optional[str] = None,
+                skip: Optional[Dict[str, List[str]]] = None) -> List[UnitReport]:
     """Reconcile the suite; returns one report per (selected) unit. A
-    None `drivers_dir` resolves personalities through the store chain, and
-    the opener defaults to the one `nxs.transports` holds at the call."""
+    None `personalities_dir` resolves personalities through the store chain, and
+    the opener defaults to the one `nxs.transports` holds at the call. A
+    unit in `skip` is not touched: its report carries the lines it was
+    skipped with (a pod where it straps, behind a port that did not come up)."""
     opener = opener or transports.open_client
     reports = []
     seen_serials: dict = {}
     for unit in cfg.units:
         if only_unit is not None and unit.name != only_unit:
             continue
+        if skip and unit.name in skip:
+            reports.append(UnitReport(name=unit.name, link=unit.links[0].describe(), ok=False,
+                                      error="\n    ".join(skip[unit.name])))
+            continue
         reports.append(_apply_unit(unit, state, dry_run=dry_run,
                                    accept_new_serial=accept_new_serial,
                                    opener=opener, firmware_dir=firmware_dir,
-                                   drivers_dir=drivers_dir,
+                                   personalities_dir=personalities_dir,
                                    seen_serials=seen_serials))
     declared = {u.name for u in cfg.units}
     orphans = sorted(set(state.unit_names()) - declared)
@@ -188,15 +189,15 @@ def switch_suite(cfg: SuiteConfig, state: SuiteState, *,
 
 def _apply_unit(unit: UnitSpec, state: SuiteState, *, dry_run: bool,
                 accept_new_serial: bool, opener, firmware_dir: str,
-                drivers_dir: Optional[str],
+                personalities_dir: Optional[str],
                 seen_serials: Optional[dict] = None) -> UnitReport:
     report = UnitReport(name=unit.name, link=unit.links[0].describe())
     would = "would " if dry_run else ""
 
     # Stage everything that can fail before any hardware is touched; a
-    # malformed driver file fails this unit's report, never the whole run.
+    # malformed personality file fails this unit's report, never the whole run.
     try:
-        panel = [(spec, load_unit_driver(spec.driver, drivers_dir)().compile(spec.config))
+        panel = [(spec, load_click_personality(spec.personality, personalities_dir)().compile(spec.config))
                  for spec in (unit.sensors or [])]
         pin = unit.firmware or assets_pin(firmware_dir)
         image_path = (find_image(firmware_dir, pin, None if unit.firmware else tool_build_identity())
@@ -269,7 +270,7 @@ def _apply_unit(unit: UnitSpec, state: SuiteState, *, dry_run: bool,
             _converge_panel(unit, state, transport, report, panel, digest,
                             drift, would, dry_run)
         elif unit.sensors is not None:
-            # Explicit `sensors: []`: a running driver or a populated store is
+            # Explicit `sensors: []`: a running personality or a populated store is
             # drift to repair. An absent key leaves the panel unmanaged.
             _converge_empty_panel(unit, state, transport, report, would,
                                   dry_run)
@@ -503,6 +504,7 @@ def _converge_firmware(unit: UnitSpec, state: SuiteState, transport, report,
     report.actions.append(
         f"{would}flash firmware {pin} "
         f"(device reports {device or 'no version'})")
+    report.restarted = True
     if dry_run:
         return True
 
@@ -562,9 +564,9 @@ def assets_pin(firmware_dir: str) -> Optional[str]:
 def _converge_panel(unit: UnitSpec, state: SuiteState, transport, report,
                     panel, digest: str, drift: UnitDrift, would: str,
                     dry_run: bool):
-    """Repair proportionately: a wrong or missing driver or a changed panel
+    """Repair proportionately: a wrong or missing personality or a changed panel
     shape redeploys the store; param-only drift is retuned in place."""
-    if not (drift.driver or drift.shape):
+    if not (drift.personality or drift.shape):
         for name, (desired, live) in sorted(drift.params.items()):
             report.actions.append(f"{would}retune {name} {live}→{desired}")
             if not dry_run:
@@ -588,7 +590,7 @@ def _converge_panel(unit: UnitSpec, state: SuiteState, transport, report,
     # on its own (a probe retry, the watchdog), and its verdict must not
     # outlive it.
     park(transport)
-    slots = _clear_driver_slots(transport)[:len(panel)]
+    slots = _clear_click_slots(transport)[:len(panel)]
     for slot, (_, compiled) in zip(slots, panel):
         transport.upload_image(serialize(compiled))
         transport.save_slot(slot)
@@ -601,42 +603,42 @@ def _converge_panel(unit: UnitSpec, state: SuiteState, transport, report,
         else:
             # A fresh deploy runs the just-uploaded RAM image, which carries no
             # slot number until a reboot loads the first sensor slot; MEASURING
-            # is the success signal, and the running driver names itself.
+            # is the success signal, and the running personality names itself.
             report.actions.append(
-                f"active: {transport.read_driver_name() or names[-1]} (running)")
+                f"active: {transport.read_personality_name() or names[-1]} (running)")
     elif runner == RunnerStates.RunnerState.PROBE_FAILED:
         # The runner parks in PROBE_FAILED until a host command intervenes, so
         # this is a verdict: the deploy did not realize the manifest.
         report.ok = False
-        report.error = ("no sensor answered the deployed driver "
+        report.error = ("no sensor answered the deployed personality "
                         "(check wiring, then `nxs status`)")
     else:
         report.ok = False
-        report.error = (f"driver did not come up — runner is "
+        report.error = (f"the personality did not come up — runner is "
                         f"{RunnerStates.RunnerState._NAMES.get(runner, runner)}")
     state.record(unit.name, panel_hash=digest)
 
 
 def _room(transport) -> int:
-    """How many slots a panel can take once the sensor personalities are
-    cleared: every slot but a camera personality's."""
+    """How many slots a panel can take once the click personalities are
+    cleared: every slot but a cam personality's."""
     from nxs.client import SupportsSlotPeek
 
     if not isinstance(transport, SupportsSlotPeek):
         return STORE_SLOTS
-    sensors = set(driver_slots(transport))
+    sensors = set(click_slots(transport))
     return sum(slot in sensors or transport.read_slot_info(slot) is None
                for slot in range(STORE_SLOTS))
 
 
-def _clear_driver_slots(transport) -> List[int]:
-    """Delete every sensor personality's slot, the last first so the others
-    keep their index, and leave a camera personality's in place: it is the
+def _clear_click_slots(transport) -> List[int]:
+    """Delete every click personality's slot, the last first so the others
+    keep their index, and leave a cam personality's in place: it is the
     camera steps'. Returns the empty slots after, lowest first, where a
     panel lands."""
     from nxs.client import SupportsSlotPeek
 
-    for slot in reversed(driver_slots(transport)):
+    for slot in reversed(click_slots(transport)):
         transport.delete_slot(slot)
     if not isinstance(transport, SupportsSlotPeek):
         return list(range(STORE_SLOTS))
@@ -645,16 +647,16 @@ def _clear_driver_slots(transport) -> List[int]:
 
 def _converge_empty_panel(unit: UnitSpec, state: SuiteState, transport,
                           report, would: str, dry_run: bool):
-    """Converge a declared-empty panel: stop the driver and clear the
+    """Converge a declared-empty panel: stop the personality and clear the
     sensor slots when either is present; record the empty panel hash."""
-    if not driver_slots(transport) and not transport.read_driver_name():
+    if not click_slots(transport) and not transport.read_personality_name():
         return
     report.actions.append(f"{would}clear panel (declared empty)")
     if dry_run:
         return
     transport.vm_stop()
     transport.vm_reset()
-    _clear_driver_slots(transport)
+    _clear_click_slots(transport)
     state.record(unit.name, panel_hash=panel_hash(unit))
 
 

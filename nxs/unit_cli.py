@@ -11,7 +11,7 @@ from nxs.client import (
     SupportsSlotPeek, SupportsTimeSync)
 from nxs import params as device_params
 from nxs.compiler import SEMANTIC_NAMES
-from nxs.descriptor import sample_width
+from nxs.click_facts import sample_width
 from nxs.stream_cli import _get_output_fields
 from nxs.term import status_line
 
@@ -114,7 +114,7 @@ def cmd_probe(t, args):
     return 0 if ok else 1
 
 def _probe_personality(t, args) -> None:
-    """One line for the camera personality a unit holds, and the addressed
+    """One line for the cam personality a unit holds, and the addressed
     link's cache brought up to date; silent when the unit holds none or the
     store cannot be read."""
     from nxs.cam import unit_source
@@ -168,7 +168,7 @@ def _format_allowed(p) -> str:
     return '[' + ', '.join(str(v) for v in vals) + ']'
 
 def cmd_caps(t, args):
-    name = t.read_driver_name()
+    name = t.read_personality_name()
     if not name:
         print("No personality loaded.")
         return 1
@@ -200,12 +200,18 @@ def cmd_caps(t, args):
 
 def _no_parameter(t, name: str) -> int:
     """The refusal for a name neither family carries: the personality's
-    parameters and the device's, one line each."""
+    parameters and the device's, one line each. A unit that answers no
+    parameter at all is not refusing the name: no personality runs on it,
+    or the one that runs is coming up, and the read is worth another try."""
+    caps = t.read_capabilities() or []
+    if not caps:
+        running = t.read_personality_name()
+        print((f"the personality {running} answers no parameters yet, so none named {name}: "
+               f"it is coming up\n  - try again\n  - nxs status" if running else
+               f"no personality runs on the unit, so none named {name}\n  - nxs switch"),
+              file=sys.stderr)
+        return 1
     print(f"no parameter {name}", file=sys.stderr)
-    try:
-        caps = t.read_capabilities() or []
-    except (RuntimeError, OSError, TimeoutError):
-        caps = []
     for p in caps:
         if len(p.get('values') or []) > 1:
             print(f"  - {p['name']}: {_format_allowed(p)}", file=sys.stderr)
@@ -273,7 +279,7 @@ def _print_outputs(t, name: str) -> None:
     outs = t.read_outputs()
     if not outs:
         # Nothing readable on-device (firmware without the descriptor
-        # window); fall back to a local compile of the Python driver.
+        # window); fall back to a local compile of the Python personality.
         raw = _get_output_fields(name, t)
         outs = [{
             'idx': i,
@@ -304,7 +310,7 @@ def _print_outputs(t, name: str) -> None:
               f"{o['offset']:>10.4g}  {o['unit']}")
 
 def _camera_line(t):
-    """The `Camera:` value of an addressed status: the camera personality the
+    """The `Camera:` value of an addressed status: the cam personality the
     store holds, its slot and the last run the unit reports (`never run`
     before its first), or `(none)`.
     None on a wire that serves no camera run, or when the store cannot be
@@ -335,7 +341,7 @@ def cmd_status(t, args):
     state = t.read_vm_state()
     error = t.read_error_code()
     count = t.read_sample_count()
-    name = t.read_driver_name()
+    name = t.read_personality_name()
     store_count = t.read_store_count()
     active_slot = t.read_active_slot()
     runner_state = t.read_runner_state()
@@ -492,7 +498,7 @@ def cmd_timesync(t, args):
             if e.code != ERRNO_EBUSY or args.once:
                 print(f"timesync: {e}")
                 return 1
-            # A transfer session holds the mux (a driver upload or a firmware
+            # A transfer session holds the mux (a personality upload or a firmware
             # push); the resident pusher skips the interval and lives.
             print("timesync: mux held (transfer in flight) — skipping")
             time.sleep(args.interval)
@@ -674,7 +680,7 @@ def add_unit_parsers(sub) -> None:
 
     p_upload = sub.add_parser('upload', help='Compile and upload a personality of '
                                              'either kind by name or path')
-    p_upload.add_argument('driver',
+    p_upload.add_argument('personality',
                           help='Personality name (iam20680) — the preferred form; '
                                'a compiled .nxs path is accepted but must '
                                'match this tool\'s image format')
@@ -684,10 +690,10 @@ def add_unit_parsers(sub) -> None:
                                'for yakut file-server fleet provisioning')
     p_upload.add_argument('--param', '--config', '-c', nargs='*',
                           metavar='KEY=VALUE', dest='config',
-                          help='Driver params (e.g. sample_rate=250 accel_fs=8). '
+                          help='Personality params (e.g. sample_rate=250 accel_fs=8). '
                                '`--param` and `--config` are aliases.')
     p_upload.add_argument('--slot', type=int, default=None,
-                          help='The store slot a camera personality lands in '
+                          help='The store slot a cam personality lands in '
                                '(default: its own, else the first empty)')
 
     sub.add_parser('caps', help="Show the loaded personality's parameters and limits")

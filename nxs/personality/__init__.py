@@ -1,11 +1,10 @@
 # Copyright (c) 2026 Aliensense.
 # SPDX-License-Identifier: Apache-2.0
 
-"""`nxs personality check|install`: the host half of the personality
-verb group, which checks and installs sensor personalities. A unit
-personality is a driver pair (`<name>.py` beside `<name>.yaml`); a camera
-personality is a descriptor (`<name>.yaml`, `<name>.py`, `blobs/`) extending
-the installed pack."""
+"""`nxs personality check|install`: the host half of the personality verb
+group. A click personality is `<name>.py` beside `<name>.yaml`; a cam
+personality is `<name>.yaml`, `<name>.py` and its `blobs/`. Either installs
+flat into the store as `<store>/<name>/`."""
 
 from __future__ import annotations
 
@@ -25,8 +24,8 @@ import yaml
 
 from nxs.suite import PERSONALITY_DIR
 
-UNIT = "unit"
-CAMERA = "camera"
+CLICK = "click"
+CAM = "cam"
 
 
 @dataclass
@@ -81,16 +80,12 @@ def add_host_verbs(ps) -> None:
                               help=f'Copy a personality into the store ({PERSONALITY_DIR})')
     p_install.add_argument('path', help='A personality directory, one file of '
                                         'a pair, or a .tar.gz')
-    p_install.add_argument('--extends', default=None,
-                           help='The descriptor pack a camera personality '
-                                'extends (default: the first installed '
-                                'pack)')
 
 
 def run_host_verb(args) -> int:
     if args.personality_cmd == 'check':
         return cmd_check(args.path)
-    return cmd_install(args.path, args.extends)
+    return cmd_install(args.path)
 
 
 def _refusing(verb):
@@ -132,7 +127,7 @@ def _yaml_in(directory: str) -> str:
     if os.path.exists(named):
         return named
     found = sorted(f for f in os.listdir(directory) if f.endswith(".yaml")
-                   and f != "pack.yaml")
+                   and f != "hub.yaml")
     if len(found) != 1:
         raise PersonalityError(f"{directory}: expected {base}.yaml (one descriptor); "
                          f"found {found or 'none'}")
@@ -181,7 +176,7 @@ def discard(personality: Personality) -> None:
         personality.tmp_root = None
 
 
-#: A unit personality is a Python module name; a camera personality is a pack chip
+#: A click personality is a Python module name; a cam personality is a hub chip
 #: name, which is also the directory name the loader expects.
 _UNIT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _CAMERA_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -201,7 +196,7 @@ def _read(yaml_path: str, root: Optional[str]) -> Personality:
         raise PersonalityError(f"{yaml_path}: expected a mapping with a meta: block")
     name = os.path.splitext(os.path.basename(yaml_path))[0]
     kind = kind_of(doc, yaml_path)
-    pattern = _UNIT_NAME if kind == UNIT else _CAMERA_NAME
+    pattern = _UNIT_NAME if kind == CLICK else _CAMERA_NAME
     if not pattern.fullmatch(name):
         raise PersonalityError(f"{yaml_path}: {name!r} is not a {kind} personality name "
                          f"({pattern.pattern})")
@@ -215,39 +210,39 @@ def kind_of(doc: dict, where: str) -> str:
     """`meta.kind`, or the kind the descriptor's shape implies."""
     meta = doc.get("meta") or {}
     kind = meta.get("kind")
-    if kind in (UNIT, CAMERA):
+    if kind in (CLICK, CAM):
         return kind
     if kind is not None:
-        raise PersonalityError(f"{where}: meta.kind must be {UNIT} or {CAMERA}, got {kind!r}")
-    if "params" in doc or "driver" in meta:
-        return UNIT
+        raise PersonalityError(f"{where}: meta.kind must be {CLICK} or {CAM}, got {kind!r}")
+    if "params" in doc or "personality" in meta:
+        return CLICK
     if "compatible" in meta or "registers" in doc:
-        return CAMERA
+        return CAM
     raise PersonalityError(f"{where}: cannot tell the personality kind — set meta.kind: "
-                     f"{UNIT} or {CAMERA}")
+                     f"{CLICK} or {CAM}")
 
 
 # ── check ────────────────────────────────────────────────────────────
 
 def findings(personality: Personality) -> List[str]:
     """What is wrong with a personality, empty when it is sound."""
-    if personality.kind == UNIT:
+    if personality.kind == CLICK:
         return _unit_findings(personality)
     return _camera_findings(personality)
 
 
 def _unit_findings(personality: Personality) -> List[str]:
-    from nxs.compiler import CompileError, SensorDriver
-    from nxs.descriptor import _load_descriptor_file
+    from nxs.compiler import CompileError, ClickPersonality
+    from nxs.click_facts import _load_facts_file
 
     problems: List[str] = []
     try:
-        doc = _load_descriptor_file(personality.yaml_path)
+        doc = _load_facts_file(personality.yaml_path)
     except ValueError as e:
         return [str(e)]
-    declared = (doc.get("meta") or {}).get("driver")
+    declared = (doc.get("meta") or {}).get("personality")
     if declared != personality.name:
-        problems.append(f"{personality.yaml_path}: meta.driver is {declared!r}, "
+        problems.append(f"{personality.yaml_path}: meta.personality is {declared!r}, "
                         f"the file is {personality.name}")
     if personality.py_path is None:
         problems.append(f"{personality.name}.py: missing beside {personality.yaml_path}")
@@ -257,10 +252,10 @@ def _unit_findings(personality: Personality) -> List[str]:
     except Exception as e:
         return problems + [f"{personality.py_path}: import failed: {e}"]
     classes = [obj for obj in vars(mod).values()
-               if isinstance(obj, type) and issubclass(obj, SensorDriver)
+               if isinstance(obj, type) and issubclass(obj, ClickPersonality)
                and obj.__module__ == mod.__name__]
     if len(classes) != 1:
-        return problems + [f"{personality.py_path}: expected one SensorDriver "
+        return problems + [f"{personality.py_path}: expected one ClickPersonality "
                            f"subclass, found {len(classes)}"]
     cls = classes[0]
     buses = tuple(getattr(cls, "BUSES", None) or ())
@@ -281,17 +276,17 @@ def _unit_findings(personality: Personality) -> List[str]:
 def _camera_findings(personality: Personality) -> List[str]:
     from nxs import schemas
 
-    problems = schemas.findings(personality.doc, schemas.CAM_DESCRIPTOR,
+    problems = schemas.findings(personality.doc, schemas.CAM_PERSONALITY,
                                 where=personality.yaml_path)
     meta = personality.doc.get("meta") or {}
     if meta.get("role") != "SEN":
-        problems.append(f"{personality.yaml_path}: a camera personality is a sensor "
+        problems.append(f"{personality.yaml_path}: a cam personality is a sensor "
                         f"(meta.role: SEN), got {meta.get('role')!r}")
     if personality.py_path is None:
         problems.append(f"{personality.name}.py: missing beside {personality.yaml_path} "
                         f"(the behaviour the unit runs)")
     else:
-        # The behaviour compiles inside the pack's context at upload; here the
+        # The behaviour compiles inside the hub's context at upload; here the
         # file is checked to be a Python module before it is installed.
         try:
             compile(open(personality.py_path, encoding="utf-8").read(), personality.py_path, "exec")
@@ -327,7 +322,7 @@ def _mode_tables(doc: dict) -> Dict[str, str]:
 
 
 def _bench(personality: Personality) -> str:
-    """The bring-up line of a camera personality."""
+    """The bring-up line of a cam personality."""
     return f"nxs <port> <link> on --sensor {personality.name}"
 
 
@@ -349,13 +344,13 @@ def _referenced_blobs(doc: dict) -> set:
 
 def describe(personality: Personality) -> str:
     meta = personality.doc.get("meta") or {}
-    if personality.kind == UNIT:
+    if personality.kind == CLICK:
         params = [p.get("name") for p in personality.doc.get("params") or []
                   if isinstance(p, dict)]
-        return (f"personality {personality.name}: unit · params "
+        return (f"personality {personality.name}: click · params "
                 f"{', '.join(str(p) for p in params) or 'none'}")
     modes = list((personality.doc.get("modes") or {}).keys())
-    return (f"personality {personality.name}: camera · {meta.get('compatible')} · "
+    return (f"personality {personality.name}: cam · {meta.get('compatible')} · "
             f"{len(modes)} mode(s)")
 
 
@@ -370,7 +365,7 @@ def cmd_check(path: str) -> int:
         if problems:
             return 1
         print("  ok" + (" — bench proof: nxs upload, then the validation contract"
-                        if personality.kind == UNIT else
+                        if personality.kind == CLICK else
                         f" — bench proof: {_bench(personality)}, then capture --frames 60"))
         return 0
     finally:
@@ -380,15 +375,15 @@ def cmd_check(path: str) -> int:
 # ── install ──────────────────────────────────────────────────────────
 
 @_refusing
-def cmd_install(path: str, extends: Optional[str]) -> int:
+def cmd_install(path: str) -> int:
     personality = locate(path)
     try:
-        return _install(personality, extends)
+        return _install(personality)
     finally:
         discard(personality)
 
 
-def _install(personality: Personality, extends: Optional[str]) -> int:
+def _install(personality: Personality) -> int:
     problems = findings(personality)
     if problems:
         print(describe(personality))
@@ -406,13 +401,9 @@ def _install(personality: Personality, extends: Optional[str]) -> int:
     # never merges into what was there.
     stage = tempfile.mkdtemp(prefix=f".{personality.name}.", dir=None if escalate else store)
     try:
-        if personality.kind == UNIT:
-            _install_unit(personality, stage)
-            nxt = f"nxs upload {personality.name}"
-        else:
-            base = _base_pack(extends)
-            _install_camera(personality, stage, base)
-            nxt = _bench(personality)
+        _copy_files(personality, stage)
+        nxt = (f"nxs upload {personality.name}" if personality.kind == CLICK
+               else _bench(personality))
         if escalate:
             _place_as_root(stage, store, dest)
         else:
@@ -466,7 +457,7 @@ def _copy_files(personality: Personality, dest: str) -> None:
     os.makedirs(dest, exist_ok=True)
     if personality.root:
         for entry in os.listdir(personality.root):
-            if entry in ("__pycache__", "pack.yaml") or entry.endswith(".pyc"):
+            if entry in ("__pycache__", "hub.yaml") or entry.endswith(".pyc"):
                 continue
             src = os.path.join(personality.root, entry)
             target = os.path.join(dest, entry)
@@ -478,7 +469,7 @@ def _copy_files(personality: Personality, dest: str) -> None:
     else:
         shutil.copy2(personality.yaml_path, dest)
         shutil.copy2(personality.py_path, dest)
-        if personality.kind == CAMERA:
+        if personality.kind == CAM:
             # The pair's tables and blobs beside it: `<name>_*.yaml` by the
             # naming convention, and the blobs directory when there is one.
             here = os.path.dirname(personality.yaml_path)
@@ -490,46 +481,3 @@ def _copy_files(personality: Personality, dest: str) -> None:
                 elif entry == "blobs" and os.path.isdir(src):
                     shutil.copytree(src, os.path.join(dest, entry), dirs_exist_ok=True,
                                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-
-
-def _install_unit(personality: Personality, dest: str) -> None:
-    _copy_files(personality, dest)
-
-
-def _install_camera(personality: Personality, dest: str, base: str) -> None:
-    """A camera personality is an extension of the installed pack: the store
-    entry carries a pack.yaml naming the pack it extends, and the chip
-    directory the loader expects (`<name>/<name>.yaml`)."""
-    from nxs.cam.packs import PACK_API
-
-    os.makedirs(dest, exist_ok=True)
-    _copy_files(personality, os.path.join(dest, personality.name))
-    with open(os.path.join(dest, "pack.yaml"), "w", encoding="utf-8") as fh:
-        fh.write(f"extends: {base}\napi: {PACK_API}\nchips: [{personality.name}]\n")
-
-
-def _base_pack(extends: Optional[str]) -> str:
-    """The pack a camera personality extends: the one named, checked against
-    the installed packs, else the first installed one."""
-    from nxs.cam import packs
-
-    try:
-        names = [p.name for p in packs.discover()]
-        known = [p.name for p in packs.all_packs()]
-    except packs.PackError as e:
-        raise PersonalityError(f"a camera personality extends the installed descriptor "
-                         f"pack, which did not load: {e}") from None
-    if extends is not None:
-        if extends not in known:
-            raise PersonalityError(f"--extends {extends}: no such pack is installed "
-                             f"(found: {', '.join(names) or 'none'})")
-        return extends
-    if not names:
-        # The tool's own pack is never the default: a personality bound to
-        # it by omission would serve no hub. It is named on purpose.
-        raise PersonalityError("a camera personality extends the installed descriptor "
-                         "pack, and none is installed (searched "
-                         + ", ".join(str(p) for p in packs.search_paths())
-                         + "); install the pack, or name one with --extends "
-                         + " | ".join(known))
-    return names[0]

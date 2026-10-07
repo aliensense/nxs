@@ -438,7 +438,7 @@ class SonyImx(_KnobMixin):
             if self._has("GAIN") and "gain_max" in self._d.limits:
                 names.append("knob_gain")
                 if self._gain_db_law() is not None:
-                    names.append("knob_gain_db")
+                    names += ["knob_gain_db", "gain_db_max"]
         if self._d.raw("test_pattern"):
             names.append("knob_test_pattern")
         if "takes_trigger" in (self._d.raw("sync") or {}):

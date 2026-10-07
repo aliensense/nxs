@@ -17,7 +17,8 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import List
+import time
+from typing import List, Optional
 
 log = logging.getLogger("nxsd")
 
@@ -33,9 +34,11 @@ _cfg: list = [None]
 #: Whether another run held the bus at the watch's last read, so a stretch
 #: of held ticks logs once.
 _held: list = [False]
-#: The ports whose bring-up by the watch failed: their links are no longer
-#: recorded up, so each tick brings them up again until one succeeds.
-_pending: set = set()
+#: The ports whose bring-up by the watch failed on a hub that did not
+#: answer, each with the time the watch stops waiting for that hub: a tick
+#: brings such a port up again once the hub answers. A bring-up that failed
+#: on an answering hub stands as the port's verdict until a reload.
+_pending: dict = {}
 #: The reads in a row a pod of each port has missed.
 _misses: dict = {}
 _stop = threading.Event()
@@ -89,13 +92,13 @@ def tick(cfg, followers=None) -> List[str]:
 
     reconverged: List[str] = []
     stopped = False
-    _pending.intersection_update(cfg.ports)
-    for gone in set(_misses) - set(cfg.ports):
-        del _misses[gone]
+    for gone in (set(_pending) | set(_misses)) - set(cfg.ports):
+        _pending.pop(gone, None)
+        _misses.pop(gone, None)
     try:
         for name in sorted(cfg.ports):
             if not daemon._owned(cfg.ports[name]):
-                _pending.discard(name)
+                _pending.pop(name, None)
                 continue
             try:
                 topology, links = select_port_links(daemon._port_args(name), require_port=True)
@@ -105,7 +108,7 @@ def tick(cfg, followers=None) -> List[str]:
                 continue
             states = {port_state.link_state(topology, link) for link in links}
             if states == {port_state.STATE_UP}:
-                _pending.discard(name)
+                _pending.pop(name, None)
                 try:
                     silent = _silent_pods(topology, links)
                 except port_state.BusHeld:
@@ -129,10 +132,17 @@ def tick(cfg, followers=None) -> List[str]:
                     continue
                 log.warning("port %s: a pod stopped answering at its alias; reconverging", name)
             elif name in _pending and port_state.STATE_PARKED not in states:
-                log.info("port %s: the last reconverge failed; reconverging again", name)
+                if time.monotonic() >= _pending[name]:
+                    del _pending[name]
+                    log.info("port %s: the hub did not answer in %g s; the port waits for a reload",
+                             name, daemon.CONSTRUCT_WAIT_S)
+                    continue
+                if _hub_silent_locked(cfg.ports[name]) is not False:
+                    continue        # silent, or the bus is another run's: the next tick
+                log.info("port %s: the hub answers again; reconverging", name)
             else:
                 # Down by a step of its own, `off` or an `on` by hand: not the watch's.
-                _pending.discard(name)
+                _pending.pop(name, None)
                 continue
             _misses.pop(name, None)
             if followers is not None and not stopped:
@@ -141,15 +151,24 @@ def tick(cfg, followers=None) -> List[str]:
             port_state.mark_unknown(topology, links)
             rc = daemon._bring_up(name, "reconverged", "reconvergence failed")
             if rc == 0:
-                _pending.discard(name)
+                _pending.pop(name, None)
                 reconverged.append(name)
             elif rc == 3:
                 # The verdict stands for `switch` and a reload; another `on`
                 # would write the same boot entry.
-                _pending.discard(name)
+                _pending.pop(name, None)
                 log.warning("port %s: REBOOT NEEDED; the watch leaves the port to a reload", name)
+            elif _hub_silent_locked(cfg.ports[name]) is not False:
+                # A hub off or power-cycling, or a bus another run holds: the
+                # watch looks for it, as the construction does, and brings the
+                # port up when it answers.
+                _pending.setdefault(name, time.monotonic() + daemon.CONSTRUCT_WAIT_S)
+                log.info("port %s: the hub does not answer; the watch brings the port up when it does",
+                         name)
             else:
-                _pending.add(name)
+                # The refusal is the port's verdict until the declaration changes.
+                _pending.pop(name, None)
+                log.warning("port %s: the reconverge failed; its verdict stands until a reload", name)
     finally:
         if stopped:
             followers.start(cfg)
@@ -182,3 +201,18 @@ def start(cfg, followers=None) -> threading.Thread:
 def stop() -> None:
     """End the watch after its current tick."""
     _stop.set()
+
+
+def _hub_silent_locked(port) -> Optional[bool]:
+    """`daemon._hub_silent` under the bus lock, so the probe never lands
+    inside another run's sequence; None when another run holds the bus,
+    which the next tick reads again."""
+    from nxs import daemon
+    from nxs.cam import port_state
+
+    try:
+        with port_state.BusLock():
+            return daemon._hub_silent(port)
+    except port_state.BusHeld:
+        return None
+

@@ -189,7 +189,10 @@ class Panel:
         # What the freeze adopted, its node's knobs now show; every other edit stays,
         # and all of them when the freeze failed.
         if ports:
-            keep = lambda ch, sec, _f: not (ch.name == node.port and sec.kind in ("declare", "camera"))
+            # The port's own knobs and its links' are what the freeze adopted.
+            keep = lambda ch, sec, _f: not (
+                (ch.name == node.port or getattr(ch, "port_name", None) == node.port)
+                and sec.kind in ("declare", "camera", "sync", "gain"))
         else:
             keep = lambda _ch, sec, _f: sec.unit_name != node.unit
         refused = self.reload(keep if rc == 0 else None)

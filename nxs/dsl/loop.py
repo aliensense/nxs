@@ -28,7 +28,7 @@ class _ASTCompiler(_ValueCompiler, ast.NodeVisitor):
 
     def __init__(self, emitter: _Emitter, regs: _RegAlloc,
                  trigger: str, sample_rate: int, bus_kind: str,
-                 frame=None, driver=None, drdy_base_hz: int = 0):
+                 frame=None, personality=None, drdy_base_hz: int = 0):
         self._em = emitter
         self._regs = regs
         self._trigger = trigger
@@ -38,7 +38,7 @@ class _ASTCompiler(_ValueCompiler, ast.NodeVisitor):
         self._frame = frame
         # Fallback target for methods absent from the AST dispatch table: a base
         # class helper emits to the shared emitter directly.
-        self._driver = driver
+        self._personality = personality
         self._loop_label = "__measure_loop"
         # measure-local name to work-buffer offset for 64-bit locals; narrow
         # locals stay in _regs.
@@ -76,8 +76,8 @@ class _ASTCompiler(_ValueCompiler, ast.NodeVisitor):
             div = self._divider_for(self._sample_rate)
             div_off = self._em._current_offset() + 1
             self._em.emit_u16(Op.EVENT_DIV, div)
-            if self._driver is not None:
-                self._driver._patch_drdy_div(div_off, self._drdy_base_hz)
+            if self._personality is not None:
+                self._personality._patch_drdy_div(div_off, self._drdy_base_hz)
 
         # Loop top: DRDY mode yields on the hardware event and never sleeps
         # (rate reduction goes through the ODR register); poll mode sleeps.
@@ -88,8 +88,8 @@ class _ASTCompiler(_ValueCompiler, ast.NodeVisitor):
             interval = max(1, 1000 // self._sample_rate)
             sleep_off = self._em._current_offset() + 1
             self._em.emit_u16(Op.SLEEP_MS, interval)
-            if self._driver is not None:
-                self._driver._patch_poll_rate(sleep_off)
+            if self._personality is not None:
+                self._personality._patch_poll_rate(sleep_off)
 
         for stmt in func_def.body:
             self._compile_stmt(stmt)
@@ -156,11 +156,11 @@ class _ASTCompiler(_ValueCompiler, ast.NodeVisitor):
         Returns True when a matching `_dev_close(True)` must follow."""
         if dev is None:
             return False
-        if self._bus_kind != BUS_REGISTER or self._driver is None:
+        if self._bus_kind != BUS_REGISTER or self._personality is None:
             raise CompileError(
-                f"dev= targets an I2C companion; this driver kind has none "
+                f"dev= targets an I2C companion; this personality kind has none "
                 f"(line {lineno}).")
-        addr = self._driver._companion_addr(dev, lineno)
+        addr = self._personality._companion_addr(dev, lineno)
         self._em.emit(Op.I2C_TARGET, addr)
         return True
 
@@ -171,7 +171,7 @@ class _ASTCompiler(_ValueCompiler, ast.NodeVisitor):
     def _scalar_scratch_off(self, verb: str) -> int:
         """Byte offset a scalar value-read stages at before it LOADs: the
         sample-buffer tail. Rejects a sample_size that reaches into it."""
-        size = self._driver._sample_size
+        size = self._personality._sample_size
         if size > self.SCALAR_SCRATCH_OFF:
             raise CompileError(
                 f"{verb} stages through sample_buf["
@@ -258,12 +258,12 @@ class _ASTCompiler(_ValueCompiler, ast.NodeVisitor):
                 if self._frame is not None:
                     if dev is not None:
                         raise CompileError(
-                            f"dev= targets an I2C companion; a FRAME driver "
+                            f"dev= targets an I2C companion; a FRAME personality "
                             f"is SPI and declares none (line {call.lineno}).")
-                    # FRAME driver: a bare read-to-clear must still clock the
+                    # FRAME personality: a bare read-to-clear must still clock the
                     # composed frame. Discard the loaded value into a scratch reg.
                     with self._regs.scope():
-                        self._driver._emit_frame_read(reg,
+                        self._personality._emit_frame_read(reg,
                                                       self._regs.get("__bare_read"))
                     return
                 opened = self._dev_open(dev, call.lineno)
@@ -288,10 +288,10 @@ class _ASTCompiler(_ValueCompiler, ast.NodeVisitor):
                 self._em.emit(Op.UART_WRITE, val)
                 return
 
-        # Fallback: a driver method (read_until, read_n, store_sample_n, ...)
+        # Fallback: a personality method (read_until, read_n, store_sample_n, ...)
         # called with evaluated arguments emits to the shared emitter directly.
-        if self._driver is not None and hasattr(self._driver, method):
-            fn = getattr(self._driver, method)
+        if self._personality is not None and hasattr(self._personality, method):
+            fn = getattr(self._personality, method)
             args = [self._eval_const(a) for a in call.args]
             kwargs = {}
             for kw in call.keywords:
@@ -301,7 +301,7 @@ class _ASTCompiler(_ValueCompiler, ast.NodeVisitor):
 
         raise CompileError(
             f"Unsupported expression: self.{method}(...) "
-            f"on {self._bus_kind} driver (line {call.lineno})")
+            f"on {self._bus_kind} personality (line {call.lineno})")
 
     def _compile_if(self, node):
         skip_label = f"__if_skip_{id(node)}"
@@ -421,7 +421,7 @@ class _ASTCompiler(_ValueCompiler, ast.NodeVisitor):
         declared field set."""
         int_types = {'int8', 'uint8', 'int16', 'uint16', 'int32', 'uint32'}
         layout = {}
-        for f in self._driver._output_fields:
+        for f in self._personality._output_fields:
             t = f.get('type', 'int16')
             if t not in int_types:
                 raise CompileError(
@@ -472,8 +472,8 @@ class _ASTCompiler(_ValueCompiler, ast.NodeVisitor):
                 isinstance(node.value, ast.Name) and node.value.id == "self"):
             # `self.CMD_WORD`: an UPPER_CASE class-level integer constant,
             # resolved on the class so trace-time state can't leak into bytecode.
-            if (self._driver is not None and node.attr.isupper()):
-                val = getattr(type(self._driver), node.attr, None)
+            if (self._personality is not None and node.attr.isupper()):
+                val = getattr(type(self._personality), node.attr, None)
                 if isinstance(val, int) and not isinstance(val, bool):
                     return val
             raise CompileError(

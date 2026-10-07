@@ -16,6 +16,12 @@ class ContractError(ValueError):
     """Base error for contract violations between layers."""
 
 
+class NoLock(str):
+    """What a port's construction found on a link where no serializer locked
+    at any rate the hub listens at, in the hub's words: nothing answers on
+    the link."""
+
+
 class InfeasibleConfig(ContractError):
     """A requested configuration cannot work on this hardware: the fact on
     one line, then one line per lawful alternative."""

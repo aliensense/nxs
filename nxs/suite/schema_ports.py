@@ -43,7 +43,7 @@ class PortLinkSpec:
     camera: Optional[str]             # the sensor compatible; None until declared
     ser: Optional[str]                # the link's serializer, behind a hub
     des_window: Optional[int]
-    csi_vc: Optional[int]             # None: the pack's channel for the link's name
+    csi_vc: Optional[int]             # None: the hub's channel for the link's name
     ser_addr: int = 0x42
     sensor_addr: Optional[int] = None  # None: the descriptor's own address
     tca_addr: int = 0x20
@@ -215,7 +215,15 @@ def _parse_port(name, raw, where: str) -> PortSpec:
         raise ManifestError(
             f"{where}.sync.source: {port.sync_source!r} "
             f"(one of {', '.join(SYNC_SOURCES)})")
-    port.sync_fps = sync.get("fps")
+    fps = sync.get("fps")
+    if fps is not None:
+        try:
+            fps = float(fps)
+        except (TypeError, ValueError):
+            raise ManifestError(f"{where}.sync.fps: {fps!r} is not a number") from None
+        if not math.isfinite(fps) or fps <= 0:
+            raise ManifestError(f"{where}.sync.fps: must be finite and positive, got {fps}")
+    port.sync_fps = fps
     # With no hub the port serves the one sensor on its own bus.
     direct = port.hub_compatible is None
     if direct and port.sync_source != "free_run":
@@ -336,7 +344,7 @@ def _parse_port(name, raw, where: str) -> PortSpec:
                 target=target,
             )
         # Behind a hub the serializer, the window and the channel are the
-        # pack's rules for the link's name unless the link names them.
+        # hub's rules for the link's name unless the link names them.
         port.links.append(PortLinkSpec(
             name=str(lname),
             camera=link_sensor,
@@ -367,6 +375,3 @@ def _parse_port(name, raw, where: str) -> PortSpec:
 
 #: What the report (`hardware.yaml`) writes per port and per link: what
 #: answered, never read back as a declaration.
-HARDWARE_PORT_KEYS = {"bus", "hub", "csi_lanes"}
-HARDWARE_LINK_KEYS = {"camera", "ser", "des_window", "csi_vc", "ser_addr",
-                      "sensor_addr", "tca_addr", "capture_id"}

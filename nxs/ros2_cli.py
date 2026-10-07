@@ -5,7 +5,7 @@ import sys
 import time
 
 from nxs._generated_constants import CyphalDefaults
-from nxs.descriptor import is_decodable
+from nxs.click_facts import is_decodable
 from nxs.stamp_modes import STAMP_ITOW, STAMP_MODES, STAMP_SYNCED
 from nxs.stream_cli import _configure_stream
 from nxs import transports
@@ -80,16 +80,18 @@ def cmd_ros2(args, opener=None, argv=None, cfg=None):
     """Bridge decoded samples onto ROS 2 topics: the whole suite by
     default, one unit with --unit, or an ad-hoc flag-addressed device. The
     opener defaults to the one `nxs.transports` holds at the call."""
+    if getattr(args, 'launch_file', False):
+        print(os.path.join(os.path.dirname(__file__), 'ros2',
+                           'bridge.launch.py'))
+        return 0
+    if getattr(args, 'stream_start', None):
+        from nxs.ros2_cameras import stream_start
+        return stream_start(args.stream_start, getattr(args, 'since', None))
     opener = opener or transports.open_client
     from nxs.cli import _open_transport
     from nxs.ros2_bridge import (
         Ros2Bridge, UnitPlan, acquire_run_lock, epoch_binding, format_plan,
         join_topic, load_map, plan_publications, run_bridge)
-
-    if getattr(args, 'launch_file', False):
-        print(os.path.join(os.path.dirname(__file__), 'ros2',
-                           'bridge.launch.py'))
-        return 0
 
     suite_mode, targets = _ros2_targets(args, argv, cfg=cfg)
     if not getattr(args, 'plan', False):
@@ -126,10 +128,10 @@ def cmd_ros2(args, opener=None, argv=None, cfg=None):
         if not client.probe():
             refuse(label, "no probe answer", client)
             continue
-        driver = ""
+        personality = ""
         for attempt in range(3):
-            driver = client.read_driver_name()
-            if driver:
+            personality = client.read_personality_name()
+            if personality:
                 break
             time.sleep(0.2)
         fields = client.read_outputs()
@@ -142,7 +144,7 @@ def cmd_ros2(args, opener=None, argv=None, cfg=None):
                           "can't decode — update nxs", client)
             continue
         pubs = load_map(args.map) if args.map else plan_publications(fields)
-        frame = args.frame_id or name or driver or 'nxs'
+        frame = args.frame_id or name or personality or 'nxs'
         plans.append(UnitPlan(name=name, frame_id=frame, publications=pubs,
                               epoch=epoch_binding(fields)))
         clients.append(client)
@@ -230,3 +232,11 @@ def add_ros2_parser(sub) -> None:
                         help='Print the path to the shipped ROS 2 launch '
                              'file and exit: ros2 launch "$(nxs ros2 '
                              '--launch-file)"')
+    p_ros2.add_argument('--stream-start', metavar='PORT', default=None,
+                        help='Restart the output of a camera port under the '
+                             'capture session its first camera node has just '
+                             'opened, and exit. The launch file runs it.')
+    p_ros2.add_argument('--since', type=float, default=None, metavar='TIME',
+                        help='With --stream-start: the time the camera node '
+                             'said its stream started, in seconds since the '
+                             'epoch.')

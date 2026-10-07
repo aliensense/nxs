@@ -1,4 +1,4 @@
-"""The driver base class: the declarations a personality makes in probe() and configure()."""
+"""The personality base class: the declarations a personality makes in probe() and configure()."""
 
 from __future__ import annotations
 
@@ -15,17 +15,17 @@ from nxs.dsl.fields import PWM_FREQ_MAX_HZ, PWM_FREQ_MIN_HZ, ParamDescriptor, Pa
 from nxs.dsl.loop import _ASTCompiler
 
 
-class SensorDriver(_CompilePhase):
-    """Base class for NXS sensor drivers: a datasheet in code. The YAML config
+class ClickPersonality(_CompilePhase):
+    """Base class for NXS click personalities: a datasheet in code. The YAML config
     selects the mode; compile(config) produces bytecode plus output field
     descriptors."""
 
-    # Bus family declared by the subclass; plain SensorDriver is abstract and
+    # Bus family declared by the subclass; plain ClickPersonality is abstract and
     # compile() rejects it.
     BUS_KIND: Optional[str] = None
 
     # mikroBUS reset active level: 'low' (default) or 'high'. Firmware pulses
-    # the shared reset at bind for every driver kind.
+    # the shared reset at bind for every personality kind.
     RESET_ACTIVE = 'low'
 
     def __init__(self):
@@ -65,7 +65,7 @@ class SensorDriver(_CompilePhase):
         return _Emitter(REG_ADDR_MAX_16 if wide else REG_ADDR_MAX_8)
 
     def _validate_kind(self) -> None:
-        """Kind-specific class checks before tracing; a driver has none."""
+        """Kind-specific class checks before tracing; a personality has none."""
 
     def _fresh_label(self, base: str) -> str:
         """Generate a unique label name; safe to call multiple times
@@ -134,12 +134,12 @@ class SensorDriver(_CompilePhase):
                 f"Valid values: {values}{unit_str}")
 
     def declare_params_from_descriptor(self) -> None:
-        """Declare this driver's parameter table from its sibling YAML
+        """Declare this personality's parameter table from its sibling YAML
         descriptor. Declaration order is the YAML order, which fixes the wire's
         param indices."""
-        from nxs.descriptor import driver_params
+        from nxs.click_facts import click_params
 
-        for entry in driver_params(type(self)):
+        for entry in click_params(type(self)):
             param_type = entry.get("type", "enum")
             # A range has no bytecode patch site, so it is always live: an
             # entry that names no kind gets the only kind that loads.
@@ -306,7 +306,7 @@ class SensorDriver(_CompilePhase):
                 f"opcode, so sleeps must unroll into "
                 f"OP_SLEEP_MS({self.SLEEP_CHUNK_MS}) chunks at compile "
                 f"time. If this is a microsecond delay, use sleep_us(). "
-                f"For genuine long waits, factor the driver to use "
+                f"For genuine long waits, factor the personality to use "
                 f"trigger=drdy or split the wait across measure-loop "
                 f"iterations.")
         full = ms // self.SLEEP_CHUNK_MS
@@ -422,7 +422,7 @@ class SensorDriver(_CompilePhase):
                 entry['byte_off'] = int(f['at'])
             self._output_fields.append(entry)
 
-        # Explicit placement is all-or-none: mixing `at=` with pack-sequential
+        # Explicit placement is all-or-none: mixing `at=` with hub-sequential
         # fields makes the implicit offsets depend on declaration order.
         n_at = sum(1 for e in self._output_fields if 'byte_off' in e)
         if 0 < n_at < len(self._output_fields):

@@ -28,7 +28,7 @@ import threading
 import time
 from typing import List, Optional, Tuple
 
-from nxs.daemon.verdict import BRINGING_UP, port_verdict, record_verdict, verdict_of
+from nxs.daemon.verdict import BRINGING_UP, port_verdict, record_verdict, settle_stale, verdict_of
 
 log = logging.getLogger("nxsd")
 
@@ -136,15 +136,15 @@ def _load_checked():
 def _loaded():
     """The manifest, loaded against the shipped schema; None (with logs)
     when there is none at the path or it is rejected."""
-    from nxs.cam import packs
+    from nxs.cam import hubs
     from nxs.check import shape_findings
     from nxs.suite import default_config_path
     from nxs.suite.schema import ManifestError, load_suite_config
     from nxs.suite.switch import manifest_present
 
-    # Pack discovery is cached per process while the personality store is written
+    # Hub discovery is cached per process while the personality store is written
     # at run time; reset so a personality installed after start is visible.
-    packs.reset_cache()
+    hubs.reset_cache()
     path = default_config_path()
     if not manifest_present(path):
         log.error("no manifest at %s", path)
@@ -207,12 +207,12 @@ def render_systemd_unit(exec_path: str, user: Optional[str],
 
 def _owned(port) -> bool:
     """A port this daemon programs: a hub declared with the nxs driver, or a
-    sensor on the port's own bus whose links all carry a unit to run it. A
-    link with no unit is nobody's to bring up at boot (the source-tree
-    emulator serves it by hand), whatever the environment says."""
+    sensor on the port's own bus. A link there runs its personality on its
+    unit, or on the host when it declares none, so every such port with a
+    link is the daemon's to bring up at boot."""
     if port.hub_compatible is not None:
         return port.hub_driver == "nxs"
-    return bool(port.links) and all(link.unit is not None for link in port.links)
+    return bool(port.links)
 
 
 def _relinquishes(before, after) -> bool:
@@ -247,9 +247,9 @@ def _runs_another_declaration(port) -> bool:
 def _left_down(port) -> bool:
     """Whether an owned port has a link a step recorded this boot neither up
     nor parked: a bring-up that did not verify, or a port `nxs switch`
-    recorded down to come up again (a pod took a new build, or its hub lost
-    the aliases). A port `off` parked is the operator's, and one no step
-    recorded is the construction's."""
+    recorded down to come up again (a pod took a new build, its hub lost
+    the aliases, or the port was parked). A port `off` parked is the
+    operator's, and one no step recorded is the construction's."""
     from nxs.cam import port_state
     from nxs.cam import topology as cam_topo
 
@@ -458,7 +458,7 @@ CONSTRUCT_RETRY_S = 5.0
 def _hub_silent(port) -> bool:
     """Whether the port declares a hub and it does not answer its first
     register; a bus that does not open is a silent hub too."""
-    from nxs.cam import packs
+    from nxs.cam import hubs
     from nxs.cam import run as cam_run
     from nxs.cam import topology as cam_topo
     from nxs.cam.descriptors import to_int
@@ -468,7 +468,7 @@ def _hub_silent(port) -> bool:
         return False
     try:
         topology = cam_topo.port_topology(port)
-        registers = packs.pack_for(topology).descriptor(topology.des_compatible).registers
+        registers = hubs.for_topology(topology).descriptor(topology.des_compatible).registers
     except Exception:        # noqa: BLE001 (the port's `on` refuses it with the reason)
         return False
     i2c = cam_run.CamI2c(addr=hex(topology.des_addr), bus=topology.i2c_bus)
@@ -645,6 +645,8 @@ def main(argv=None) -> int:
                         format="%(name)s: %(message)s")
 
     signal.signal(signal.SIGHUP, _on_hup)
+    for name in settle_stale():
+        log.info("port %s: the daemon restarted during its bring-up; recorded stopped", name)
     cfg = _loaded()
     if cfg is None:
         # A rejected manifest is the service's failure and the oneshot's; with

@@ -148,6 +148,7 @@
               "kind": {
                 "enum": [
                   "port",
+                  "link",
                   "unit"
                 ]
               },
@@ -183,7 +184,12 @@
                       "enum": [
                         "declare",
                         "camera",
-                        "sensor"
+                        "sync",
+                        "gain",
+                        "sensor",
+                        "mount",
+                        "egress",
+                        "firmware"
                       ]
                     },
                     "unit": {
@@ -486,10 +492,7 @@
                         ],
                         "properties": {
                           "kind": {
-                            "enum": [
-                              "sensor",
-                              "camera"
-                            ]
+                            "enum": ["click", "cam"]
                           },
                           "text": {
                             "type": "string"
@@ -1147,7 +1150,7 @@
         "link",
         "sensor",
         "csi_lanes",
-        "pack",
+        "hub",
         "modes",
         "knobs",
         "trigger_modes"
@@ -1172,7 +1175,7 @@
         "csi_lanes": {
           "type": "integer"
         },
-        "pack": {
+        "hub": {
           "type": "string"
         },
         "cameras": {
@@ -1254,7 +1257,7 @@
                   "integer",
                   "null"
                 ],
-                "description": "The mode's index in the table the port boots; null for a mode the table carries no row for, or on a pack without a capture table."
+                "description": "The mode's index in the table the port boots; null for a mode the table carries no row for, or on a hub without a capture table."
               },
               "token": {
                 "type": "string",
@@ -1269,7 +1272,7 @@
                   "boolean",
                   "null"
                 ],
-                "description": "Whether the table the port boots carries the mode's row (one pixel format per table); false for a mode that boots on no node, with no range or line listed; null on a pack without a capture table."
+                "description": "Whether the table the port boots carries the mode's row (one pixel format per table); false for a mode that boots on no node, with no range or line listed; null on a hub without a capture table."
               },
               "fps_floor": {
                 "type": [

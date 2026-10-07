@@ -1,6 +1,6 @@
 """The unit rows of a bare `nxs status`, read on demand: `up`, `degraded`
 (another declared link is silent), or `down`; the drift kinds (`config`,
-`driver`, `shape`, `fw`), `-` for none, `?` when unknown; the sync,
+`personality`, `shape`, `fw`), `-` for none, `?` when unknown; the sync,
 serial and calibration verdicts; the personality and its outputs."""
 import sys
 from dataclasses import dataclass, field
@@ -23,7 +23,7 @@ class UnitStatus:
     link: str
     up: bool = False
     degraded: bool = False
-    driver: str = ""
+    personality: str = ""
     vm_state: str = ""
     fw_version: str = ""
     serial_ok: str = ""
@@ -36,7 +36,7 @@ class UnitStatus:
 
 
 def collect_status(cfg: SuiteConfig, state: SuiteState,
-                   opener=None, drivers_dir: "str | None" = None,
+                   opener=None, personalities_dir: "str | None" = None,
                    units: Optional[List[UnitSpec]] = None) -> List[UnitStatus]:
     """One row per declared unit, or per unit of `units`, read now. The
     opener defaults to the one `nxs.transports` holds at the call."""
@@ -77,14 +77,14 @@ def collect_status(cfg: SuiteConfig, state: SuiteState,
         if row.up:
             # Each field is read independently: one failing read leaves that
             # column blank without blanking the others.
-            row.driver = _try(transport.read_driver_name, "") or "-"
+            row.personality = _try(transport.read_personality_name, "") or "-"
             row.vm_state = _vm_verdict(transport)
             row.fw_version = _try(transport.read_fw_version, "") or "-"
             row.sync = _sync_verdict(transport)
             row.serial = _try(lambda: (transport.read_serial() or b"").hex(), "")
             row.serial_ok = _try(lambda: _serial_verdict(unit, state, transport), "-")
             row.drift = _try(lambda: _drift_verdict(unit, state, transport,
-                                                    drivers_dir), "?")
+                                                    personalities_dir), "?")
             row.cal = _try(lambda: _calib_verdict(transport), "-")
             row.samples = _try(transport.read_sample_count, None)
             row.outputs = _try(lambda: [o["name"] for o in transport.read_outputs() or []], [])
@@ -139,7 +139,7 @@ def _calib_verdict(transport) -> str:
     `STALE` (a bucket solved for another sensor), `-` (nothing solved)."""
     from nxs._generated_constants import Calibration as CalConstants
     from nxs.client import SupportsCalibration, active_driver_tag
-    from nxs.descriptor import IDENTITY_M
+    from nxs.click_facts import IDENTITY_M
     if not isinstance(transport, SupportsCalibration):
         return "-"
     record = transport.read_calibration()
@@ -152,7 +152,7 @@ def _calib_verdict(transport) -> str:
     buckets = [(record.bucket_guard(v, active_tag),
                 tuple(record.m[v]) != IDENTITY_M or any(record.b[v]))
                for v in range(3)]
-    buckets.append((record.bucket_guard(len(record.driver_tags), active_tag),
+    buckets.append((record.bucket_guard(len(record.personality_tags), active_tag),
                     bool(record.encoder_zero)))
     for guard, touched in buckets:
         if guard == guard_of.UNGUARDED and not touched:
@@ -167,11 +167,11 @@ def _calib_verdict(transport) -> str:
     return "unguarded" if unguarded else "ok"
 
 
-def _drift_verdict(unit, state: SuiteState, transport, drivers_dir) -> str:
-    from nxs.suite.reconcile import load_unit_driver, panel_hash
+def _drift_verdict(unit, state: SuiteState, transport, personalities_dir) -> str:
+    from nxs.suite.reconcile import load_click_personality, panel_hash
 
     try:
-        panel = [(spec, load_unit_driver(spec.driver, drivers_dir)().compile(spec.config))
+        panel = [(spec, load_click_personality(spec.personality, personalities_dir)().compile(spec.config))
                  for spec in (unit.sensors or [])]
         drift = detect_unit_drift(unit, panel, transport, state,
                                   panel_hash(unit))

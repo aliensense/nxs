@@ -10,6 +10,8 @@ installed, on a link that is not a synced pair's."""
 from __future__ import annotations
 
 import dataclasses
+import sys
+import time
 from typing import Any, Dict, List, Optional
 
 
@@ -81,11 +83,61 @@ CAMERA_SOURCES = ("gstreamer", "argus")
 #: session at a time, a session takes a few seconds to start, and two
 #: sources started together both fail.
 CAMERA_STAGGER_S = 8.0
+#: Seconds from a port's first camera node saying its stream started to the
+#: port's output closing under it; the output opens one gate step later,
+#: half a second. The capture stack hears a stream's start from about one
+#: second after its session opens until it gives the session up, some four
+#: seconds in.
+CAMERA_OPEN_S = 1.5
+#: The camera node's line once its pipeline plays.
+CAMERA_STARTED = "Started stream"
 #: The image encodings the camera node publishes, the first the default:
 #: the hardware converter delivers `yuv422` and `mono8` at the link's rate,
 #: `rgb8` needs the software converter and lags at 1080p, `jpeg` is the
 #: hardware encoder's stream on `image_raw/compressed`.
 CAMERA_ENCODINGS = ("yuv422", "mono8", "rgb8", "jpeg")
+
+
+def port_openers(plan: List[CameraTopic]) -> Dict[str, int]:
+    """The node that opens each port's first capture session, by port: the
+    index of the port's first node in the plan. The capture stack locks onto
+    a stream only when it sees the stream start, so that session needs the
+    port's output restarted under it (`stream_start`). A session opened
+    beside a delivering one needs nothing, and a restart under a delivering
+    session ends it."""
+    first: Dict[str, int] = {}
+    for index, topic in enumerate(plan):
+        first.setdefault(topic.port, index)
+    return first
+
+
+def stream_start(port: str, since: Optional[float] = None) -> int:
+    """`nxs ros2 --stream-start <port>`: restart the port's output under the
+    capture session a camera node has just opened, so the session sees the
+    stream start. The output closes `CAMERA_OPEN_S` after `since`, the time
+    the node said its stream started (this call's own start without one),
+    and opens one gate step later. The gate is the one every choreographed
+    capture switches (`verify.csi_gate`), each write under the bus lock. The
+    caller runs it for a port's first session alone (`port_openers`)."""
+    from nxs.cam.frame_source import port_topology
+    from nxs.cam.select import _hub_for
+    from nxs.cam.verbs import verify
+
+    began = time.time() if since is None else since
+    try:
+        topology = port_topology(port)
+    except LookupError as exc:
+        print(f"nxs ros2: {exc}", file=sys.stderr)
+        return 1
+    hub = _hub_for(topology)
+    gate = verify.csi_gate(hub, hub.flows(), topology)
+    # What is left of the time, and never more than all of it: a clock set
+    # back between the node's line and this call must not hold the restart.
+    time.sleep(min(CAMERA_OPEN_S, max(0.0, CAMERA_OPEN_S - (time.time() - began))))
+    gate(False)
+    gate(True)
+    print(f"{port}: the output restarted under the first camera node")
+    return 0
 
 
 def gscam_pipeline(topic: CameraTopic, host=None, encoding: str = CAMERA_ENCODINGS[0]) -> str:

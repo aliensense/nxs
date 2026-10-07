@@ -12,7 +12,7 @@
 
 The node decides the wires: `cam1 A`, `cam1:A`, or `--port cam1`. Ports
 resolve from the manifest or from the platform itself; port verbs name their
-port explicitly. Hardware knowledge comes from the descriptor pack (`nxs.cam.packs`).
+port explicitly. Hardware knowledge comes from the hub (`nxs.cam.hubs`).
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from nxs import term
 from nxs import experimental
 
 from .contracts import InfeasibleConfig
-from . import capture, packs, port_state, viewers
+from . import capture, hubs, port_state, viewers
 from .identity import (
     _declared_camera,
     _identity_read,
@@ -47,15 +47,13 @@ from .run import (
     _run_unit_program,
     _staged_values,
     _unit_personality,
-    _unit_program_refusal,
-    unit_program_refusal,
 )
 from .select import (
     _declare,
     _descriptor_among,
     _link_descriptor,
     _owns_link,
-    _pack_for,
+    _hub_for,
     _per_link,
     _port_key,
     _port_name,
@@ -138,7 +136,7 @@ __all__ = [
     "_mode_arg",
     "_no_capture_id",
     "_owns_link",
-    "_pack_for",
+    "_hub_for",
     "_per_link",
     "_plan_links",
     "_port_key",
@@ -167,7 +165,6 @@ __all__ = [
     "_sync_links",
     "_unit_line",
     "_unit_personality",
-    "_unit_program_refusal",
     "_verify_hub_identity",
     "_with_sensors",
     "add_cam_parser",
@@ -187,7 +184,7 @@ __all__ = [
     "experimental",
     "follow_gap",
     "identity_facts",
-    "packs",
+    "hubs",
     "pair_gain",
     "park_port",
     "plan_text",
@@ -200,7 +197,6 @@ __all__ = [
     "status_payload",
     "sync_text",
     "term",
-    "unit_program_refusal",
     "viewers",
 ]
 
@@ -220,7 +216,7 @@ def add_cam_parser(sub) -> None:
     p_cam.add_argument("--_node", action="store_true",
                        help=argparse.SUPPRESS)
     p_cam.add_argument("--topology", help="port-set YAML "
-                       "(default: the pack's topology)")
+                       "(default: the hub's topology)")
     p_cam.add_argument("--port", dest="port", metavar="PORT",
                        help="port name (e.g. cam0, cam1)")
     cam_sub = p_cam.add_subparsers(dest="cam_cmd", required=True)
@@ -233,7 +229,7 @@ def add_cam_parser(sub) -> None:
     # to every link, repeated values go link by link.
     p.add_argument("--sensor", action="append", default=None,
                    metavar="NAME",
-                   help="the sensor behind the selected link(s): a pack "
+                   help="the sensor behind the selected link(s): a hub "
                         "sensor name or compatible; remembered by the "
                         "port, frozen by tune --freeze --ports")
     p.add_argument("--mode", action="append", default=None,
@@ -325,12 +321,12 @@ def cmd_cam(args: argparse.Namespace) -> int:
     except InfeasibleConfig as exc:
         term.refusal(exc.reason, *exc.alternatives)
         return 2
-    except packs.PackError as exc:
-        # A sensor or a hub no installed pack or personality serves: one
+    except hubs.HubError as exc:
+        # A sensor or a hub no installed hub or personality serves: one
         # fact and where a personality for it comes from, never a traceback.
-        alternatives = ["nxs personality install <pair directory>"]
+        alternatives = ["nxs personality install ./<name>"]
         if not experimental.enabled():
-            alternatives.append(f"nxs {experimental.FLAG} … (reads the pack roots "
-                                f"on ${packs.PACK_ENV})")
+            alternatives.append(f"nxs {experimental.FLAG} … (reads the hub roots "
+                                f"on ${hubs.HUBS_ENV})")
         term.refusal(str(exc), *alternatives)
         return 2

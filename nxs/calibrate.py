@@ -101,30 +101,30 @@ def _driver_tag(t) -> Tuple[str, int]:
     """The running sensor's name and identity tag. The tag a solve stamps
     must be the one the guard later compares against, so both sides go
     through `_active_tag`."""
-    name = t.read_driver_name() or ''
+    name = t.read_personality_name() or ''
     return name, active_driver_tag(t)
 
 
 def _require(t, args, bucket_names, what: str):
-    """Common verb preamble: capability, driver, panel, and runner-state checks."""
+    """Common verb preamble: capability, personality, panel, and runner-state checks."""
     if not isinstance(t, SupportsCalibration):
         print(f"calibrate: not supported on transport '{args.transport}'",
               file=sys.stderr)
         return None, None
     fields = t.read_outputs()
     if not fields:
-        print("calibrate: no driver loaded", file=sys.stderr)
+        print("calibrate: no personality loaded", file=sys.stderr)
         return None, None
     names = _axes(fields, bucket_names) if isinstance(bucket_names, int) \
         else bucket_names(fields)
     if not names:
-        print(f"calibrate: the loaded driver has no {what}", file=sys.stderr)
+        print(f"calibrate: the loaded personality has no {what}", file=sys.stderr)
         return None, None
-    # A driver whose sensor never answered declares the vector but delivers
+    # A personality whose sensor never answered declares the vector but delivers
     # no samples; the device would only wait out its stillness timeout.
     runner = t.read_runner_state()
     if runner != RunnerStates.RunnerState.MEASURING:
-        print(f"calibrate: the driver is not measuring (runner "
+        print(f"calibrate: the personality is not measuring (runner "
               f"{runner_state_name(runner)}) — no samples to calibrate from",
               file=sys.stderr)
         return None, None
@@ -323,7 +323,7 @@ def cmd_accel(t, args, clock=time.monotonic) -> int:
     except calsolve.CalSolveError as e:
         print(f"✗ {e}", file=sys.stderr)
         return 1
-    driver, tag = _driver_tag(t)
+    personality, tag = _driver_tag(t)
     record = t.read_calibration().replace_vector(
             _bucket_index('accel'), sol.m, sol.b, tag)
     t.write_calibration(record, persist=not args.no_persist)
@@ -331,7 +331,7 @@ def cmd_accel(t, args, clock=time.monotonic) -> int:
           f"offset ({', '.join(f'{x:+.3f}' for x in sol.offset)}) m/s^2, "
           f"check poses {err * 100:.2f}% off g")
     print(f"✓ applied{'' if args.no_persist else ' + persisted'}"
-          f" (tag {driver or 'unguarded'})")
+          f" (tag {personality or 'unguarded'})")
     return 0
 
 
@@ -414,26 +414,26 @@ def cmd_encoder_zero(t, args) -> int:
               file=sys.stderr)
         return 1
     mean = math.atan2(sines / n, cosines / n) % math.tau
-    driver, tag = _driver_tag(t)
+    personality, tag = _driver_tag(t)
     record = t.read_calibration()
     record.encoder_zero = (-mean) % math.tau
     record.encoder_tag = tag
     t.write_calibration(record, persist=not args.no_persist)
     print(f"zero at {mean:.4f} rad → offset {record.encoder_zero:.4f}")
     print(f"✓ applied{'' if args.no_persist else ' + persisted'}"
-          f" (tag {driver or 'unguarded'})")
+          f" (tag {personality or 'unguarded'})")
     return 0
 
 
-def _guard_label(guard: int, tag: int, driver: str) -> str:
+def _guard_label(guard: int, tag: int, personality: str) -> str:
     """One row's guard verdict for `calibrate show`, tag detail included."""
     if guard == CalConstants.BucketGuard.UNGUARDED:
         return 'unguarded'
     if guard == CalConstants.BucketGuard.BOUND:
-        return f'active ({driver})' if driver else 'active'
+        return f'active ({personality})' if personality else 'active'
 
     return (f'INACTIVE (solved for tag 0x{tag:08X}, '
-            f'now {driver or "none"})')
+            f'now {personality or "none"})')
 
 
 def cmd_show(t, args) -> int:
@@ -443,16 +443,16 @@ def cmd_show(t, args) -> int:
         return 1
     record = t.read_calibration()
     try:
-        driver, active_hash = _driver_tag(t)
+        personality, active_hash = _driver_tag(t)
     except Exception:
-        driver, active_hash = '', 0
+        personality, active_hash = '', 0
     print(f"orientation  {rotation_name(record.orientation)}")
     for vec, label in enumerate(('accel', 'gyro', 'mag')):
         solved = (tuple(record.m[vec]) != (1.0, 0.0, 0.0, 0.0, 1.0, 0.0,
                                            0.0, 0.0, 1.0)
                   or any(record.b[vec]))
         guard = _guard_label(record.bucket_guard(vec, active_hash),
-                             record.driver_tags[vec], driver)
+                             record.personality_tags[vec], personality)
         print(f"{label:<6} {'solved' if solved else 'identity':<9} {guard}")
         if args.full:
             for i in range(3):
@@ -460,8 +460,8 @@ def cmd_show(t, args) -> int:
                 print(f"       [{row[0]:+9.5f} {row[1]:+9.5f} {row[2]:+9.5f}]"
                       f"  b[{i}] {record.b[vec][i]:+9.5f}")
     enc_guard = _guard_label(
-            record.bucket_guard(len(record.driver_tags), active_hash),
-            record.encoder_tag, driver)
+            record.bucket_guard(len(record.personality_tags), active_hash),
+            record.encoder_tag, personality)
     print(f"encoder zero {record.encoder_zero:+.4f} rad  {enc_guard}")
     return 0
 

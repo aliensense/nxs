@@ -124,7 +124,7 @@ def _encode_program(descriptor: Descriptor) -> bytes:
             buf += _PROGRAM_BLKLEVEL_VALUE.pack(bits, value)
     return bytes(buf)
 
-def _encode_capture(descriptor: Descriptor, pack=None) -> bytes:
+def _encode_capture(descriptor: Descriptor, hub=None) -> bytes:
     from nxs.cam.capture_facts import derived_rows
 
     cap = descriptor.raw("capture")
@@ -132,10 +132,10 @@ def _encode_capture(descriptor: Descriptor, pack=None) -> bytes:
                                       cap["exposure"], cap["framerate"])
     polarity = cap.get("lane_polarity")
     # A row the unit program offers derives its line length and top rate
-    # from the mode's timing, the pack's serializer tail counted when the
-    # pack is in hand: the rows a unit serves are then the rows a host
-    # with the pack derives.
-    table = derived_rows(pack, descriptor)
+    # from the mode's timing, the hub's serializer tail counted when the
+    # hub is in hand: the rows a unit serves are then the rows a host
+    # with the hub derives.
+    table = derived_rows(hub, descriptor)
     buf = bytearray(_CAPTURE_HEAD.pack(
         _u(cap["mclk_khz"], 32, "capture.mclk_khz"),
         _u(cap["pix_clk_hz"], 32, "capture.pix_clk_hz"),

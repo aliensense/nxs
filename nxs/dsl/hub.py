@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional
 
-from nxs.dsl.camera import CameraSensor
+from nxs.dsl.camera import CamPersonality
 from nxs.dsl.compiled import ImageKind
 from nxs.dsl.errors import CompileError
 
@@ -32,7 +32,7 @@ def _is_expect(step: Dict[str, Any]) -> bool:
     return "expect" in step or "poll" in step
 
 
-class HubDevice(CameraSensor):
+class HubDevice(CamPersonality):
     """Base class for a hub personality: a deserializer, or a serializer
     reached through its window. The program has the camera shape (a probe,
     a configure of `select()` blocks, no measure loop) and compiles to a
@@ -46,7 +46,7 @@ class HubDevice(CameraSensor):
     program never branches on what it read: a device fact a phase needs
     arrives as a parameter.
 
-    `emit_steps` transcribes a pack's engine steps (the `w`, `expect`,
+    `emit_steps` transcribes a hub's engine steps (the `w`, `expect`,
     `wait_ms` and `retry` dicts its knob modules and blobs build) into
     the program, so a phase is authored from the same rows the host
     engine replayed: `DEVICE_ALIAS` names the alias that is this device,

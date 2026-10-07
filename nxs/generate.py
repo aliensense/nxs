@@ -14,9 +14,10 @@ is reported and not written.
 from __future__ import annotations
 
 import os
-import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
+
+from nxs.generate_seed import _SEED_HEADER, name_by_trial, seed_from_walk
 
 
 @dataclass
@@ -36,10 +37,10 @@ class LinkFinding:
     unit_addr: Optional[int] = None
     unit_serial: str = ""
     unit_fw: str = ""
-    #: The driver the pod runs, by the name it reports; "" when it runs none.
-    unit_driver: str = ""
-    #: The camera personality the pod holds, as a sensor compatible.
-    unit_personality: Optional[str] = None
+    #: The click personality the pod runs, by the name it reports; "" when it runs none.
+    unit_click: str = ""
+    #: The cam personality the pod holds, as a sensor compatible.
+    unit_cam: Optional[str] = None
     #: True when this link's pod is reached through a translation, so the
     #: address probed belongs to this link alone.
     unit_aliased: bool = False
@@ -68,8 +69,8 @@ class PortFinding:
     #: (addr, serial, fw) of a unit that answers through every window —
     #: on the port's bus, owned by no link.
     shared_unit: Optional[tuple] = None
-    #: The driver that unit runs, by the name it reports.
-    shared_driver: str = ""
+    #: The click personality that unit runs, by the name it reports.
+    shared_click: str = ""
     #: Links whose pods share one un-aliased address, so the walk cannot
     #: say which of them answered. (addr, [link names]).
     collided: Optional[tuple] = None
@@ -77,6 +78,8 @@ class PortFinding:
     #: answers where every pod straps: the translation is declared but
     #: not programmed. ([silent link names], strapped address).
     unprogrammed: Optional[tuple] = None
+    #: The port's bus could not be opened: nothing below says anything.
+    unreadable: bool = False
 
 
 @dataclass
@@ -85,7 +88,7 @@ class UnitFinding:
     route: str
     serial: str = ""
     fw: str = ""
-    driver: str = ""
+    personality: str = ""
     link: Any = None
 
 
@@ -107,7 +110,7 @@ def _unit_addresses(link) -> tuple:
 
 
 def _pod_personality(hit) -> Optional[str]:
-    """The sensor compatible of the camera personality a scanned pod holds,
+    """The sensor compatible of the cam personality a scanned pod holds,
     read over its route; None when it holds none or the read fails."""
     from nxs.cam import unit_source
     from nxs.transports import open_client
@@ -142,7 +145,7 @@ def _translated(link) -> bool:
 def walked_ports():
     """The ports to walk, as `on` will program them: the manifest's when
     one exists (its declared aliases are the ones `on` writes into the
-    serializer), else the platform's and the pack's. A walk against a
+    serializer), else the platform's and the hub's. A walk against a
     different topology than `on` uses would judge the rig by aliases
     nobody programs."""
     from nxs.cam.topology import _ports_from_suite, discover_ports
@@ -157,13 +160,13 @@ def _platform_candidates() -> Dict[str, tuple]:
     """Port name -> (the port as `on` will program it, the platform's shape
     of it): the manifest's ports, then the platform's that it leaves out.
     The platform's shape is the hub a port may have been re-cabled to."""
-    from nxs.cam import packs
+    from nxs.cam import hubs
     from nxs.cam.topology import discover_ports
 
     declared, _ = walked_ports()
     try:
         platform = {_port_name(t): t for t in discover_ports()[0].values()}
-    except packs.PackError:
+    except hubs.HubError:
         platform = {}
     out = {_port_name(t): (t, platform.get(_port_name(t))) for t in declared.values()}
     for name, topology in platform.items():
@@ -230,15 +233,15 @@ def _walk_hub(topology) -> PortFinding:
     """A hub port's walk: the hub's identity, then each link through its
     window. A hub that does not answer leaves its links unwalked. The port
     written is what answered: each link carries the sensor that gave its
-    identity (the declared one, else another the pack serves), or the
+    identity (the declared one, else another the hub serves), or the
     declared one when it has no identity register and answers; a link with
     no serializer and no sensor answering is not written."""
     import dataclasses
 
-    from nxs.cam.cli import _pack_for
+    from nxs.cam.cli import _hub_for
     from nxs.cam.diag import run_probes
     from nxs.cam.engine import CamI2c
-    from nxs.cam import packs
+    from nxs.cam import hubs
     from nxs.cam.identity import acks, answering_address, detect_sensor
     from nxs.cam.port_state import BusLock
     from nxs.suite.scan import scan_bus_units
@@ -247,14 +250,18 @@ def _walk_hub(topology) -> PortFinding:
                        lanes=getattr(topology, "csi_lanes", None),
                        hub=topology.des_compatible, hub_addr=int(topology.des_addr),
                        hub_present=False, topology=topology)
-    pack = _pack_for(topology)
-    flows = pack.flows()
-    desd = pack.descriptor(topology.des_compatible)
+    hub = _hub_for(topology)
+    flows = hub.flows()
+    desd = hub.descriptor(topology.des_compatible)
     kept = []
     with BusLock():
         i2c = CamI2c(addr=hex(topology.des_addr), bus=topology.i2c_bus)
         try:
-            i2c.open()
+            try:
+                i2c.open()
+            except (OSError, RuntimeError):
+                port.unreadable = True
+                return port
             des = run_probes(i2c, topology.des_addr, desd)
             port.hub_present = any(r.name == "device" and r.ok for r in des)
             if not port.hub_present:
@@ -271,7 +278,7 @@ def _walk_hub(topology) -> PortFinding:
             # reset and answers nothing: release the heads before asking.
             release = getattr(flows, "release_heads", None)
             if release is not None:
-                release(pack, i2c, topology)
+                release(hub, i2c, topology)
             # The windows do not isolate: a part on a locked link answers
             # through every window, so the hub's lock bit says which link
             # a part belongs to. An unlocked link has nothing behind it.
@@ -292,7 +299,7 @@ def _walk_hub(topology) -> PortFinding:
                         locked=locks[link.name]))
                     continue
                 if isolate:
-                    if not flows.isolate_link(pack, i2c, topology, link):
+                    if not flows.isolate_link(hub, i2c, topology, link):
                         port.links.append(LinkFinding(
                             name=link.name, window=int(link.des_window),
                             ser=link.ser_compatible, ser_present=False, sensor=None,
@@ -301,32 +308,36 @@ def _walk_hub(topology) -> PortFinding:
                                      "every link until `switch` programs their aliases"))
                         continue
                 else:
-                    flows.open_window(pack, i2c, topology, link)
-                serd = pack.descriptor(link.ser_compatible)
+                    flows.open_window(hub, i2c, topology, link)
+                serd = hub.descriptor(link.ser_compatible)
                 ser = run_probes(i2c, link.ser_addr, serd)
                 present = any(r.name == "device" and r.ok for r in ser)
-                send = pack.descriptor(link.sensor_compatible) if link.has_camera else None
+                send = hub.descriptor(link.sensor_compatible) if link.has_camera else None
                 # The head answers at its alias while the port is up, at
                 # its own address before the first `on` maps it. Alone on
                 # the bus it may answer at an alias a previous declaration
                 # mapped for any link: its serializer keeps the map.
                 isolated = isolate or alone == [link.name]
-                sen_addr, _mapped = answering_address(pack, i2c, link)
+                sen_addr, _mapped = answering_address(hub, i2c, link)
                 if isolated and not acks(i2c, sen_addr):
                     for other in topology.links:
-                        alias = int(packs.sensor_address(pack, other))
+                        alias = int(hubs.sensor_address(hub, other))
                         if alias != sen_addr and acks(i2c, alias):
                             sen_addr = alias
                             break
                 sen = run_probes(i2c, sen_addr, send) if send is not None else []
                 identity = next((r for r in sen if r.name == "device"), None)
                 # What self-describes names the sensor: an identity
-                # register, else the pod's personality. A head that only
-                # answers is written without a sensor, and the report says
-                # what to declare.
+                # register (the declared head's, else any installed cam
+                # personality's), else the pod's personality. A head that
+                # only answers is written without a sensor, and the report
+                # says what to declare.
                 sensor = None
                 answers = False
-                if identity is None:
+                detected = detect_sensor(hub, i2c, link)[0] if send is None else None
+                if detected is not None:
+                    note, sensor, answers = f"identity {detected}", detected, True
+                elif identity is None:
                     try:
                         i2c.read_reg(0x0000, reg_width=16, data_width=8,
                                      addr=hex(sen_addr))
@@ -338,7 +349,7 @@ def _walk_hub(topology) -> PortFinding:
                 elif identity.ok:
                     note, sensor, answers = "identity ok", link.sensor_compatible, True
                 else:
-                    detected, _detail = detect_sensor(pack, i2c, link)
+                    detected, _detail = detect_sensor(hub, i2c, link)
                     if detected is not None:
                         note, sensor, answers = f"identity {detected}", detected, True
                     else:
@@ -365,20 +376,20 @@ def _walk_hub(topology) -> PortFinding:
                     finding.unit_addr = int(hit.link.address)
                     finding.unit_serial = hit.serial
                     finding.unit_fw = hit.fw_version
-                    finding.unit_driver = hit.driver
-                    finding.unit_personality = _pod_personality(hit)
+                    finding.unit_click = hit.personality
+                    finding.unit_cam = _pod_personality(hit)
                     break
-                if sensor is None and finding.unit_personality:
-                    sensor = finding.unit_personality
+                if sensor is None and finding.unit_cam:
+                    sensor = finding.unit_cam
                     finding.sensor = sensor
                     finding.sensor_note = f"the pod's personality; {note}"
                 if present or sensor is not None:
                     kept.append(dataclasses.replace(link, sensor_compatible=sensor or ""))
                 port.links.append(finding)
             if isolate:
-                flows.restore_links(pack, i2c, topology, alone)
+                flows.restore_links(hub, i2c, topology, alone)
             else:
-                flows.close_windows(pack, i2c, topology)
+                flows.close_windows(hub, i2c, topology)
         except (OSError, RuntimeError):
             return port
         finally:
@@ -396,7 +407,7 @@ def _walk_bare(topology) -> PortFinding:
     answered: that one link, or its bus and lanes alone."""
     import dataclasses
 
-    from nxs.cam import packs
+    from nxs.cam import hubs
     from nxs.cam.contracts import LinkSpec, NxsUnitSpec
     from nxs.cam.engine import CamI2c
     from nxs.cam.identity import detect_sensor, identity_facts
@@ -404,11 +415,11 @@ def _walk_bare(topology) -> PortFinding:
     from nxs.suite.scan import scan_bus_units
 
     declared = topology.links[0] if topology.is_direct and topology.links else None
-    # The port's pack as the camera verbs take it: the tool's own, with the
+    # The port's hub as the camera verbs take it: the tool's own, with the
     # installed personalities and the cached unit descriptors adopted.
     bare = dataclasses.replace(topology, des_compatible=None,
                                links=(declared,) if declared is not None else ())
-    pack = packs.pack_for(bare)
+    hub = hubs.for_topology(bare)
     port = PortFinding(name=_port_name(topology), bus=topology.i2c_bus,
                        lanes=getattr(topology, "csi_lanes", None), hub=None,
                        hub_addr=int(topology.des_addr), hub_present=False)
@@ -417,15 +428,19 @@ def _walk_bare(topology) -> PortFinding:
     with BusLock():
         i2c = CamI2c(addr=hex(topology.des_addr), bus=topology.i2c_bus)
         try:
-            i2c.open()
-            detected, _detail = detect_sensor(pack, i2c, declared)
+            try:
+                i2c.open()
+            except (OSError, RuntimeError):
+                port.unreadable = True
+                return port
+            detected, _detail = detect_sensor(hub, i2c, declared)
             if detected is None and declared is not None:
                 # A declared sensor with no identity register is written
                 # when it answers at its address, and not otherwise.
-                desc = pack.descriptor(declared.sensor_compatible)
+                desc = hub.descriptor(declared.sensor_compatible)
                 if identity_facts(desc) is None:
                     i2c.read_reg(0x0000, reg_width=16, data_width=8,
-                                 addr=hex(packs.sensor_address(pack, declared)))
+                                 addr=hex(hubs.sensor_address(hub, declared)))
                     answers = True
         except (OSError, RuntimeError):
             pass
@@ -435,7 +450,7 @@ def _walk_bare(topology) -> PortFinding:
     # pod's personality below. A head that only answers is reported with
     # what to declare; a head that does not answer is not written.
     sensor = detected
-    sen_addr = int(packs.sensor_address(pack, declared)) if declared is not None else None
+    sen_addr = int(hubs.sensor_address(hub, declared)) if declared is not None else None
     links = ()
     finding = None
     if sensor is not None or answers:
@@ -461,11 +476,11 @@ def _walk_bare(topology) -> PortFinding:
             finding.unit_addr = int(hit.link.address)
             finding.unit_serial = hit.serial
             finding.unit_fw = hit.fw_version
-            finding.unit_driver = hit.driver
-            finding.unit_personality = _pod_personality(hit)
+            finding.unit_click = hit.personality
+            finding.unit_cam = _pod_personality(hit)
             break
-        if sensor is None and finding.unit_personality:
-            sensor = finding.unit_personality
+        if sensor is None and finding.unit_cam:
+            sensor = finding.unit_cam
             finding.sensor = sensor
             finding.sensor_note = f"the pod's personality; {finding.sensor_note}"
         port.links.append(finding)
@@ -488,14 +503,14 @@ def _flag_unprogrammed_alias(port: PortFinding) -> None:
     translation yet. The pods are still merged onto that one address, so
     what answered there may be several of them at once — the bytes read
     back are whatever the bus settles on, not one unit's. The address
-    stands; the serial and the driver do not."""
+    stands; the serial and the personality do not."""
     silent = [l.name for l in port.links if l.unit_aliased and not l.unit_serial]
     merged = [l for l in port.links if not l.unit_aliased and l.unit_serial]
     if not silent or not merged:
         return
     port.unprogrammed = (silent, merged[0].unit_addr)
     for link in merged:
-        link.unit_serial, link.unit_fw, link.unit_driver = "", "", ""
+        link.unit_serial, link.unit_fw, link.unit_click = "", "", ""
 
 
 def _disown_shared_unit(port: PortFinding) -> None:
@@ -522,19 +537,21 @@ def _disown_shared_unit(port: PortFinding) -> None:
         port.collided = (port.links[0].unit_addr,
                          [l.name for l in port.links])
         for link in port.links:
-            link.unit_addr, link.unit_serial, link.unit_fw, link.unit_driver = None, "", "", ""
+            link.unit_addr, link.unit_serial, link.unit_fw, link.unit_click = None, "", "", ""
         return
     shared = port.links[0]
     port.shared_unit = (shared.unit_addr, shared.unit_serial, shared.unit_fw)
-    port.shared_driver = shared.unit_driver
+    port.shared_click = shared.unit_click
     for link in port.links:
-        link.unit_addr, link.unit_serial, link.unit_fw, link.unit_driver = None, "", "", ""
+        link.unit_addr, link.unit_serial, link.unit_fw, link.unit_click = None, "", "", ""
 
 
-def scan_units(ports: List[PortFinding]) -> List[UnitFinding]:
+def scan_units(ports: List[PortFinding], buses=None, extra=None) -> List[UnitFinding]:
     """Units on the bare buses — everything the link sweep finds — less
     the ones already attributed to a link, which the bare bus reaches
-    only through whichever window was left open."""
+    only through whichever window was left open. `buses` narrows the scan
+    to those I2C buses, each asked at the standard addresses, the pod
+    addresses where a hub answered, and its `extra` ({bus: addresses})."""
     from nxs.suite.scan import scan_suite
 
     attributed = {l.unit_serial for p in ports for l in p.links if l.unit_serial}
@@ -545,172 +562,41 @@ def scan_units(ports: List[PortFinding]) -> List[UnitFinding]:
     merged = {(p.bus, p.unprogrammed[1]) for p in ports if p.unprogrammed}
     merged |= {(p.bus, p.collided[0]) for p in ports if p.collided}
     units: List[UnitFinding] = []
-    for hit in scan_suite(None):
+    hits = scan_suite(None) if buses is None else _scan_buses(ports, buses, extra or {})
+    for hit in hits:
         if hit.serial and hit.serial in attributed:
             continue
         if (getattr(hit.link, "bus", None),
                 getattr(hit.link, "address", None)) in merged:
             continue
         units.append(UnitFinding(route=hit.link.describe(), serial=hit.serial,
-                                 fw=hit.fw_version, driver=hit.driver,
+                                 fw=hit.fw_version, personality=hit.personality,
                                  link=hit.link))
     return units
 
 
-def _unit_name(port: str, link: str) -> str:
-    return f"unit-{port}-{link.lower()}"
+def _scan_buses(ports: List[PortFinding], buses, extra: dict) -> list:
+    from nxs.suite.scan import scan_bus_units
+    from nxs.tree import unit_addresses
 
-
-def _serial_or_none(serial: str) -> Optional[str]:
-    """A serial the manifest parser will take back — the 12-byte UID96
-    as 24 hex digits — else nothing: a seed that does not parse would
-    wedge the bootstrap it exists to start."""
-    from nxs.suite.schema import ManifestError, normalize_serial
-    if not serial:
-        return None
-    try:
-        return normalize_serial(serial, "seed")
-    except ManifestError:
-        return None
-
-
-def _unit_entry(name: str, route: Dict[str, Any], serial: str, driver: str) -> Dict[str, Any]:
-    """A seeded unit: its name and route, its serial when the parser takes
-    it back, and the personality that compiles to the driver it runs. A unit
-    running no personality the tool knows gets no `sensors` key, which leaves
-    its store undeclared: `sensors: []` would clear it on the first switch."""
-    from nxs.suite.scan import _module_for_driver
-
-    entry: Dict[str, Any] = {"name": name, "module": "nxs", "links": [route]}
-    if _serial_or_none(serial):
-        entry["serial"] = _serial_or_none(serial)
-    personality = _module_for_driver(driver) if driver else None
-    if personality:
-        entry["sensors"] = [{"personality": personality}]
-    return entry
-
-
-def name_by_trial(units: List[UnitFinding], opener=None) -> None:
-    """A unit running nothing is asked by trial: every personality the tool
-    knows uploaded in turn, and the one whose sensor answers stays running
-    and names the unit's Click (`nxs.detect`)."""
-    from nxs.detect import detect
-    from nxs.transports import open_client
-
-    opener = opener or open_client
-    for unit in units:
-        if unit.driver or unit.link is None:
-            continue
-        client = None
-        try:
-            client = opener(unit.link.transport, **unit.link.client_kwargs())
-            print(f"{unit.route}: runs nothing; trying every personality",
-                  file=sys.stderr)
-            name = detect(client, report=lambda line: print(f"  {line}",
-                                                             file=sys.stderr))
-            if name:
-                unit.driver = client.read_driver_name() or name
-        except Exception as exc:        # noqa: BLE001 (the unit's own refusals)
-            print(f"{unit.route}: the trial failed: {exc}", file=sys.stderr)
-        finally:
-            if client is not None:
-                try:
-                    client.close()
-                except Exception:
-                    pass
-
-
-def seed_intent(ports: List[PortFinding], units: List[UnitFinding],
-                intent_by_port: Dict[str, dict]) -> dict:
-    """A first suite.yaml: the intent the live port already carries
-    (mode, sync), a name and alias for every unit found riding a link,
-    and every unit found on a bare bus — named by where it answers,
-    for the operator to rename."""
-    from nxs.suite.freeze import hex_address
-    from nxs.suite.scan import I2C_ADDRESSES
-
-    doc: Dict[str, Any] = {}
-    port_docs: Dict[str, dict] = {}
-    unit_docs: List[dict] = []
-    alias_base = int(I2C_ADDRESSES[0])
-    for port in ports:
-        entry = dict(intent_by_port.get(port.name) or {})
-        # The declaration names the hub and each link's sensor: what
-        # self-described is seeded, a head that only answered is left for
-        # the person to declare.
-        if port.bus:
-            entry.setdefault("bus", port.bus)
-        if port.hub_present and port.hub:
-            entry.setdefault("hub", port.hub)
-        for link in port.links:
-            if link.sensor and not link.unwalked:
-                entry.setdefault("links", {}).setdefault(link.name, {}).setdefault(
-                    "camera", link.sensor)
-        # A collision is the answer of at least one pod behind links the
-        # walk cannot separate, and nothing separates them until each is
-        # declared: the alias `on` programs is what makes the next walk
-        # able to tell them apart. Declaring only what already answered
-        # would leave the rig unable to ever discover the rest.
-        collided = set(port.collided[1]) if port.collided else set()
-        for index, link in enumerate(port.links):
-            if link.unit_addr is None and link.name not in collided:
-                continue
-            name = _unit_name(port.name, link.name)
-            # Behind a hub every pod is presented at its own alias, the
-            # next addresses up from the one every NXS straps, so the
-            # host never speaks the strapped address on the port and the
-            # pods do not collide when the hub merges its links.
-            ref: Dict[str, Any] = {"name": name}
-            if port.hub is None:
-                # Nothing translates on the port's own bus: the unit is
-                # reached where it answered, its own address.
-                if link.unit_addr is not None and link.unit_addr != alias_base:
-                    ref["target"] = hex_address(link.unit_addr)
-            else:
-                ref["alias"] = hex_address(alias_base + index + 1)
-            entry.setdefault("links", {}).setdefault(link.name, {})["unit"] = ref
-            route = {"transport": "i2c", "link": f"{port.name}/{link.name}"}
-            unit_docs.append(_unit_entry(name, route, link.unit_serial, link.unit_driver))
-        if entry:
-            port_docs[port.name] = entry
-        if port.shared_unit:
-            addr, serial, _fw = port.shared_unit
-            route = {"transport": "i2c", "bus": port.bus, "address": hex_address(addr)}
-            unit_docs.append(_unit_entry(f"unit-{port.name}", route, serial, port.shared_driver))
-    from nxs.suite.scan import _suggest_name
-
-    for unit in units:
-        link = unit.link
-        route = {"transport": link.transport}
-        for key in ("bus", "address", "port", "iface", "node_id"):
-            value = getattr(link, key, None)
-            if value is not None:
-                route[key] = hex_address(value) if key == "address" else value
-        unit_docs.append(_unit_entry(_suggest_name(link), route, unit.serial, unit.driver))
-    if port_docs:
-        doc["ports"] = port_docs
-    if unit_docs:
-        doc["units"] = unit_docs
-    return doc
-
-
-_SEED_HEADER = ("# Written by `nxs generate` from what it found. This file is yours to\n"
-                "# edit, by hand or with `nxs tune`: names, personalities, settings. The wiring\n"
-                "# lives in hardware.yaml beside it and is rewritten on every run.\n")
+    hubs_on = {p.bus for p in ports if p.hub_present}
+    hits = []
+    for bus in buses:
+        hits.extend(scan_bus_units(bus, unit_addresses(bus in hubs_on, extra.get(bus, ()))))
+    return hits
 
 
 def generate(config_path: str, dry_run: bool = False,
              walker: Optional[Callable[[], List[PortFinding]]] = None,
              unit_scanner: Optional[Callable[[List[PortFinding]], List[UnitFinding]]] = None,
              ) -> Dict[str, Any]:
-    """Walk, then write: hardware.yaml regenerated, suite.yaml seeded
-    only when absent. Returns the report and what was written."""
+    """Walk, then write: hardware.yaml regenerated, suite.yaml seeded only
+    when absent, as the panel would save the same walk. Returns the report
+    and what was written."""
     walker = walker or walk_ports
     unit_scanner = unit_scanner or scan_units
 
-    from nxs.cam import port_state
-    from nxs.suite.freeze import (_render_hardware, _split_entry, _write_atomic,
-                                  port_block, render_seed)
+    from nxs.suite.freeze import _render_hardware, _write_atomic, port_wiring, render_seed
     from nxs.suite.schema import hardware_path
 
     from nxs.generate_report import render_report, walk_data
@@ -719,24 +605,10 @@ def generate(config_path: str, dry_run: bool = False,
     units = unit_scanner(ports)
     if not dry_run:
         name_by_trial(units)
-    wiring: Dict[str, dict] = {}
-    intent: Dict[str, dict] = {}
-    for port in ports:
-        if port.topology is None:
-            continue
-        own = port_state.port_record(port.topology)
-        # The sensors are the walk's, never the state cache's: the wiring
-        # is what answered today. The mode and the viewer hints are the
-        # port's own record.
-        block = port_block(port.topology, sync=own.get("sync"),
-                           viewer=own.get("viewer"), viewers=own.get("viewers"),
-                           modes=own.get("modes"))
-        wired, want = _split_entry(block)
-        if wired:
-            wiring[port.name] = wired
-        if want:
-            intent[port.name] = want
-    seed = seed_intent(ports, units, intent)
+    # The wiring is what answered today, never the state cache's word.
+    wiring: Dict[str, dict] = {port.name: port_wiring(port.topology)
+                               for port in ports if port.topology is not None}
+    seed = seed_from_walk(ports, units, config_path)
     exists = os.path.exists(config_path) and os.path.getsize(config_path) > 0
     result = {"report": render_report(ports, units), "hardware": None,
               "seeded": None, "kept": config_path if exists else None,
@@ -764,7 +636,7 @@ def cmd_generate(args) -> int:
         raise SystemExit(f"nxs generate: {stray}")
     try:
         result = generate(config_path, dry_run=bool(getattr(args, "dry_run", False)))
-    except Exception as exc:        # no pack, a silent tree, an unwritable path
+    except Exception as exc:        # no hub, a silent tree, an unwritable path
         raise SystemExit(f"nxs generate: {exc}")
     if getattr(args, "json", False):
         import json

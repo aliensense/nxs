@@ -1,4 +1,4 @@
-"""Camera personalities: a probe, a configure with one block per mode, no measure loop."""
+"""Cam personalities: a probe, a configure with one block per mode, no measure loop."""
 
 from __future__ import annotations
 
@@ -10,12 +10,12 @@ from nxs.dsl.compiled import ImageKind
 from nxs.dsl.emit import OpErrorCode, _emit_store_bytes
 from nxs.dsl.errors import CompileError
 from nxs.dsl.fields import ParamDescriptor
-from nxs.dsl.register import RegisterDriver
+from nxs.dsl.register import RegisterClickPersonality
 from nxs.dsl.values import RunValue
 
 
-class CameraSensor(RegisterDriver):
-    """Base class for a camera personality: `probe()` is the alive or
+class CamPersonality(RegisterClickPersonality):
+    """Base class for a cam personality: `probe()` is the alive or
     identity check and `configure()` the init program with `select()`
     blocks per mode; there is no measure loop. Compiles to a CAMERA-kind
     image the unit runs once per `CAM_RUN` on the pod bus, then halts.
@@ -28,7 +28,7 @@ class CameraSensor(RegisterDriver):
     IMAGE_KIND = ImageKind.CAMERA
     BUSES = ('i2c',)
 
-    # Attribute names of the host-side law surface the pack modules carry;
+    # Attribute names of the host-side law surface the hub modules carry;
     # any of them on a camera class is a CompileError.
     HOST_HOOK_PREFIXES = ('knob_', 'expect_', 'derive_', 'export_')
     HOST_HOOK_NAMES = frozenset({
@@ -44,14 +44,14 @@ class CameraSensor(RegisterDriver):
             fn = getattr(cls, name, None)
             if callable(fn) and getattr(fn, "_measure_loop", False):
                 raise CompileError(
-                    f"{cls.__name__}: a camera personality has no measure "
+                    f"{cls.__name__}: a cam personality has no measure "
                     f"loop; remove @measure_loop from {name}()")
             if name.startswith('_'):
                 continue
             if name in self.HOST_HOOK_NAMES or name.startswith(self.HOST_HOOK_PREFIXES):
                 if name == 'measure':
                     raise CompileError(
-                        f"{cls.__name__}: a camera personality has no "
+                        f"{cls.__name__}: a cam personality has no "
                         f"measure(); probe() and configure() are its whole "
                         f"program")
                 raise CompileError(

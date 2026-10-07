@@ -22,9 +22,9 @@ SESSION_LIVE_REASON = ("a transfer session is live (an upload or firmware "
 # the errno from CMD_ERROR, the Cyphal path from `aliensense.nxs.cmd_error`.
 STORE_ERR_REASON = {
     16: SESSION_LIVE_REASON,                                            # EBUSY
-    61: "no driver image loaded — upload a driver first",               # ENODATA
-    17: "an identical driver image is already stored in another slot",  # EEXIST
-    28: "the driver store is full",                                     # ENOSPC
+    61: "no personality image loaded; upload a personality first",               # ENODATA
+    17: "an identical personality image is already stored in another slot",  # EEXIST
+    28: "the personality store is full",                                     # ENOSPC
     22: "invalid slot",                                                 # EINVAL
     2:  "no such slot",                                                 # ENOENT
     5:  "flash (NVS) write error",                                      # EIO
@@ -57,7 +57,7 @@ LOAD_ERR_REASON = {
     16: SESSION_LIVE_REASON,                                            # EBUSY
     61: "the staged image arrived short of the announced size — bytes were "
         "lost in transit; re-run the upload",                         # ENODATA
-    8:  "the device rejected the image: not a valid driver (stale SDK "
+    8:  "the device rejected the image: not a valid personality image (stale SDK "
         "wheel or corrupt content — detail in the device log)",       # ENOEXEC
     11: "the device dropped the command before dispatch (queue full) — "
         "retry",                                                      # EAGAIN
@@ -77,9 +77,9 @@ CALIB_ERR_REASON = {
     77: "fit failed the sphere self-check (iron near the unit, or a sweep "
         "that never inverted an axis) — the collection is closed, run again",           # EBADMSG
     116: "timed out waiting for stillness",                                              # ETIMEDOUT
-    95: "the loaded driver has no source for this calibration",                 # EOPNOTSUPP
-    61: "the loaded driver is not measuring — no samples for this calibration",  # ENODATA
-    140: "procedure cancelled (host abort or driver change)",                           # ECANCELED
+    95: "the loaded personality has no source for this calibration",                 # EOPNOTSUPP
+    61: "the loaded personality is not measuring; no samples for this calibration",  # ENODATA
+    140: "procedure cancelled (host abort or personality change)",                           # ECANCELED
 }
 
 # DFU begin/write/finish errnos.
@@ -116,8 +116,8 @@ CAM_VERDICT_REASON = {
     19:  "no sensor answered at the personality's address",             # ENODEV
     116: "a poll did not see its value within its timeout",             # ETIMEDOUT
     140: "the run was aborted",                                         # ECANCELED
-    8:   "the slot holds a driver personality, not a camera one",      # ENOEXEC
-    9:   "the slot's camera personality does not parse; reinstall it: "
+    8:   "the slot holds a click personality, not a cam one",      # ENOEXEC
+    9:   "the slot's cam personality does not parse; reinstall it: "
          "nxs switch",                                                  # EBADF
     14:  "the personality's program faulted; the unit's log names the "
          "instruction",                                                 # EFAULT
@@ -135,8 +135,8 @@ CAM_VERDICT_REASON = {
 # that ended before the host read the accept; the accept's reason stands where both name a code.
 CAM_RUN_ERR_REASON = {
     **CAM_VERDICT_REASON,
-    8:  "the slot holds a driver personality, not a camera one",       # ENOEXEC
-    2:  "the slot is empty — upload the camera personality and save it",  # ENOENT
+    8:  "the slot holds a click personality, not a cam one",       # ENOEXEC
+    2:  "the slot is empty; upload the cam personality and save it",  # ENOENT
     16: "the unit is busy: a run, an upload, or a firmware push holds "
         "the transfer session",                                         # EBUSY
     19: "the unit's firmware carries no camera runner",                 # ENODEV
@@ -190,8 +190,8 @@ def import_failure_detail(exc: BaseException, path: str) -> str:
     the last frame in `path`."""
     import traceback
     detail = f"{type(exc).__name__}: {exc}"
-    # A SyntaxError from a module the driver imports carries that module's
-    # position, not the driver's; trust it only when the files match.
+    # A SyntaxError from a module the personality imports carries that module's
+    # position, not the personality's; trust it only when the files match.
     line = (exc.lineno if isinstance(exc, SyntaxError) and exc.filename == path
             else None)
     if line is None:
@@ -207,14 +207,14 @@ def err_reason(code: int, reasons=None) -> str:
     return (reasons or STORE_ERR_REASON).get(code, f"device error code {code}")
 
 def op_error_name(code: int) -> str:
-    """The `ERROR_CODE` byte as `TIMEOUT (17)`, or `driver code (N)` for
-    a driver-defined value."""
+    """The `ERROR_CODE` byte as `TIMEOUT (17)`, or `device code (N)` for
+    a personality-defined value."""
     name = OpErrors.OpErrorCode._NAMES.get(code)
-    return f"{name} ({code})" if name else f"driver code ({code})"
+    return f"{name} ({code})" if name else f"device code ({code})"
 
 # The queued personality-info select: the unit's verdict on the slot asked for.
 PERSONALITY_INFO_ERR_REASON = {
     2: "the slot is empty",
-    8: "the slot holds a driver personality, which has no descriptor trailer",
+    8: "the slot holds a click personality, which has no descriptor trailer",
     19: "the device has no personality store",
 }
