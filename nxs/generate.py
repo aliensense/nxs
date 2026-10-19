@@ -7,17 +7,19 @@ each link through its window, the serializer and sensor behind it, the
 NXS unit riding the link, or the sensor and the unit on the port's own
 bus — and the bare buses for units on their own, then write
 `hardware.yaml` (what answered, regenerated every run) and seed
-`suite.yaml` (what you want of it) when there is none. A port's wiring is
-what answered: a hub the last walk wrote down and nothing answers for now
-is reported and not written.
+`suite.yaml` (what you want of it, in api 3) when there is none. A
+declaration of an earlier language, api 2 or the 1.0 form, is written
+again in api 3, the earlier file kept beside it. A port's wiring is what answered: a hub the last walk
+wrote down and nothing answers for now is reported and not written.
 """
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
-from nxs.generate_seed import _SEED_HEADER, name_by_trial, seed_from_walk
+from nxs.generate_seed import _SEED_HEADER, _undeclared, convert_earlier, name_by_trial, seed_from_walk
 
 
 @dataclass
@@ -142,6 +144,14 @@ def _translated(link) -> bool:
     return any(int(u.alias_addr) != int(u.target_addr) for u in link.nxs_units)
 
 
+def _strap(port, link) -> int:
+    """The address a link's pod straps: the declaration's, else the default."""
+    try:
+        return int(port.topology.link(link.name).nxs_units[0].target_addr)
+    except (AttributeError, KeyError, IndexError, TypeError, ValueError):
+        return POD_ADDRESSES[0]
+
+
 def walked_ports():
     """The ports to walk, as `on` will program them: the manifest's when
     one exists (its declared aliases are the ones `on` writes into the
@@ -203,10 +213,9 @@ def walk_ports() -> List[PortFinding]:
     return found
 
 
-#: Where a pod answers on an isolated link: the address every pod straps
-#: and the link aliases the declarations assign (`unit.alias` 0x31, 0x32,
-#: one per link, and the next).
-POD_ADDRESSES = tuple(range(0x30, 0x34))
+#: Where a pod answers on an isolated link: its strapped pair (register map, camera map), then
+#: the link aliases the declarations assign (a pod's alias 0x32, 0x34 and the next), a pair each.
+POD_ADDRESSES = tuple(range(0x30, 0x38, 2))
 
 
 def _link_locks(descriptor, results) -> Dict[str, Optional[bool]]:
@@ -242,7 +251,8 @@ def _walk_hub(topology) -> PortFinding:
     from nxs.cam.diag import run_probes
     from nxs.cam.engine import CamI2c
     from nxs.cam import hubs
-    from nxs.cam.identity import acks, answering_address, detect_sensor
+    from nxs.cam.identity import acks, answering_address, detect_sensor, map_head
+    from nxs.cam import port_state
     from nxs.cam.port_state import BusLock
     from nxs.suite.scan import scan_bus_units
 
@@ -273,6 +283,12 @@ def _walk_hub(topology) -> PortFinding:
                     name=link.name, window=int(link.des_window), ser=link.ser_compatible,
                     ser_present=False, sensor=link.sensor_compatible,
                     unwalked="kernel-owned hub") for link in topology.links)
+                return port
+            if any(port_state.link_state(topology, link) == port_state.STATE_UP
+                   for link in topology.links):
+                # An up port is read as it runs: each pod at its alias, the windows as `on` left
+                # them, since isolating one would drop the links that stream.
+                _read_up_port(port, hub, topology)
                 return port
             # A head behind a serializer no program has touched sits in
             # reset and answers nothing: release the heads before asking.
@@ -318,14 +334,17 @@ def _walk_hub(topology) -> PortFinding:
                 # the bus it may answer at an alias a previous declaration
                 # mapped for any link: its serializer keeps the map.
                 isolated = isolate or alone == [link.name]
-                sen_addr, _mapped = answering_address(hub, i2c, link)
-                if isolated and not acks(i2c, sen_addr):
+                # A declared pod's head is its unit's: its camera map says what it runs, and
+                # the walk reads no register of the sensor (R-10.2).
+                pod = map_head(hub, topology, link) if link.nxs_units and send is not None else None
+                sen_addr = pod["sen_addr"] if pod else answering_address(hub, i2c, link)[0]
+                if pod is None and isolated and not acks(i2c, sen_addr):
                     for other in topology.links:
                         alias = int(hubs.sensor_address(hub, other))
                         if alias != sen_addr and acks(i2c, alias):
                             sen_addr = alias
                             break
-                sen = run_probes(i2c, sen_addr, send) if send is not None else []
+                sen = run_probes(i2c, sen_addr, send) if send is not None and pod is None else []
                 identity = next((r for r in sen if r.name == "device"), None)
                 # What self-describes names the sensor: an identity
                 # register (the declared head's, else any installed cam
@@ -335,7 +354,11 @@ def _walk_hub(topology) -> PortFinding:
                 sensor = None
                 answers = False
                 detected = detect_sensor(hub, i2c, link)[0] if send is None else None
-                if detected is not None:
+                if pod is not None:
+                    answers, sensor = pod["sen"] == "present", pod["sensor"]["detected"]
+                    note = (pod["sensor"]["detail"] if answers
+                            else f"no camera door answers at {sen_addr:#04x}")
+                elif detected is not None:
                     note, sensor, answers = f"identity {detected}", detected, True
                 elif identity is None:
                     try:
@@ -400,6 +423,36 @@ def _walk_hub(topology) -> PortFinding:
     return port
 
 
+def _read_up_port(port: PortFinding, hub, topology) -> None:
+    """The links of a port that is up, as they run: the head and the
+    serializer as declared, the pod read at the alias `on` programmed.
+    Only a translated alias is one link's: the hub forwards the strap to
+    every link, so an answer there belongs to the bare-bus sweep."""
+    import dataclasses
+
+    from nxs.cam import hubs
+    from nxs.suite.scan import scan_bus_units
+
+    for link in topology.links:
+        finding = LinkFinding(
+            name=link.name, window=int(link.des_window), ser=link.ser_compatible,
+            ser_present=True, sensor=link.sensor_compatible or None,
+            sensor_note="the port is up; as declared", head_answers=bool(link.has_camera),
+            head_addr=int(hubs.sensor_address(hub, link)) if link.has_camera else None,
+            unit_aliased=_translated(link), locked=True)
+        aliases = tuple(int(u.alias_addr) for u in link.nxs_units
+                        if int(u.alias_addr) != int(u.target_addr))
+        for hit in (scan_bus_units(topology.i2c_bus, aliases) if aliases else ()):
+            finding.unit_addr = int(hit.link.address)
+            finding.unit_serial = hit.serial
+            finding.unit_fw = hit.fw_version
+            finding.unit_click = hit.personality
+            finding.unit_cam = _pod_personality(hit)
+            break
+        port.links.append(finding)
+    port.topology = dataclasses.replace(topology, links=tuple(topology.links))
+
+
 def _walk_bare(topology) -> PortFinding:
     """The walk of a port's own bus, where no hub answers: the sensor that
     answers with its identity (the declared one, else any the tool knows
@@ -423,8 +476,17 @@ def _walk_bare(topology) -> PortFinding:
     port = PortFinding(name=_port_name(topology), bus=topology.i2c_bus,
                        lanes=getattr(topology, "csi_lanes", None), hub=None,
                        hub_addr=int(topology.des_addr), hub_present=False)
+    # The declared unit's address first, then every address a unit straps: nothing on the port's
+    # own bus separates two, so the first answer is the link's; a stale declaration hides no unit.
+    declared_addrs = (tuple(int(u.alias_addr) for u in declared.nxs_units)
+                      if declared is not None and declared.nxs_units else ())
+    from nxs.suite.scan import I2C_ADDRESSES
+
+    addresses = declared_addrs + tuple(a for a in I2C_ADDRESSES if a not in declared_addrs)
     detected = None
     answers = False
+    # The head, the unit and a smart camera's map are read under one hold of the bus: another
+    # run between the reads moves what answers.
     with BusLock():
         i2c = CamI2c(addr=hex(topology.des_addr), bus=topology.i2c_bus)
         try:
@@ -446,6 +508,11 @@ def _walk_bare(topology) -> PortFinding:
             pass
         finally:
             i2c.close()
+        hit = next(iter(scan_bus_units(topology.i2c_bus, addresses)), None)
+        unit_cam = _pod_personality(hit) if hit is not None else None
+        # Nothing at a sensor address and no unit: a smart camera answers its
+        # camera map alone, and its rows name the personality that describes it.
+        smart = _smart_camera(topology.i2c_bus) if detected is None and not answers and hit is None else None
     # What self-describes names the sensor: an identity register, else the
     # pod's personality below. A head that only answers is reported with
     # what to declare; a head that does not answer is not written.
@@ -453,36 +520,47 @@ def _walk_bare(topology) -> PortFinding:
     sen_addr = int(hubs.sensor_address(hub, declared)) if declared is not None else None
     links = ()
     finding = None
-    if sensor is not None or answers:
-        if detected is None:
+    if smart is not None:
+        compatible, line = smart
+        finding = LinkFinding(name=declared.name if declared is not None else "A",
+                              window=None, ser=None, ser_present=False,
+                              sensor=compatible or None, sensor_note=line,
+                              head_answers=True, head_addr=smart_camera_address())
+        port.links.append(finding)
+        if compatible:
+            links = (dataclasses.replace(declared, sensor_compatible=compatible, nxs_units=())
+                     if declared is not None else
+                     LinkSpec(name="A", des_window=None, csi_vc=0, sensor_compatible=compatible,
+                              ser_compatible=None, nxs_units=()),)
+        port.topology = dataclasses.replace(bare, links=links)
+        return port
+    if sensor is not None or answers or unit_cam:
+        if detected is None and (answers or sensor is not None):
             note = f"no identity register; the head answers at {sen_addr:#04x}"
+        elif detected is None:
+            # A pod on the port's own bus: its sensor sits on the pod bus,
+            # and no head answers at a sensor address.
+            note = "the unit's personality; no head answers at a sensor address"
         elif declared is None or detected == declared.sensor_compatible:
             note = "identity ok"
         else:
             note = f"identity {detected}, declared {declared.sensor_compatible}"
         finding = LinkFinding(name=declared.name if declared is not None else "A",
                               window=None, ser=None, ser_present=False,
-                              sensor=sensor, sensor_note=note, head_answers=True,
-                              head_addr=sen_addr)
-        # The declared unit's address first, then every address a unit
-        # straps: nothing on the port's own bus separates two, so the first
-        # answer is the link's, and a stale declaration hides no unit.
-        declared_addrs = (tuple(int(u.alias_addr) for u in declared.nxs_units)
-                          if declared is not None and declared.nxs_units else ())
-        from nxs.suite.scan import I2C_ADDRESSES
-
-        addresses = declared_addrs + tuple(a for a in I2C_ADDRESSES if a not in declared_addrs)
-        for hit in scan_bus_units(topology.i2c_bus, addresses):
+                              sensor=sensor, sensor_note=note,
+                              head_answers=answers or sensor is not None,
+                              head_addr=sen_addr if answers or sensor is not None else None)
+        if hit is not None:
             finding.unit_addr = int(hit.link.address)
             finding.unit_serial = hit.serial
             finding.unit_fw = hit.fw_version
             finding.unit_click = hit.personality
-            finding.unit_cam = _pod_personality(hit)
-            break
+            finding.unit_cam = unit_cam
         if sensor is None and finding.unit_cam:
             sensor = finding.unit_cam
             finding.sensor = sensor
-            finding.sensor_note = f"the pod's personality; {finding.sensor_note}"
+            if detected is None and answers:
+                finding.sensor_note = f"the pod's personality; {finding.sensor_note}"
         port.links.append(finding)
         units = ((NxsUnitSpec(alias_addr=finding.unit_addr, target_addr=finding.unit_addr),)
                  if finding.unit_addr is not None else ())
@@ -495,6 +573,38 @@ def _walk_bare(topology) -> PortFinding:
                               ser_compatible=None, nxs_units=units),)
     port.topology = dataclasses.replace(bare, links=links)
     return port
+
+
+def smart_camera_address() -> int:
+    """Where a smart camera's map answers on its port's own bus."""
+    from nxs.cam import smart_camera
+
+    return smart_camera.ADDRESS
+
+
+def _smart_camera(bus_path: str):
+    """`(compatible, line)` when a smart camera's map answers on a bare port's
+    bus: the installed personality whose rows and mode table it serves, ''
+    when none does or the map's layout is one this tool does not speak,
+    with the line the walk prints; None when no camera map answers, or a
+    pod's unit serves the one that does."""
+    from nxs._libnxs_map import open_door
+    from nxs.cam import smart_camera
+
+    try:
+        with open_door(bus_path, smart_camera.ADDRESS) as cmap:
+            if not smart_camera.answers(cmap):
+                foreign = smart_camera.foreign_layout(cmap)
+                return ("", f"a smart camera: {foreign}") if foreign else None
+            if not smart_camera.serves_alone(cmap):
+                return None
+            compatible = smart_camera.identify(cmap) or ""
+            line = smart_camera.map_line(cmap)
+    except OSError:
+        return None
+    if compatible:
+        return compatible, f"a smart camera: {line}"
+    return "", f"a smart camera: {line}, and no installed personality serves its rows"
 
 
 def _flag_unprogrammed_alias(port: PortFinding) -> None:
@@ -561,6 +671,14 @@ def scan_units(ports: List[PortFinding], buses=None, extra=None) -> List[UnitFin
     # serial is not a unit's — the sweep must not hand it out as one.
     merged = {(p.bus, p.unprogrammed[1]) for p in ports if p.unprogrammed}
     merged |= {(p.bus, p.collided[0]) for p in ports if p.collided}
+    # Two pods strapped alike behind a hub answer together on the trunk, the bus settling the bytes
+    # between them: a serial read there is nobody's, and that address is the pods', not a unit's.
+    for p in ports:
+        straps = [l.unit_addr for l in p.links if l.unit_addr is not None and not l.unit_aliased]
+        # Pods reached through their aliases still answer together at the
+        # address they strap: the hub forwards it to every link untranslated.
+        straps += [_strap(p, l) for l in p.links if l.unit_aliased and l.unit_serial]
+        merged |= {(p.bus, a) for a in straps if straps.count(a) > 1}
     units: List[UnitFinding] = []
     hits = scan_suite(None) if buses is None else _scan_buses(ports, buses, extra or {})
     for hit in hits:
@@ -589,18 +707,22 @@ def _scan_buses(ports: List[PortFinding], buses, extra: dict) -> list:
 def generate(config_path: str, dry_run: bool = False,
              walker: Optional[Callable[[], List[PortFinding]]] = None,
              unit_scanner: Optional[Callable[[List[PortFinding]], List[UnitFinding]]] = None,
-             ) -> Dict[str, Any]:
+             log: Callable[[str], None] = lambda _line: None) -> Dict[str, Any]:
     """Walk, then write: hardware.yaml regenerated, suite.yaml seeded only
-    when absent, as the panel would save the same walk. Returns the report
-    and what was written."""
+    when absent, as the panel would save the same walk, and a declaration
+    of an earlier language written in api 3 before the walk reads it, its
+    line to `log`. Returns the report and what was written."""
     walker = walker or walk_ports
     unit_scanner = unit_scanner or scan_units
 
+    from nxs.description import UNIT_TYPES
     from nxs.suite.freeze import _render_hardware, _write_atomic, port_wiring, render_seed
-    from nxs.suite.schema import hardware_path
+    from nxs.suite.schema import hardware_path, parse_suite_config
 
     from nxs.generate_report import render_report, walk_data
 
+    exists = os.path.exists(config_path) and os.path.getsize(config_path) > 0
+    migrated = convert_earlier(config_path, dry_run, log) if exists else None
     ports = walker()
     units = unit_scanner(ports)
     if not dry_run:
@@ -608,44 +730,52 @@ def generate(config_path: str, dry_run: bool = False,
     # The wiring is what answered today, never the state cache's word.
     wiring: Dict[str, dict] = {port.name: port_wiring(port.topology)
                                for port in ports if port.topology is not None}
-    seed = seed_from_walk(ports, units, config_path)
-    exists = os.path.exists(config_path) and os.path.getsize(config_path) > 0
+    seed: dict = {}
+    if not exists:
+        seed = seed_from_walk(ports, units, config_path)
+        parse_suite_config(seed, config_path)
     result = {"report": render_report(ports, units), "hardware": None,
               "seeded": None, "kept": config_path if exists else None,
-              "ports": len(wiring), "units": len(seed.get("units") or []),
+              "migrated": migrated,
+              "ports": len(wiring),
+              "units": sum(1 for n in (seed.get("nodes") or {}).values()
+                           if n.get("type") in UNIT_TYPES),
+              "undeclared": _undeclared(ports, config_path) if exists else [],
               "walk": walk_data(ports, units)}
     if dry_run:
         return result
     hw = hardware_path(config_path)
     _write_atomic(hw, lambda f: f.write(_render_hardware(wiring)))
     result["hardware"] = hw
-    if not exists and seed:
+    if not exists and len(seed.get("nodes") or {}) > 1:
         _write_atomic(config_path, lambda f: f.write(_SEED_HEADER + render_seed(seed)))
         result["seeded"] = config_path
     return result
 
 
 def cmd_generate(args) -> int:
-    from nxs.suite import default_config_path
-
-    from nxs.suite import stray_declaration
+    from nxs.suite import default_config_path, stray_declaration
 
     config_path = getattr(args, "config", None) or default_config_path()
     stray = stray_declaration(config_path)
     if stray:
         raise SystemExit(f"nxs generate: {stray}")
+    as_json = bool(getattr(args, "json", False))
     try:
-        result = generate(config_path, dry_run=bool(getattr(args, "dry_run", False)))
+        result = generate(config_path, dry_run=bool(getattr(args, "dry_run", False)),
+                          log=lambda line: print(line, file=sys.stderr if as_json else sys.stdout))
     except Exception as exc:        # no hub, a silent tree, an unwritable path
         raise SystemExit(f"nxs generate: {exc}")
-    if getattr(args, "json", False):
+    if as_json:
         import json
 
         from nxs.schemas import CONTRACT
         print(json.dumps({"contract": CONTRACT, "manifest": config_path,
                           "dry_run": bool(getattr(args, "dry_run", False)),
                           "hardware": result["hardware"], "seeded": result["seeded"],
-                          "kept": result["kept"], **result["walk"]}, indent=2))
+                          "kept": result["kept"], "migrated": result["migrated"],
+                          "undeclared": result["undeclared"],
+                          **result["walk"]}, indent=2))
         return 0
     print(result["report"], end="")
     if getattr(args, "dry_run", False):
@@ -655,6 +785,9 @@ def cmd_generate(args) -> int:
     print(f"wrote {result['hardware']} ({result['ports']} port(s))")
     if result["seeded"]:
         print(f"seeded {result['seeded']} ({result['units']} unit(s)); next: nxs tune")
+    elif result["undeclared"]:
+        print(f"kept {result['kept']}; {', '.join(result['undeclared'])} answers and is not "
+              f"declared — nxs tune")
     elif result["kept"]:
         print(f"kept {result['kept']}; next: nxs tune")
     else:

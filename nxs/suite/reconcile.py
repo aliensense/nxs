@@ -1,19 +1,21 @@
 """`nxs switch`: converge every declared unit to its manifest entry.
 Compiles the panel, opens the management link, verifies identity and every
-other link, then DFU, commission, and deploy, skipping what already matches."""
+other link, then DFU, commission, deploy, and the unit's own rows, skipping
+what already matches."""
 import hashlib
 import json
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 from nxs._generated_constants import CyphalDefaults, RunnerStates
 from nxs.client import SupportsTimeSync, estimate_and_push, push_and_verify
 from nxs.compiler import ClickPersonality
 from nxs.suite import FIRMWARE_DIR
 from nxs.suite.drift import (STORE_SLOTS, UnitDrift, detect_unit_drift,
-                             click_slots, firmware_drift)
+                             click_slots, declared_rows, firmware_drift, rows_drift, unit_door)
 from nxs.suite.firmware import find_image, image_identity
 from nxs.suite.schema import (SuiteConfig, UnitSpec, device_runs,
                               parse_version)
@@ -69,7 +71,9 @@ def _is_camera_personality(directory: str, name: str) -> bool:
 
 def known_click_personalities(personalities_dir: Optional[str] = None) -> List[str]:
     """The click personalities the tool can load: the store first, then the
-    wheel's own; a store name shadows a shipped one. Cam personalities are skipped."""
+    wheel's own; a store name shadows a shipped one. Cam personalities and
+    the law families beside them are skipped."""
+    from nxs.cam.laws import is_family
     from nxs.suite import personality_dirs
 
     names: List[str] = []
@@ -81,6 +85,8 @@ def known_click_personalities(personalities_dir: Optional[str] = None) -> List[s
                 continue
             if entry.endswith(".py"):
                 name = entry[:-3]
+            elif is_family(Path(directory, entry)):
+                continue
             elif os.path.exists(os.path.join(directory, entry, f"{entry}.py")):
                 name = entry
             else:
@@ -136,10 +142,13 @@ def load_click_personality(name: str, personalities_dir: Optional[str] = None):
     return classes[0]
 
 
-def panel_hash(unit: UnitSpec) -> str:
-    """Digest of the deploy-relevant intent: the sensor list and configs."""
-    payload = [{"personality": s.personality, "config": s.config}
-               for s in (unit.sensors or [])]
+def panel_hash(panel: list) -> str:
+    """Digest of the panel as deployed: each sensor's personality, its config
+    and the image this tool compiled for it. A tool that compiles the same
+    intent into another image redeploys it."""
+    payload = [{"personality": spec.personality, "config": spec.config,
+                "image": hashlib.sha256(compiled.bytecode).hexdigest()}
+               for spec, compiled in panel]
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
@@ -198,11 +207,8 @@ def _apply_unit(unit: UnitSpec, state: SuiteState, *, dry_run: bool,
     # malformed personality file fails this unit's report, never the whole run.
     try:
         panel = [(spec, load_click_personality(spec.personality, personalities_dir)().compile(spec.config))
-                 for spec in (unit.sensors or [])]
-        pin = unit.firmware or assets_pin(firmware_dir)
-        image_path = (find_image(firmware_dir, pin, None if unit.firmware else tool_build_identity())
-                      if pin else None)
-        image = image_identity(image_path) if image_path else None
+                 for spec in unit.sensors]
+        pin, image_path, image = firmware_target(unit, firmware_dir)
     except Exception as e:
         report.ok = False
         report.error = str(e) or type(e).__name__
@@ -263,18 +269,17 @@ def _apply_unit(unit: UnitSpec, state: SuiteState, *, dry_run: bool,
                                 "contract either")
                 return report
         _commission(unit, mgmt_link, transport, report, would, opener)
-        _push_orientation(unit, transport, report, would)
         if panel:
-            digest = panel_hash(unit)
+            digest = panel_hash(panel)
             drift = detect_unit_drift(unit, panel, transport, state, digest)
             _converge_panel(unit, state, transport, report, panel, digest,
                             drift, would, dry_run)
-        elif unit.sensors is not None:
-            # Explicit `sensors: []`: a running personality or a populated store is
-            # drift to repair. An absent key leaves the panel unmanaged.
+        else:
+            # A socket no click feeds is empty: a running personality or a
+            # populated store is drift to repair.
             _converge_empty_panel(unit, state, transport, report, would,
                                   dry_run)
-        _converge_egress(unit, transport, report, would, dry_run)
+        converge_rows(unit, transport, report, would, dry_run)
         # Counted before the seed: the time sync runs on every switch, so
         # folding it in would leave `converged` unreachable.
         if not dry_run and isinstance(transport, SupportsTimeSync):
@@ -470,22 +475,6 @@ def _commission_edge(link, transport, report, would: str):
                           f"(now {current}; adopts on next power-cycle)")
 
 
-def _push_orientation(unit: UnitSpec, transport, report, would: str):
-    """Persist the declared mounting orientation when the device differs. Only
-    the orientation byte moves; the solved per-silicon affines are untouched."""
-    from nxs.client import SupportsCalibration, rotation_code, rotation_name
-    if unit.orientation is None or not isinstance(transport, SupportsCalibration):
-        return
-    declared = rotation_code(unit.orientation)
-    current = transport.read_calibration().orientation
-    if current == declared:
-        return
-    if not would:
-        transport.set_orientation(declared)
-    report.actions.append(f"{would}set orientation {unit.orientation} "
-                          f"(was {rotation_name(current)})")
-
-
 def _converge_firmware(unit: UnitSpec, state: SuiteState, transport, report,
                        image_path: str, image: Optional[str], would: str,
                        dry_run: bool, pin: str, *, needs_flash: bool) -> bool:
@@ -531,9 +520,9 @@ def tool_base_version() -> Optional[str]:
 
 def tool_build_identity() -> Optional[str]:
     """The build identity the firmware built with this wheel carries: the
-    wheel's own build record (`v1.1.0-rc1-174-gd7bb22bf` on a build between
+    wheel's own build record (`vX.Y.Z-rcN-<count>-g<sha>` on a build between
     tags, the tag on a release build), else the tag its version names
-    (`v1.1.0-rc1`); None in a source checkout, which records no build."""
+    (`vX.Y.Z-rcN`); None in a source checkout, which records no build."""
     from nxs import __version__
     from nxs.assets_cli import release_tag, tool_build
 
@@ -545,6 +534,38 @@ def tool_build_identity() -> Optional[str]:
         return release_tag(str(__version__).split("+", 1)[0].lstrip("v"))
     except ValueError:
         return None
+
+
+def firmware_target(unit: UnitSpec, firmware_dir: Optional[str] = None
+                    ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """The firmware `unit` converges to: the pin (its own, else the assets'
+    release), the image's path in `firmware_dir`, and the build identity
+    the image carries; all None when nothing pins it. Raises
+    FileNotFoundError, naming the store, when no image matches the pin."""
+    store = firmware_dir or FIRMWARE_DIR
+    pin = unit.firmware or assets_pin(store)
+    if not pin:
+        return None, None, None
+    path = find_image(store, pin, None if unit.firmware else tool_build_identity())
+
+    return pin, path, image_identity(path)
+
+
+def firmware_first(unit: Optional[UnitSpec], client, state: SuiteState) -> Optional[str]:
+    """What a pod runs when the unit steps reflash it, as the fact of its
+    line: the drift rule `nxs switch` flashes by. None when it runs the
+    firmware this switch installs, when nothing pins its firmware, or
+    when the store holds no image of the pin (the unit step names it)."""
+    if unit is None:
+        return None
+    try:
+        pin, _path, image = firmware_target(unit)
+    except (FileNotFoundError, OSError, ValueError):
+        return None
+    if not pin or not firmware_drift(unit, state, client, pin, image):
+        return None
+
+    return f"runs {client.read_fw_version() or 'an unknown build'}, not {image or pin}"
 
 
 def assets_pin(firmware_dir: str) -> Optional[str]:
@@ -649,33 +670,74 @@ def _converge_empty_panel(unit: UnitSpec, state: SuiteState, transport,
                           report, would: str, dry_run: bool):
     """Converge a declared-empty panel: stop the personality and clear the
     sensor slots when either is present; record the empty panel hash."""
-    if not click_slots(transport) and not transport.read_personality_name():
+    running = transport.read_personality_name()
+    if not click_slots(transport) and not running:
         return
-    report.actions.append(f"{would}clear panel (declared empty)")
+    ran = f", the unit runs {running}" if running else ""
+    report.actions.append(f"{would}clear panel (declared empty{ran})")
     if dry_run:
         return
     transport.vm_stop()
     transport.vm_reset()
     _clear_click_slots(transport)
-    state.record(unit.name, panel_hash=panel_hash(unit))
+    state.record(unit.name, panel_hash=panel_hash([]))
 
 
-def _converge_egress(unit: UnitSpec, transport, report, would: str,
-                     dry_run: bool):
-    """Repair declared egress factors in place, then persist them so they
-    survive a power-cycle."""
-    from nxs.suite.drift import egress_drift
+def converge_rows(unit: UnitSpec, transport, report, would: str, dry_run: bool):
+    """Commit the rows the unit node declares where the unit serves another
+    value, through its unit door, then persist them (`STORE_PERSIST`), so
+    they hold across a power cycle. The drifting rows of one owner and one
+    kind are one commit: the unit judges a commit whole, the CAN rates as
+    the pair it leaves in effect. A row the unit serves none of fails the
+    unit, naming the rows it serves; a commit the unit does not apply fails
+    it, naming the rows and the unit's reason; a route that reaches no unit
+    door leaves the rows with a note."""
+    from nxs._libnxs_map import MapRefused, MapState, find_row
+    from nxs.cam.unit_source import door_text
 
-    drift = egress_drift(unit, transport)
+    drift = rows_drift(unit, transport)
+    if drift is None:
+        names = ", ".join(sorted(declared_rows(unit)))
+        report.notes.append(f"rows {names}: a unit's rows commit through its unit door, and "
+                            f"{report.link} reaches none")
+        return
+    unknown = sorted(name for name, (_want, live) in drift.items() if live is None)
+    if unknown:
+        report.ok = False
+        report.error = (f"{', '.join(unknown)}: the unit serves no such row "
+                        f"(nxs describe nxs on the unit names the rows it serves)")
+        return
     if not drift:
         return
-    for key, (want, live) in sorted(drift.items()):
-        label = "decimation" if key == "device" else f"decimation[{key}]"
-        report.actions.append(f"{would}retune {label} {live}→{want}")
-        if not dry_run:
-            transport.write_decimation(
-                want, subject=None if key == "device" else key)
-    if not dry_run:
-        transport.commission()
-
+    if dry_run:
+        for name, (want, live) in sorted(drift.items()):
+            report.actions.append(f"{would}set {name} {live}→{want}")
+        return
+    with unit_door(transport) as door:
+        rows, owners = door.rows(), door.owners()
+        commits: Dict[Tuple[int, int], Dict[int, int]] = {}
+        for name, (want, _live) in sorted(drift.items()):
+            index = find_row(rows, name)
+            if index is None:
+                report.ok = False
+                report.error = f"{name} {want}: the unit door serves no row {name}"
+                return
+            commits.setdefault((owners[index], int(rows[index].kind)), {})[index] = int(want)
+        for (_owner, kind), staged in commits.items():
+            named = ", ".join(f"{rows[index].name} {value}" for index, value in staged.items())
+            try:
+                state, error = door.commit(staged, kind)
+            except MapRefused as exc:
+                report.ok = False
+                report.error = f"{named}: {exc}"
+                return
+            if state != MapState.READY:
+                report.ok = False
+                report.error = f"{named}: the unit did not apply the commit ({door_text(state, error)})"
+                return
+            # A row reads as set once the unit applied its commit, never before.
+            for index, value in staged.items():
+                name = rows[index].name
+                report.actions.append(f"set {name} {drift[name][1]}→{value}")
+    transport.commission()
 

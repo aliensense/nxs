@@ -33,20 +33,12 @@ from .identity import (
     sensor_identity_line,
 )
 from .run import (
-    TRAIN_ROUNDS,
-    UNIT_RUN_TIMEOUT_S,
     _accepted,
     _compose_from,
-    _execute,
-    _execute_split,
     _mode_arg,
-    _plan_links,
     _port_links,
     _rates_arg,
     _resolve_modes,
-    _run_unit_program,
-    _staged_values,
-    _unit_personality,
 )
 from .select import (
     _declare,
@@ -69,24 +61,22 @@ from .select import (
 from .verbs.caps import (
     _camera_knobs,
     _hub_fsync_rate,
-    _knob_names,
     _range_text,
     caps_payload,
     cmd_caps,
 )
 from .verbs.on import (
-    _dead_pipes,
     _port_lines,
-    _relock,
     _sensors_verified,
     cmd_down,
     cmd_up,
     park_port,
 )
-from .verbs.set import _sensor_readings, _set_sync, cmd_get, cmd_set
+from .verbs.set import _set_sync, cmd_get, cmd_set
 from .verbs.status import (
     _unit_line,
     cmd_status,
+    camera_node_gap,
     follow_gap,
     pair_gain,
     presence_payload,
@@ -114,31 +104,24 @@ from .verbs.verify import _no_capture_id, csi_gate
 
 __all__ = [
     "InfeasibleConfig",
-    "TRAIN_ROUNDS",
-    "UNIT_RUN_TIMEOUT_S",
     "_accepted",
     "_booted_index",
     "_camera_knobs",
     "_compose_from",
-    "_dead_pipes",
     "_declare",
     "_declared_camera",
     "_descriptor_among",
-    "_execute",
-    "_execute_split",
     "_frames_kwarg",
     "_fsync_plan",
     "_hints_by_link",
     "_hub_fsync_rate",
     "_identity_read",
-    "_knob_names",
     "_link_descriptor",
     "_mode_arg",
     "_no_capture_id",
     "_owns_link",
     "_hub_for",
     "_per_link",
-    "_plan_links",
     "_port_key",
     "_port_links",
     "_port_lines",
@@ -149,22 +132,17 @@ __all__ = [
     "_rates_arg",
     "_record_sync",
     "_refuse",
-    "_relock",
     "_remembered_sensors",
     "_require_nxs_hub",
     "_require_up",
     "_resolve_links",
     "_resolve_modes",
     "_role_code",
-    "_run_unit_program",
     "_selected_up_links",
-    "_sensor_readings",
     "_sensors_verified",
     "_set_sync",
-    "_staged_values",
     "_sync_links",
     "_unit_line",
-    "_unit_personality",
     "_verify_hub_identity",
     "_with_sensors",
     "add_cam_parser",
@@ -182,6 +160,7 @@ __all__ = [
     "csi_gate",
     "detect_sensor",
     "experimental",
+    "camera_node_gap",
     "follow_gap",
     "identity_facts",
     "hubs",
@@ -313,11 +292,41 @@ def add_cam_parser(sub) -> None:
     p.set_defaults(cam_fn=cmd_set)
 
 
+def _denied(exc: PermissionError) -> str:
+    """The refusal for a path this run may not open: the state store's
+    `chmod` for a store path; for a device node, the group that owns the
+    I²C buses, which a user outside it, or not logged in again since
+    joining it, does not open; else the path's own listing."""
+    import os
+
+    from nxs.host.cli import unwritable_store
+    from nxs.suite.switch_host import STATE_GROUP
+
+    where = str(exc.filename or "")
+    own = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), "nxs")
+    if not where or where.startswith((port_state.SYSTEM_STATE_DIR, own)):
+        return unwritable_store(exc).removeprefix("nxs host: ")
+    fact = f"cannot open {where}: {(exc.strerror or 'permission denied').lower()}"
+    if where.startswith("/dev/"):
+        return f'{fact}\n  - sudo usermod -aG {STATE_GROUP} "$USER", then log in again'
+    return f"{fact}\n  - ls -l {where}"
+
+
 def cmd_cam(args: argparse.Namespace) -> int:
     """Dispatch a `cam` group verb (drives its own I2C bus). A configuration
     the laws refuse is one fact and its alternatives, exit 2."""
+    from nxs.cam.engine.i2c import I2CHandlerError
+
     try:
         return args.cam_fn(args)
+    except PermissionError as exc:
+        term.refusal_text(_denied(exc))
+        return 2
+    except I2CHandlerError as exc:
+        if not isinstance(exc.__cause__, PermissionError):
+            raise
+        term.refusal_text(_denied(exc.__cause__))
+        return 2
     except InfeasibleConfig as exc:
         term.refusal(exc.reason, *exc.alternatives)
         return 2

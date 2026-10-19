@@ -2,16 +2,23 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
+from nxs._generated_constants import NxsDriverImage, NxsMap
 from nxs.opcodes import Op
 from nxs.profiles import I2cProfile, SpiProfile
-from nxs.dsl.compiled import CompiledDriver, ImageKind
+from nxs.dsl.compiled import HOST_KINDS, SAMPLING_KINDS, CompiledDriver, ImageKind
 from nxs.dsl.emit import BUS_REGISTER, OpErrorCode, _BUS_CODE_TO_NAME, _BUS_NAME_TO_CODE, _RegAlloc, _WorkAlloc
 from nxs.dsl.errors import CompileError
-from nxs.dsl.fields import (MAX_PATCH_SITES, ParamDescriptor, PatchEntry, VM_HOST_PROGRAM_SIZE,
+from nxs.dsl.fields import (MAX_PARAMS, MAX_PATCH_SITES, MAX_TRAILER_SIZE, STREAM_LABELS,
+                            STREAM_ROW, ParamDescriptor, PatchEntry, VM_HOST_PROGRAM_SIZE,
                             VM_MAX_PROGRAM_SIZE, resolve_field_offsets)
 from nxs.dsl.loop import _ASTCompiler
+from nxs.personality.records_fields import ACTION_PARAM
+
+#: The standard ids of the rows a unit reads by their id: the mount rotation
+#: of a sampling personality's sensor, which its compensation reads.
+UNIT_READ_IDS = frozenset({NxsMap.ParamId.MOUNT_ORIENTATION})
 
 
 class _CompilePhase:
@@ -36,15 +43,17 @@ class _CompilePhase:
         self._config = config
 
         cls = type(self)
-        kind = int(getattr(cls, 'IMAGE_KIND', ImageKind.DRIVER))
-        # A camera or hub image runs once: probe, configure, halt.
-        is_camera = kind in (ImageKind.CAMERA, ImageKind.HUB)
+        kind = int(getattr(cls, 'IMAGE_KIND', ImageKind.CLICK))
+        # A camera image and an image the host runs execute once: probe,
+        # configure, halt.
+        is_camera = kind == ImageKind.CAMERA or kind in HOST_KINDS
 
         self._emitter = self._new_emitter()
         self._regs = _RegAlloc()
         self._work = _WorkAlloc(_ASTCompiler.VM_WORK_BUF_SIZE)
         self._output_fields = []
         self._params = {}
+        self._rows = {}
         self._patch_entries = []
         self._trace_phase = None
         self._patch_accum = {}
@@ -61,6 +70,12 @@ class _CompilePhase:
         self._validate_kind()
         self._validate_companions()
         self._emit_who_am_i_prologue()
+        # A native head's run parameters come from its facts and a host's rows
+        # from its plugin's data: neither runs a probe or a configure.
+        if is_camera and getattr(cls, 'NATIVE', False):
+            self._declare_native_params()
+        elif kind == ImageKind.HOST:
+            self._declare_host_rows()
 
         # Phase 1: Trace probe()
         if hasattr(self, "probe"):
@@ -72,11 +87,23 @@ class _CompilePhase:
         # selection stamps the chosen value into `config`, which configure() reads.
         measure_fn = self._select_measure_fn(config)
 
+        gated = getattr(self, "_gate_from_facts", False)
         if hasattr(self, "configure"):
             self._trace_phase = "configure"
-            self.configure(config)
+            if gated:
+                self._configure_gated(config)
+            else:
+                self.configure(config)
         self._trace_phase = None
         configure_end = self._emitter._current_offset()
+        # A table-only part that declares no action and stages no apply takes one from its stream
+        # gate, recompiled with the gate's arms; a class that stages the apply declares its own.
+        if (kind == ImageKind.CAMERA and not gated and ACTION_PARAM not in self._params
+                and not getattr(cls, 'NATIVE', False)
+                and all(p.kind != "apply" for p in self._params.values())
+                and self._facts_stream_gate() is not None):
+            self._gate_from_facts = True
+            return self.compile(config)
 
         # Phase 3: AST-compile measure(); a cam personality halts instead
         # (its one pass is probe, configure, release the bus).
@@ -108,8 +135,8 @@ class _CompilePhase:
         finalized_patches = self._finalize_patches(config)
 
         # Over the program cap the compile fails with the budget, never a
-        # truncated program. A hub image runs on the host and has its own.
-        cap = VM_HOST_PROGRAM_SIZE if kind == ImageKind.HUB else VM_MAX_PROGRAM_SIZE
+        # truncated program. An image the host runs has its own.
+        cap = VM_HOST_PROGRAM_SIZE if kind in HOST_KINDS else VM_MAX_PROGRAM_SIZE
         if len(bytecode) > cap:
             report = "\n".join(f"  {label:<40} {size:>5} B"
                                for label, size in budget)
@@ -169,6 +196,7 @@ class _CompilePhase:
                 default=default_bus,
                 current=current_bus,
                 unit='',
+                labels=tuple(_BUS_CODE_TO_NAME[c] for c in bus_values),
             )
 
         # Auto-inject a runtime `reset_active` param when the personality overrides
@@ -182,7 +210,24 @@ class _CompilePhase:
                 and not is_camera):
             self._params['reset_active'] = ParamDescriptor(
                 name='reset_active', param_type='enum',
-                values=[0, 1], default=1, current=1, unit='')
+                values=[0, 1], default=1, current=1, unit='', labels=("low", "high"))
+
+        # A sampling personality carries the stream row in standby, whatever the config says: a GATE
+        # commit of it starts and parks the sampling. A cam personality's comes from its law family.
+        if kind in SAMPLING_KINDS:
+            if STREAM_ROW in self._params:
+                raise CompileError(
+                    f"{cls.__name__}: {STREAM_ROW!r} is the row the compiler adds, the "
+                    f"GATE row that starts and parks the sampling; name the parameter "
+                    f"otherwise")
+            self._params[STREAM_ROW] = ParamDescriptor(
+                name=STREAM_ROW, param_type='enum', values=[0, 1], default=0,
+                current=0, unit='', kind='gate', labels=STREAM_LABELS)
+            if len(self._params) > MAX_PARAMS:
+                raise CompileError(
+                    f"{cls.__name__}: {len(self._params)} parameters with the "
+                    f"{STREAM_ROW!r} row the compiler adds, and an image carries "
+                    f"{MAX_PARAMS} at most")
 
         who_am_i_values = [
             int(v) & 0xFF
@@ -214,41 +259,47 @@ class _CompilePhase:
                     f"only applies when opting out "
                     f"(WHO_AM_I_VALUES = []). Remove "
                     f"WHO_AM_I_SKIP_REASON or empty WHO_AM_I_VALUES.")
-        # A reload/enum param that patches no bytecode is a no-op `set`.
+        # A run/enum param that patches no bytecode is a no-op `set`.
         # Injected runtime params (bus, reset_active) are exempt.
         patched = {pe.param_name for pe in finalized_patches}
         for name, p in self._params.items():
-            if (name in self._patch_accum and p.kind == "reload"
+            if (name in self._patch_accum and p.kind == "run"
                     and p.param_type == "enum" and name not in patched
                     and name not in self._params_used):
                 raise CompileError(
-                    f"param {name!r} is declared reload/enum but patches no "
-                    f"bytecode; a `set {name}` would reload identical bytecode. "
+                    f"param {name!r} is declared run/enum but patches no "
+                    f"bytecode; a `set {name}` would re-run identical bytecode. "
                     f"Tag a write with param=({name!r}, ...), dispatch on it "
                     f"with select(), or remove the declaration.")
 
-        # A live param needs a runtime consumer: the PWM pair, an output
-        # field's scale_param, or the program itself. Any other live param
-        # is a no-op set.
-        live_consumers = {"pwm_freq", "pwm_duty"}
+        # An apply param needs a runtime consumer: the PWM pair, an output field's scale_param, the
+        # program, or the unit, which consumes a row of a standard id. Any other is a no-op set.
+        apply_consumers = {"pwm_freq", "pwm_duty"}
         scale_refs = {f.get("scale_param") for f in self._output_fields
                       if f.get("scale_param")}
         for name, p in self._params.items():
-            if (p.kind == "live" and name not in live_consumers
-                    and name not in scale_refs and name not in self._params_used):
+            if (p.kind == "apply" and name not in apply_consumers
+                    and name not in scale_refs and name not in self._params_used
+                    and p.id not in UNIT_READ_IDS):
                 raise CompileError(
-                    f"param {name!r} is kind='live' but nothing reads it at "
+                    f"param {name!r} is kind='apply' but nothing reads it at "
                     f"runtime (not PWM, not an output scale_param, not the "
-                    f"program through param()); a `set {name}` would be a "
-                    f"no-op. Use kind='reload', or reference it.")
+                    f"program through param(), not a row the unit reads by its "
+                    f"id); a `set {name}` would be a no-op. Use kind='run', or "
+                    f"reference it.")
+
+        output_fields = resolve_field_offsets(list(self._output_fields))
+        params = list(self._params.values())
+        trailer = self._trailer(kind, params, output_fields)
 
         return CompiledDriver(
             bytecode=bytecode,
             sample_size=self._sample_size,
             name=cls.__name__,
             config=config,
-            output_fields=resolve_field_offsets(list(self._output_fields)),
-            params=list(self._params.values()),
+            output_fields=output_fields,
+            # A host image is run by nothing: its rows are its PARAMS record alone.
+            params=params,
             patch_map=finalized_patches,
             who_am_i_reg=int(getattr(cls, 'WHO_AM_I_REG', 0) or 0),
             who_am_i_values=who_am_i_values,
@@ -261,7 +312,95 @@ class _CompilePhase:
             kind=kind,
             budget=budget,
             probe_len=probe_end,
+            trailer=trailer,
         )
+
+    def _trailer(self, kind: int, params: list, output_fields: list) -> list:
+        """The records the compiler writes: the IDENTITY head of every image
+        but a cam personality's, whose descriptor writes its own, the PARAMS
+        rows and the PRESENTATION record of a sampling personality's whole
+        table and of a hub or host program's public parameters, the OUTPUTS
+        rows of a personality that declares output fields, the PORTS rows of
+        every image, and the HUB_PHASES rows of a hub program that offers
+        ports and names its phases. A cam personality's other records come
+        from its descriptor at upload and precede these. Over
+        `MAX_TRAILER_SIZE` the compile fails with each record's size."""
+        from nxs.personality.records_fields import (IDENTITY, OUTPUTS, PARAMS, PORTS,
+                                                    PRESENTATION, RecordError)
+        from nxs.personality.records_identity import encode_identity_head
+        from nxs.personality.records_outputs import encode_outputs, field_rows
+        from nxs.personality.records_params import click_rows, encode_presentation_rows, encode_rows
+        from nxs.personality.records_ports import encode_ports
+
+        name = type(self).__name__
+        trailer = []
+        try:
+            if kind != ImageKind.CAMERA:
+                trailer.append((IDENTITY, encode_identity_head(self._identity(),
+                                                               f"{name} identity")))
+            # A cam personality's rows are its law's, its descriptor's records.
+            rows = (click_rows(params, name) if kind in SAMPLING_KINDS
+                    else click_rows([p for p in params if p.public] + list(self._rows.values()),
+                                    name) if kind in HOST_KINDS
+                    else [])
+            if rows:
+                trailer.append((PARAMS, encode_rows(rows, f"{name} parameters")))
+                trailer.append((PRESENTATION, encode_presentation_rows(rows,
+                                                                       f"{name} parameters")))
+            if output_fields:
+                trailer.append((OUTPUTS, encode_outputs(field_rows(output_fields, params),
+                                                        f"{name} outputs")))
+            trailer.append((PORTS, encode_ports(tuple(type(self).PORTS), f"{name} ports")))
+            phases = dict(getattr(type(self), "PHASES", None) or {})
+            if kind == ImageKind.HUB and phases and type(self).PORTS:
+                trailer.append(self._hub_phases(phases, name))
+        except RecordError as exc:
+            raise CompileError(str(exc)) from None
+        size = 1 + sum(3 + len(payload) for _, payload in trailer)
+        if size > MAX_TRAILER_SIZE:
+            records = NxsDriverImage.TrailerRecord._NAMES
+            raise CompileError(
+                f"{name}: a {size} B descriptor trailer, past the {MAX_TRAILER_SIZE} B "
+                f"limit: " + ", ".join(f"{records[t]} {len(p)} B" for t, p in trailer))
+        return trailer
+
+    def _identity(self):
+        """The IDENTITY head this image carries: the first address the class
+        declares, else 0, under the names `_identity_names` gives."""
+        from nxs.personality.records_identity import IdentityHead
+
+        addrs = getattr(type(self), "I2C_ADDRS", None) or []
+        compatible, product = self._identity_names()
+        return IdentityHead(address=int(addrs[0]) & 0x7F if addrs else 0,
+                            compatible=compatible, product=product)
+
+    def _identity_names(self) -> Tuple[str, str]:
+        """`(compatible, product)` of the image: a click personality's
+        compatible is its name and its product empty."""
+        from nxs.click_facts import personality_name
+
+        return personality_name(type(self)), ""
+
+    def _hub_phases(self, phases: Dict[str, int], name: str):
+        """The HUB_PHASES record of a hub program's `PHASES`: a name for each
+        value its `phase` param declares, one value per name. RecordError
+        names the mismatch."""
+        from nxs.personality.records_fields import RecordError
+        from nxs.personality.records_graph import HUB_PHASES, encode_phases
+
+        param = self._params.get("phase")
+        if param is None:
+            raise RecordError(f"{name}: PHASES names phases, and the program declares no "
+                              f"'phase' parameter to select them")
+        values = sorted(int(v) for v in phases.values())
+        declared = [int(v) for v in param.values]
+        if param.param_type == "range":
+            declared = list(range(declared[0], declared[1] + 1))
+        if values != sorted(declared):
+            raise RecordError(f"{name}: PHASES names the phases {values}, and 'phase' takes "
+                              f"{sorted(declared)}")
+        return HUB_PHASES, encode_phases({int(v): str(k) for k, v in phases.items()},
+                                         f"{name} phases")
 
     def _build_bus_config(self, cls, config: dict) -> Optional[list]:
         """Assemble the bus_config trailer: one register-access profile per
@@ -524,6 +663,7 @@ class _CompilePhase:
                 orig_em = self._emitter
                 orig_regs_obj = self._regs
                 orig_params = self._params
+                orig_rows = self._rows
                 orig_accum = self._patch_accum
                 orig_fields = self._output_fields
                 orig_recorder = self._patch_recorder_fn
@@ -535,6 +675,7 @@ class _CompilePhase:
                 self._emitter = alt_emitter
                 self._regs = alt_regs
                 self._params = {}
+                self._rows = {}
                 self._patch_accum = {}
                 self._output_fields = []
                 self._patch_recorder_fn = _alt_recorder
@@ -560,6 +701,7 @@ class _CompilePhase:
                     self._emitter = orig_em
                     self._regs = orig_regs_obj
                     self._params = orig_params
+                    self._rows = orig_rows
                     self._patch_accum = orig_accum
                     self._output_fields = orig_fields
                     self._patch_recorder_fn = orig_recorder

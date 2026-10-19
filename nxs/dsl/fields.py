@@ -1,11 +1,11 @@
-"""Output-field semantics, the image limits, and the parameter and patch descriptors."""
+"""Output-field semantics, the image limits, and the parameter, patch and port descriptors."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
-from nxs._generated_constants import FieldSemantics, NxsDriverImage
+from nxs._generated_constants import FieldSemantics, NxsDriverImage, NxsMap
 from nxs.dsl.errors import CompileError
 
 
@@ -33,6 +33,12 @@ def infer_semantic(field_name: str) -> int:
     Matching is exact, case-insensitive, after alias folding."""
     key = field_name.lower()
     return FIELD_SEMANTICS.get(_SEMANTIC_ALIASES.get(key, key), 0)
+
+
+#: The output field types by their code on the wire, the field type codes of
+#: the host interface: a field's code is its index here.
+FIELD_TYPES = ('int8', 'uint8', 'int16', 'uint16', 'int32', 'uint32', 'float32',
+               'float64', 'string')
 
 
 def field_width(field: dict) -> int:
@@ -105,6 +111,22 @@ PWM_FREQ_MAX_HZ = 25000
 
 # ── Parameter descriptors ──────────────────────────────────────
 
+#: The GATE row the compiler adds to every sampling personality: 0 standby,
+#: 1 sampling, `ParamId.STREAM` on its PARAMS row.
+STREAM_ROW = "stream"
+#: The names of a stream row's values, standby and streaming.
+STREAM_LABELS = ("off", "on")
+
+
+@dataclass(frozen=True)
+class Show:
+    """How a parameter's values read on a host: the unit a value shows in and
+    the power of ten a shown value is the served value times.
+    `Show("dB", -3)` shows a row served in mdB in decibels."""
+    unit: str = ""
+    exponent: int = 0
+
+
 @dataclass
 class ParamDescriptor:
     """Describes a configurable parameter with valid values."""
@@ -114,7 +136,19 @@ class ParamDescriptor:
     default: Any
     current: Any
     unit: str = ""
-    kind: str = "reload"     # "reload" = patch + VM restart; "live" = applied in place
+    # "run" = patch + VM restart; "apply" = applied in place; "gate" = the
+    # stream row the compiler adds, which starts and parks the sampling.
+    kind: str = "run"
+    # The standard id of the parameter's row, `ParamId.CUSTOM` for a row a
+    # host offers by name.
+    id: int = NxsMap.ParamId.CUSTOM
+    # How the row reads: its display unit and exponent (the row's own unit at 0 when None) and a
+    # name per value, an enum's in its order and a range's from its min.
+    show: Optional[Show] = None
+    labels: Optional[Tuple[str, ...]] = None
+    # A hub or host program's parameter rides its image's PARAMS record only
+    # when public; every parameter of a sampling personality is a row.
+    public: bool = True
 
 
 @dataclass
@@ -125,5 +159,23 @@ class PatchEntry:
     value_map: Dict          # config_value → byte_value(s) to write
     reg: Optional[int] = None  # target register (register writes only)
     size: int = 1            # patched width in bytes (1, 2, or 4)
+
+
+# ── Port descriptors ───────────────────────────────────────────
+
+#: What a port connects to, and which way it carries.
+PortType = NxsMap.PortType
+PortDirection = NxsMap.PortDirection
+
+
+@dataclass(frozen=True)
+class Port:
+    """A typed connection point of a personality's device, one row of the
+    PORTS record: a graph connects a port only to a port of its type. A
+    port's attributes, a csi port's lanes, are rows of the block named for
+    the port."""
+    name: str
+    type: int
+    direction: int
 
 

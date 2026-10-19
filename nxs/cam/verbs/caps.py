@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 
 
 from nxs.cam import port_state
+from nxs.cam import laws as cam_laws
 from nxs.cam import timing as cam_timing
 from nxs.cam.contracts import InfeasibleConfig, LinkSpec, Topology
 from nxs.cam.descriptors import mode_token
@@ -17,12 +18,37 @@ from nxs.host import capture_table as tables
 
 
 def _camera_knobs(hub, link: LinkSpec, topology=None) -> List[str]:
-    """The knobs the host names for a link: the hub's, and the port's
-    `sync` where a node on the port generates frame sync (a hub's)."""
-    knobs = set(_knob_names(hub, link))
+    """The knobs the host names for a link: the camera map's rows behind a
+    unit or on a smart camera, the ones a bare head's apply takes
+    otherwise, and the port's `sync` where a node on the port generates
+    frame sync (a hub's)."""
+    from nxs.cam import pods
+    from nxs.cam.hubs import map_address
+
+    mapped = pods.camera_map_knobs(hub, link) if map_address(hub, link) is not None else None
+    knobs = set(_bare_knobs(hub, link, topology) if mapped is None else mapped)
     if topology is None or not topology.is_direct:
         knobs.add("sync")
     return sorted(knobs)
+
+
+def _bare_knobs(hub, link: LinkSpec, topology) -> List[str]:
+    """The knobs the link's bare head takes through its apply
+    (`compose_heads.bare_knobs`); none for a head whose personality the
+    host does not hold."""
+    from nxs.cam import compose_heads
+
+    if topology is None:
+        return []
+    send = _link_descriptor(hub, topology, link)
+    modes = send.program_modes()
+    if not modes:
+        return []
+    try:
+        found, _periods = compose_heads.head(hub, topology, link, modes[0], None)
+    except InfeasibleConfig:
+        return []
+    return compose_heads.bare_knobs(found)
 
 
 def _hub_fsync_rate(hub, i2c, topology) -> Optional[float]:
@@ -45,16 +71,6 @@ def _hub_fsync_rate(hub, i2c, topology) -> Optional[float]:
         return hook(readings)
     except Exception:
         return None
-
-
-def _knob_names(hub, link: LinkSpec) -> List[str]:
-    """The link's knobs from hubs that know per-sensor surfaces, the
-    hub's list otherwise."""
-    fn = hub.flows().knob_names
-    try:
-        return list(fn(hub, link))
-    except TypeError:
-        return list(fn(hub))
 
 
 def _cameras_label(cameras: int) -> str:
@@ -108,7 +124,7 @@ def caps_payload(topology: Topology, hub, link: LinkSpec,
     plain = (_link_descriptor(hub, dataclasses.replace(topology, lines=()), link)
              if topology.lines else send)
     guarantee = getattr(hub.flows(), "frame_guarantee", None)
-    module = hub.chip_module(link.sensor_compatible.split(",")[-1])
+    module = cam_laws.laws(hub.descriptor(link.sensor_compatible.split(",")[-1]))
     cameras = topology.cameras
     if port is None:
         port = topology

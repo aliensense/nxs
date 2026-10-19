@@ -4,6 +4,7 @@ the signature TLVs."""
 import re
 import struct
 from dataclasses import dataclass
+from typing import Optional
 
 from ._generated_constants import NxsMcuboot
 
@@ -14,6 +15,10 @@ HEADER = struct.Struct("<IIHHIIBBHI")
 TLV_INFO = struct.Struct("<HH")
 TLV_ENTRY = struct.Struct("<HH")
 TLV_SHA256 = 0x10
+TLV_KEYHASH = 0x01
+#: The production signing key's fingerprint, the KEYHASH every release's
+#: notes print: the one key a released unit's bootloader takes.
+PRODUCTION_KEYHASH = bytes.fromhex("72a44d015eda3ca1ae23bc389a4b1c5afbfdd3a564d4c83672cb2506db00546c")
 
 
 @dataclass(frozen=True)
@@ -66,6 +71,17 @@ def identity(data: bytes):
     embeds none or more than one candidate."""
     found = {m.group(1).decode("ascii") for m in _IDENTITY_RE.finditer(data)}
     return found.pop() if len(found) == 1 else None
+
+
+def foreign_key(data: bytes) -> Optional[str]:
+    """The KEYHASH of a signed image another key than the production key
+    signed, as hex; None for a production image or one without the TLV."""
+    try:
+        found = tlvs(data).get(TLV_KEYHASH)
+    except (ValueError, struct.error):
+        return None
+
+    return found.hex() if found and found != PRODUCTION_KEYHASH else None
 
 
 def tlvs(data: bytes) -> dict:

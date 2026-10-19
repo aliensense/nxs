@@ -10,6 +10,7 @@ installed, on a link that is not a synced pair's."""
 from __future__ import annotations
 
 import dataclasses
+import os
 import sys
 import time
 from typing import Any, Dict, List, Optional
@@ -44,14 +45,22 @@ class CameraTopic:
 
 def camera_plan() -> List[CameraTopic]:
     """Every declared link with a capture id and recorded capture caps, in
-    port then link order; a link never brought up carries nothing."""
+    port then link order; a link never brought up carries nothing.
+
+    Raises:
+        ManifestError: The declaration does not load.
+    """
     from nxs.cam import port_state
-    from nxs.cam.topology import load_ports
+    from nxs.cam.topology import TopologyError, load_ports
     from nxs.cam.viewers import resolve_capture_hints
+    from nxs.suite.schema_base import ManifestError
 
     out: List[CameraTopic] = []
     try:
         ports, _ = load_ports(None)
+    except TopologyError as exc:
+        # A declaration that does not load is a refusal, not a rig without cameras.
+        raise ManifestError(str(exc)) from exc
     except Exception:
         return out
     for _index, topology in sorted(ports.items()):
@@ -91,6 +100,68 @@ CAMERA_STAGGER_S = 8.0
 CAMERA_OPEN_S = 1.5
 #: The camera node's line once its pipeline plays.
 CAMERA_STARTED = "Started stream"
+#: Where the camera nodes read a link's calibration, one camera_info_manager YAML per link
+#: (`<port>_<link>.yaml`): a path every consumer reads, the daemon's nodes as root among them.
+CAMERA_INFO_DIR = "/etc/aliensense/camera_info"
+
+
+def camera_info_url(port: str, link: str) -> str:
+    return f"file://{CAMERA_INFO_DIR}/{port}_{link}.yaml"
+
+
+def ament_prefix(package: str, environ=None) -> Optional[str]:
+    """The ament prefix that installs `package`, from `AMENT_PREFIX_PATH`;
+    None where no prefix on the path carries it."""
+    environ = os.environ if environ is None else environ
+    for prefix in (environ.get("AMENT_PREFIX_PATH") or "").split(os.pathsep):
+        marker = os.path.join(prefix, "share", "ament_index", "resource_index", "packages", package)
+        if prefix and os.path.isfile(marker):
+            return prefix
+    return None
+
+
+def node_argv(node: Dict[str, Any], prefix: str) -> List[str]:
+    """The command line that runs a launch node description (`gscam_node`)
+    as a plain process: the package's executable under its ament prefix,
+    then `--ros-args` with the node name, each parameter and each remapping."""
+    argv = [os.path.join(prefix, "lib", node["package"], node["executable"]),
+            "--ros-args", "-r", f"__node:={node['name']}"]
+    for params in node.get("parameters") or []:
+        for key, value in params.items():
+            text = ("true" if value else "false") if isinstance(value, bool) else str(value)
+            argv += ["-p", f"{key}:={text}"]
+    for source, target in node.get("remappings") or []:
+        argv += ["-r", f"{source}:={target}"]
+    return argv
+
+
+def frames_node_argv(topic: "CameraTopic", topic_base: str = "nxs") -> List[str]:
+    """The command line of the library's own camera node for a link
+    (`nxs.ros2_camera_node`), under this interpreter."""
+    return [sys.executable, "-m", "nxs.ros2_camera_node", topic.port, topic.link,
+            "--topic-base", topic_base, "--camera-info", camera_info_url(topic.port, topic.link)]
+
+
+def node_argv_for(topic: "CameraTopic", topic_base: str = "nxs", environ=None) -> List[str]:
+    """The command line nxsd runs a link's camera node with: the library's
+    own node where this host's library has a capture-stack backend, which
+    stamps each frame from the sensor's start of frame, else the GStreamer
+    node under its ament prefix.
+
+    Raises:
+        LookupError: The host installs no `gscam`, with the install line.
+    """
+    from nxs import _libnxs_frames
+
+    if _libnxs_frames.supported():
+        return frames_node_argv(topic, topic_base)
+    prefix = ament_prefix("gscam", environ)
+    if prefix is None:
+        distro = (os.environ if environ is None else environ).get("ROS_DISTRO") or "<distro>"
+        raise LookupError(f"no gscam on this host\n  - sudo apt install ros-{distro}-gscam")
+    return node_argv(gscam_node(topic, topic_base), prefix)
+
+
 #: The image encodings the camera node publishes, the first the default:
 #: the hardware converter delivers `yuv422` and `mono8` at the link's rate,
 #: `rgb8` needs the software converter and lags at 1080p, `jpeg` is the
@@ -174,6 +245,7 @@ def gscam_node(topic: CameraTopic, topic_base: str = "nxs", host=None,
         "parameters": [{
             "gscam_config": gscam_pipeline(topic, host, encoding),
             "camera_name": frame,
+            "camera_info_url": camera_info_url(topic.port, topic.link),
             "frame_id": f"{frame}_optical",
             "image_encoding": encoding,
             "use_gst_timestamps": True,

@@ -13,7 +13,9 @@ import io
 import os
 from typing import Optional
 
+from nxs._generated_constants import NxsMap
 from nxs.cam import unit_source
+from nxs.device_errors import ERRNO_ENOTSUP, DeviceRefused
 from nxs.cam.contracts import InfeasibleConfig, LinkSpec, Topology
 from nxs.cam.port_state import port_name
 
@@ -96,6 +98,18 @@ class PodRefused(RuntimeError):
     names the port and the link, so a caller prints it bare."""
 
 
+class PodFirmwareOld(PodRefused):
+    """A pod whose firmware predates the image format of the declared
+    personality, which it refused with ENOTSUP: the line names the port,
+    the link, what the pod holds and the push of the firmware that takes
+    the image. `fact` is the line without the push, for a run whose own
+    firmware step converges the pod first."""
+
+    def __init__(self, fact: str, push: str) -> None:
+        super().__init__(f"{fact}\n  - {push}")
+        self.fact = fact
+
+
 def _answers(topology: Topology, address: int) -> bool:
     """Whether a unit answers at `address` on the port's bus."""
     from nxs.transports import open_client
@@ -140,24 +154,56 @@ def _unanswered(topology: Topology, link: LinkSpec, exc: OSError) -> Optional[st
     return f"{where}: no pod answers at {alias:#04x} or at {own:#04x} ({_failure(exc)})"
 
 
-def param_names(hub, link: LinkSpec) -> list:
-    """The parameter table of the link's declared personality as this host
-    holds it (the store's image, else the hub's class compiled): what a
-    pod that `converge` brought to the declaration stages by index."""
-    from nxs import personality_cli
-    from nxs.image import deserialize
+#: The host's forms of a standard row: the rate in frames a second the rate
+#: row's, the gain in decibels the gain's, the mode the RUN row's.
+ROW_FORMS = ((NxsMap.ParamId.FRAME_RATE_MFPS, "fps"), (NxsMap.ParamId.GAIN_MDB, "gain_db"),
+             (NxsMap.ParamId.MODE, "mode"))
 
-    name = declared_name(hub, link)
+
+def declared_records(hub, link: LinkSpec) -> list:
+    """The trailer records of the declared personality as this host builds
+    it: what the pod serves once it converges, and the records a smart
+    camera's map is built from."""
+    return records_of(declared_name(hub, link))
+
+
+def records_of(name: str) -> list:
+    """The trailer records of the personality `name` as this host builds it;
+    InfeasibleConfig when it is not installed here."""
+    from nxs import personality_cli
+    from nxs.image import deserialize, parse_trailer, trailer_bytes
+
     try:
         source = personality_cli.resolve(name)
     except personality_cli.ResolveError as exc:
         raise InfeasibleConfig(f"no personality {name} on this host ({exc})",
                                alternatives=["nxs assets install"]) from exc
     if source.kind == personality_cli.KIND_IMAGE:
-        compiled = deserialize(source.image)
+        trailer = deserialize(source.image).trailer
     else:
-        compiled, _img = personality_cli.compile_source(source, {})
-    return [p.name for p in compiled.params]
+        trailer = personality_cli.compile_source(source, {})[0].trailer
+    if not isinstance(trailer, (bytes, bytearray)):
+        trailer = trailer_bytes(trailer)
+    return list(parse_trailer(trailer))
+
+
+def camera_map_knobs(hub, link: LinkSpec) -> Optional[list]:
+    """The knobs a link's head offers through its camera map, from the rows
+    of the declared personality: each row an APPLY commit takes, by its
+    name, and `fps`, `gain_db` and `mode` where the rate, the gain and the
+    mode rows stand. None for a personality without a camera map
+    (the host writes its head)."""
+    from nxs._generated_constants import NxsDriverImage
+    from nxs.personality.records import camera_map_info
+
+    info = camera_map_info(declared_records(hub, link))
+    if info is None:
+        return None
+    knobs = {row.name for row in info["rows"]
+             if row.kind == NxsDriverImage.ParamKind.APPLY and not row.is_read_only}
+    ids = {row.id for row in info["rows"]}
+    knobs.update(form for pid, form in ROW_FORMS if pid in ids)
+    return sorted(knobs)
 
 
 def converge(client, hub, topology: Topology, link: LinkSpec, *,
@@ -168,12 +214,23 @@ def converge(client, hub, topology: Topology, link: LinkSpec, *,
     InfeasibleConfig when the declared personality is not installed on
     this host, PodRefused when the upload was refused, PodSilent when no
     pod answers at the link's addresses, DeviceRefused when the pod refuses
-    a read of its store."""
+    a read of its store or the upload. A pod whose firmware predates the
+    image's format refuses the upload with ENOTSUP and keeps what it holds:
+    PodFirmwareOld names the push, and only a run with a firmware step of
+    its own (`nxs switch`) goes on past it."""
     from nxs import personality_cli
 
     name = declared_name(hub, link)
     who = unit_name or f"@{link.nxs_units[0].alias_addr:#04x}"
     where = f"{port_name(topology)}/{link.name}"
+    # A pod on the first interface serves another map: nothing of its store
+    # reads, and its firmware is converged before anything else is asked.
+    if first_interface(client):
+        from nxs.firmware import push_fw_asset
+
+        raise PodFirmwareOld(f"{where}: pod {who} speaks interface version 1, the first interface",
+                             f"nxs {_push_target(topology, link, unit_name)} push-fw "
+                             f"{push_fw_asset()}")
     stale = None
     try:
         found = unit_source.read_unit_personality(client)
@@ -215,8 +272,43 @@ def converge(client, hub, topology: Topology, link: LinkSpec, *,
                               link=link.name, json=False)
     unit_source.forget(topology, link)
     # The upload's own lines are this line's: its refusals still reach stderr.
-    with contextlib.redirect_stdout(io.StringIO()):
-        rc = personality_cli._land(client, args, source, img, kind, name, compiled)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = personality_cli._land(client, args, source, img, kind, name, compiled)
+    except DeviceRefused as exc:
+        if exc.code != ERRNO_ENOTSUP:
+            raise
+        from nxs.firmware import push_fw_asset
+
+        raise PodFirmwareOld(f"{where}: pod {who} holds {held}; its firmware predates {name}'s "
+                             f"image format",
+                             f"nxs {_push_target(topology, link, unit_name)} push-fw "
+                             f"{push_fw_asset()}") from exc
     if rc != 0:
         raise PodRefused(f"{where}: the upload of {name} was refused")
     return f"{line} ... ok"
+
+
+def first_interface(client) -> bool:
+    """Whether the unit behind `client` speaks the first host interface; False
+    where the transport serves no version or the read fails."""
+    from nxs.firmware import FIRST_PROTO_VERSION
+
+    reader = getattr(client, "interface_version", None)
+    if reader is None:
+        return False
+    try:
+        return reader() == FIRST_PROTO_VERSION
+    except (OSError, RuntimeError, NotImplementedError):
+        return False
+
+
+def _push_target(topology: Topology, link: LinkSpec, unit_name: Optional[str]) -> str:
+    """The flags that address a link's pod on a command line: its declared
+    name, else its alias on the port's bus."""
+    from nxs.cam.verbs.status import _pod_names
+
+    name = unit_name or _pod_names(topology).get(link.name)
+    if name:
+        return f"--unit {name}"
+    return f"-t i2c -b {topology.i2c_bus} -a 0x{int(link.nxs_units[0].alias_addr):02X}"

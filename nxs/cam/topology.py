@@ -16,7 +16,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import yaml
 
-from nxs.suite.schema_ports import port_signature
+from nxs.suite.schema_nodes import port_signature
 
 from .contracts import LinkSpec, NxsUnitSpec, SyncSpec, Topology
 from .descriptors import to_int
@@ -85,11 +85,11 @@ def _parse_link(raw: Dict[str, Any], where: str, direct: bool = False) -> LinkSp
                      f"alias_addr {to_int(unit['alias_addr']):#04x} is the sensor's "
                      f"address too, and nothing on the port's own bus tells the two "
                      f"apart")
+        alias = to_int(unit["alias_addr"])
         units.append(NxsUnitSpec(
-            alias_addr=to_int(unit["alias_addr"]),
-            # On the port's own bus the unit's address is its own.
-            target_addr=to_int(unit.get("target_addr",
-                                        unit["alias_addr"] if direct else 0x30)),
+            alias_addr=alias,
+            # On the port's own bus the unit's addresses are its own.
+            target_addr=to_int(unit.get("target_addr", alias if direct else 0x30)),
         ))
     # Integers as the schema admits them: a number, or a string in any
     # base-0 spelling ("0x21").
@@ -114,23 +114,37 @@ def _parse_link(raw: Dict[str, Any], where: str, direct: bool = False) -> LinkSp
 
 def _require_separable_units(keyed, where: str) -> None:
     """Two units behind one hub answer apart only through their aliases: a
-    unit at its strapped address answers on every link the hub merges, and
-    two units at one alias merge the same way."""
+    unit takes two host addresses, its alias and the next one for its
+    camera map, and a strapped address, the register map's or the camera map's,
+    answers on every link the hub merges. An address that reaches two
+    units merges them."""
     units = [(f"{where}.links.{key}.nxs_units[{i}]", unit)
              for key, link in keyed for i, unit in enumerate(link.nxs_units)]
     if len(units) < 2:
         return
     claimed = {}
     for uwhere, unit in units:
-        _require(unit.alias_addr != unit.target_addr, uwhere,
-                 f"alias_addr {unit.alias_addr:#04x} is the address the unit "
+        alias, target = unit.alias_addr, unit.target_addr
+        _require(alias != target, uwhere,
+                 f"alias_addr {alias:#04x} is the address the unit "
                  f"straps, which answers on every link, and {len(units)} units "
                  f"ride this hub")
-        _require(unit.alias_addr not in claimed, uwhere,
-                 f"alias_addr {unit.alias_addr:#04x} is also "
-                 f"{claimed.get(unit.alias_addr)}'s, and two units at one alias "
+        _require(claimed.get(alias, (None, "alias"))[1] != "alias" or alias not in claimed, uwhere,
+                 f"alias_addr {alias:#04x} is also "
+                 f"{claimed.get(alias, ('', ''))[0]}'s, and two units at one alias "
                  f"merge")
-        claimed[unit.alias_addr] = uwhere
+        for addr, what in ((alias, "alias"), (alias + 1, "camera map")):
+            for _owhere, other in units:
+                _require(other is unit or addr not in (other.target_addr, other.target_addr + 1),
+                         uwhere,
+                         f"alias_addr {alias:#04x} puts the unit's {what} at {addr:#04x}, "
+                         f"an address every unit straps, and two units at one address merge")
+            _require(addr not in claimed, uwhere,
+                     f"alias_addr {alias:#04x} puts the unit's {what} at {addr:#04x}, "
+                     f"{claimed.get(addr, ('', ''))[0]}'s {claimed.get(addr, ('', ''))[1]}, "
+                     f"and two units at one address merge")
+        claimed[alias] = (uwhere, "alias")
+        claimed[alias + 1] = (uwhere, "camera map")
 
 
 def _parse_port(raw: Dict[str, Any], where: str) -> Topology:
@@ -281,21 +295,24 @@ def port_topology(port, host=None) -> Topology:
         # No hub names the serializer: a link that names its own stands in
         # for the others, else the hub default the hub's flows are built on.
         ser_rule = next((l.ser for l in port.links if l.ser), None)
+    facts = (f"nodes.{port.hub_node}.links" if getattr(port, "hub_node", None)
+             else f"ports.{port.name}.links")
     for l in port.links:
         if port.hub_compatible and l.des_window is None and l.name not in windows:
-            raise TopologyError(f"ports.{port.name}.links.{l.name}: no window rule for "
+            raise TopologyError(f"{facts}.{l.name}: no window rule for "
                                 f"a link named {l.name!r} (the hub knows "
-                                f"{', '.join(sorted(windows))}); declare des_window")
+                                f"{', '.join(sorted(windows))})")
         if l.csi_vc is None and l.name not in vcs:
-            raise TopologyError(f"ports.{port.name}.links.{l.name}: no channel rule for "
-                                f"a link named {l.name!r}; declare csi_vc")
-    # A declared value is the operator's word (check compares it with the booted
-    # tree); an undeclared one follows the tree, then the connector's wiring.
+            raise TopologyError(f"{facts}.{l.name}: no channel rule for "
+                                f"a link named {l.name!r} (the hub knows "
+                                f"{', '.join(sorted(vcs))})")
+    # A declared value is the operator's word (check compares it with the booted tree); an
+    # undeclared one follows the tree, then the host's connector row and the lanes it wires.
     booted_ids = host.capture_ids(bus)
     node_addrs = _booted_node_addrs(host, bus)
     lanes = port.csi_lanes
     if not port.csi_lanes_declared:
-        lanes = host.booted_lanes(bus) or _connector_lanes(host, port.name) or port.csi_lanes
+        lanes = host.booted_lanes(bus) or port.csi_lanes
     links = tuple(
         LinkSpec(
             name=l.name,
@@ -304,6 +321,7 @@ def port_topology(port, host=None) -> Topology:
             csi_vc=(l.csi_vc if l.csi_vc is not None else vcs.get(l.name, 0)),
             sensor_compatible=l.camera,
             sensor_declared=True,
+            camera_node=l.camera_node,
             ser_compatible=(l.ser or ser_rule) if port.hub_compatible else None,
             ser_addr=l.ser_addr,
             sensor_addr=l.sensor_addr,
@@ -314,7 +332,8 @@ def port_topology(port, host=None) -> Topology:
             capture_id=(booted_ids.get(int(l.csi_vc if l.csi_vc is not None
                                            else vcs.get(l.name, 0)))
                       if booted_ids else l.capture_id),
-            # Nothing translates a direct port's unit: it answers at its own address.
+            # Nothing translates a direct port's unit: it answers at its own
+            # addresses, the register map's and the camera map's.
             nxs_units=(NxsUnitSpec(alias_addr=(l.unit.alias if port.hub_compatible
                                                else l.unit.target),
                                    target_addr=l.unit.target),)
@@ -336,12 +355,14 @@ def port_topology(port, host=None) -> Topology:
         des_addr=port.hub_addr,
         csi_lanes=lanes,
         hub_driver=port.hub_driver,
-        camera_mode=port.camera_mode,
-        camera_fps=port.camera_fps,
+        hub_node=port.hub_node,
         camera_exposure_us=port.camera_exposure_us,
         camera_gain_db=port.camera_gain_db,
         sync=SyncSpec(source=port.sync_source, fps=port.sync_fps),
         node_addrs=pairs,
+        outputs=tuple((name, int(lanes), tuple(streams), bool(copy))
+                      for name, (lanes, streams, copy) in sorted(port.outputs.items())),
+        hub_values=tuple(sorted(getattr(port, "hub_values", {}).items())),
         declared=port_signature(port),
     )
 

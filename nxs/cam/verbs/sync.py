@@ -204,20 +204,20 @@ def pair_gain_fact(topology: Topology) -> Optional[str]:
     """Why a gain asked of the port is refused while the recorded sync gives
     its camera links one gain (the hub's `pair_ae`): the leader's capture
     session decides it and nxsd copies it to the follower's head, or the
-    declared `camera.gain_db` locks it; None where each link runs its own
+    hub's declared `gain` locks it; None where each link runs its own
     loop."""
     ae = (port_state.port_sync(topology) or {}).get("ae") or {}
     if ae.get("mode") == "follow":
         return (f"link {ae['leader']}'s capture session decides the pair's gain and nxsd "
                 f"copies it to link {ae['follower']}")
     if ae.get("mode") == "locked":
-        return (f"camera.gain_db locks links {' and '.join(ae.get('links') or [])} "
+        return (f"the hub's declared gain locks links {' and '.join(ae.get('links') or [])} "
                 f"at {float(ae['gain_db']):.1f} dB")
     return None
 
 
 def declared_exposure_fact(topology: Topology, synced: bool) -> str:
-    """Why a declared `camera.exposure_us` is refused: under the port's frame
+    """Why a declared `exposure` is refused: under the port's frame
     sync (``synced``) the pulse sets the exposure at the rate the port runs
     (`synced_fps`); otherwise the capture stack's loop does."""
     if not synced:

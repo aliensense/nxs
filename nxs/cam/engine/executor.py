@@ -13,6 +13,7 @@ from .models import (
     DeviceStep,
     ExpectFailedError,
     ExpectStep,
+    RawWriteStep,
     ReadStep,
     RetryBlockStep,
     Step,
@@ -37,6 +38,10 @@ class IStepSink(Protocol):
         comment: Optional[str] = None,
     ) -> None:
         """Emit a device register write step."""
+        ...
+
+    def raw_write(self, device: int, data: list[int], comment: Optional[str] = None) -> None:
+        """Emit a raw write: ``data`` with no register framing."""
         ...
 
     def read(
@@ -103,6 +108,8 @@ class SequenceExecutor:
                         f"reg=0x{step.reg:04X} offset=0x{step.offset:02X} "
                         f"value={step.value}"
                     ) from exc
+            elif isinstance(step, RawWriteStep):
+                self._sink.raw_write(step.device, step.data, comment=step.comment)
             elif isinstance(step, ReadStep):
                 self._sink.read(
                     step.device,

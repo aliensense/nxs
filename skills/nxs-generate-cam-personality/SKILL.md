@@ -12,7 +12,7 @@ argument-hint: [sensor-name-or-datasheet-url] [setting-file]
 
 # Generate an NXS cam personality
 
-A cam personality is two files and their tables: `<name>.yaml`, its facts file, the digitized datasheet, and `<name>.py`, the behaviour the NXS unit on the sensor's pod runs once, under the host's bus token, to program the sensor; the register tables the behaviour loads sit beside them. The tool compiles the personality into a cam image. The laws (frame rate, exposure, gain, the control table of the host's kernel driver) are the tool's law families, parameterized by the YAML. The class carries writes, sleeps and polls only.
+A cam personality is two files and their tables: `<name>.yaml`, its facts file, the digitized datasheet, and `<name>.py`, the behaviour the NXS unit on the sensor's pod runs once, under the host's bus token, to program the sensor; the register tables the behaviour loads sit beside them. The tool compiles the personality into a cam image. The laws (frame rate, exposure, gain, the camera map's rows, a bare head's control table) are the law families beside the cam personalities (`<family>/<family>.py`, loaded by `nxs.cam.laws`), parameterized by the YAML. The class carries writes, sleeps and polls only.
 
 A mikroBUS part is a click personality: run `/nxs-generate-click-personality` instead.
 
@@ -36,7 +36,7 @@ find docs -name nxs-cam-personalities.md    # prints the file to read, wherever 
 
 From `$ARGUMENTS`: the part number and the module it sits on. Two inputs:
 
-1. **The datasheet.** The I²C address; the register address and value widths; the identity register and its value, or without one a register that answers as soon as the core is out of reset; the stream gate; the readout modes with geometry, bit depth, lane count, link rate and top frame rate, and for a `sony_imx` part each mode's row of the register lists (the recommended frame length, the line length, the rate at them, the section); the Bayer origin; the input clock; the timing, shutter and gain registers with their units and ranges; whether the clock lane is gated between bursts; whether the part takes an external trigger.
+1. **The datasheet.** The I²C address; the register address and value widths; the identity register and its value, or without one a register that answers as soon as the core is out of reset; the stream gate; the readout modes with geometry, bit depth, lane count, link rate and top frame rate, and for a `sony_imx` part each mode's row of the register lists (the recommended frame length, the line length, the rate at them, the section); the Bayer origin; the input clock; the timing, shutter and gain registers with their units and ranges; whether the clock lane is gated between bursts; whether the part takes an external trigger. For a part that takes a fast trigger, its timing chart: the data output delay's fixed time, whole lines and wait registers, the wait registers that extend the pulse's exposure, and the edge the chart counts from. Per mode, the wait registers its register list states where they differ from the sensor-wide set.
 2. **The vendor setting file.** The register sequence that programs each mode: the vendor driver's mode tables, an application note's setting list, or a capture of a working chain.
 
 A published kernel driver stands in for both inputs when the part has no datasheet in hand: its register defines and their comments carry the addresses, widths, units and ranges, its mode tables are the setting file, and the host's devicetree binding for the module carries the lane count, link rate, pixel clock, line length and frame length per mode. Take the facts only from what the source states; a value the source leaves out is `limits_source: driver` with the judgement call in a YAML comment, and a register the source never names does not exist. `meta.provenance` names each file with its repository, tag and licence.
@@ -47,8 +47,9 @@ A published kernel driver stands in for both inputs when the part has no datashe
 |---|---|---|
 | `generic` | any part whose runtime controls are direct register writes | the controls named in `controls:` clamped to their ranges, the stream gate from the `standby` control, the capture facts; no timing law, so a mode runs at the one rate its table sets |
 | `sony_imx` | the registers carry the `sony_imx` vocabulary: `STANDBY`, `XMSTA`, `HMAX`, `VMAX`, a shutter counted from the frame end (`SHS` or `SHR0`), `GAIN`, `REGHOLD`, and for a trigger `TRIGMODE` with `VINT_EN` | the timing law `INCK / (HMAX × VMAX)`, exposure and gain conversions, the standby-wrapped timing program, the trigger conversions, live rate, exposure and gain knobs |
+| `native` | a head that programs its own sensor and serves the camera map itself, a smart camera without a unit | no register and no program: `chip: native`, `i2c_addr: 0`, `registers: {}`; the facts carry the map's physical limits under `limits` (`exposure_min_us`, `exposure_margin_us`, `frame_period_max_us`, the gain range in millidecibels, the optional black level, flips and temperature, `stream_gate`) with a `limits_source` per limit, each mode's `timing` (`fps`, `line_time_ns`, `frame_period_min_us`) and a `trigger` block whose `freerun` row names the device's free-run value; the class is `NATIVE = True` with no `probe` or `configure`, and the image is its records. The head serves the camera map alone. The host never uploads its personality and names the head by the installed one whose rows and mode table its map serves |
 
-Pick `sony_imx` only when every register of the vocabulary exists on the part under that meaning. A near miss is `generic`.
+Pick `sony_imx` only when every register of the vocabulary exists on the part under that meaning. A near miss is `generic`. Pick `native` only for a head with no register the host or a unit writes.
 
 ## Step 3: Write the files
 
@@ -128,7 +129,7 @@ runtime_forbidden: []
 - `mipi.embedded_lines` counts the embedded-data lines the sensor emits with each frame, the count the datasheet states, carried on every capture row as `embedded_lines`. The overlay declares them on a connector port and none behind the Hub, which parks that line on another channel; the capture stack faults every frame that carries a line it did not expect.
 - `hdr_ratio` is `{min: 1, max: 1}` for a part without an HDR mode.
 - `timing.fps` is the rate the mode's table sets. The capture row of the same geometry states `line_length` in clocks of `pix_clk_hz` and `max_fps` equal to it, so `pix_clk_hz / (line_length × max_fps)` is the frame in lines, at or above the height.
-- `controls.standby` is the stream gate with its two values. The tables stop short of the setting file's stream start and the class never writes the gate: the host starts and stops the stream with it.
+- `controls.standby` is the stream gate with its two values. The tables stop short of the setting file's stream start, and the class writes no gate itself: the program's start and park write it from these values.
 - Every other control is a register the host writes as it is, clamped to `min..max`; `gain` also states its register steps per dB as `num/den`. A part whose gain law is not linear in dB declares no `gain` control: the capture stack drives exposure alone.
 - `capture.gain`, `exposure` and `framerate` are the kernel's ranges: `factor` is the unit denominator (gain in `1/factor` dB, exposure and rate in `1/factor` of their unit), `default` the value a capture opens with.
 - `clock_noncontinuous: true` when the datasheet says the clock lane is gated between bursts.
@@ -229,14 +230,16 @@ runtime_forbidden: []
 - `inck_hz` is the clock `HMAX` counts, `1H = HMAX / inck_hz`, which is not always the INCK pin's frequency: the datasheet's line-period formula names it.
 - A mode's `sony:` row is its line of the datasheet's register lists, copied as printed: `vmax` the recommended frame length V_TR, at which the datasheet guarantees the imaging characteristics, `hmax` the line length, `max_fps` the rate the datasheet states at them, `section` the list that states them. The family reads V_TR from the row (`sony_imx.recommended_frame_length`): the range's ceiling at the port's line, `inck_hz / (line × V_TR)`, the trigger frame under frame sync, and the rate below which `caps` marks the frame as longer than the datasheet's. A row without `vmax`, `hmax` or `section` is refused at load; a mode without a row takes V_TR from `timing.min_frame_length`.
 - A mode's `timing.hmax` is its line in that clock's counts, the row's `hmax`, and `timing.min_frame_length` the frame the datasheet recommends for it, the row's `vmax`. The capture row states neither `line_length` nor `max_fps`: the family derives them, `line_length = hmax × pix_clk_hz / inck_hz`, so `pix_clk_hz` is a whole multiple of `inck_hz`.
-- `trigger` presets carry the full register values of each conversion (`freerun`, `fast`), `mipi.trigger_input` names the pin the pulse arrives on, and `sync.takes_trigger` says the head takes the hub's pulse. A part without a trigger input has no `trigger:` block, no `trigger_input`, and `takes_trigger: false`. Set `trigger.timing.pulse_width_is_exposure: true` when the datasheet's fast-trigger timing makes the exposure the pulse width plus a fixed offset and ignores the shutter register; the trailer carries it, and under frame sync the host states the exposure as the pulse's low time from it. Leave it out otherwise.
+- `trigger` presets carry the full register values of each conversion (`freerun`, `fast`), `mipi.trigger_input` names the pin the pulse arrives on, and `sync.takes_trigger` says the head takes the hub's pulse. The `trigger` parameter's value of a preset is its registry value, `freerun` 0, `fast` 1, `sequential` 2, whatever the declaration order; another name takes the next value in declaration order. A part without a trigger input has no `trigger:` block, no `trigger_input`, and `takes_trigger: false`. Set `trigger.timing.pulse_width_is_exposure: true` when the datasheet's fast-trigger timing makes the exposure the pulse width plus a fixed offset and ignores the shutter register; the trailer carries it, and under frame sync the host states the exposure as the pulse's low time from it. Leave it out otherwise.
+- `limits.fast_trigger` is the fast-trigger timing chart, with `limits_source.fast_trigger: datasheet`. `output_delay_us` and `output_delay_lines` are the fixed part of the data output delay, `output_delay_regs` the wait registers it adds, `exposure_regs` the waits that extend the pulse's exposure. The family counts both from the pulse's end edge. The output delay law crops the triggered viewers, and the readout delay law stamps frames. A datasheet without the chart carries no block: the host crops nothing and stamps without a readout delay, and the card's `trigger` line reads `fast (no timing chart: no readout delay)`. A missing chart is never the NOT EXPRESSIBLE card.
+- A mode whose register list states wait registers of its own, a 12-bit list beside a 10-bit sensor-wide set, declares them as `timing.waits`. The output delay reads them. The shutter floor and the frame-length delta read the sensor-wide `captured_waits`.
 - `program` carries the settles, in ms after the write, of each standby-wrapped program; `stop_ms` is the park settle. The values come from the vendor's launch script or the datasheet's settling figures; where neither states one, use 200 after standby, 50 after release, 600 after the start.
 - `shs_floor` is the shutter's minimum over the offered modes, `integration_offset_us` the exposure offset, `gain_max` the register ceiling, `gain_reg_per_db` register steps per dB, as a number or as `[numerator, denominator]`.
 - `serializer_csi` stays out: the host composes the pod's serializer from the mode's contract.
 
 ### The tables
 
-A table is a YAML list: `[reg, value]` (hex or decimal) or `{sleep_ms: N}`. Split the setting file: the prefix every mode shares becomes `<name>_init.yaml`, each mode's remainder its own table, and a suffix every mode ends on (the timing, gain and shutter defaults a vendor writes after each mode) becomes `<name>_final.yaml`, which the class writes after each mode's table. A value the setting file leaves to the mode but the datasheet ties to it (an A/D depth, a black level per bit depth) goes into that mode's table. Keep the vendor's order and its sleeps; consecutive registers compile into one burst on their own. Comment each table with the setting file's own section name. A value wider than `val_bits` is refused at compile: split it into bytes in the register's byte order.
+A table is a YAML list: `[reg, value]` (hex or decimal) or `{sleep_ms: N}`. Split the setting file: the prefix every mode shares becomes `<name>_init.yaml`, each mode's remainder its own table, and a suffix every mode ends on (the timing, gain and shutter defaults a vendor writes after each mode) becomes `<name>_final.yaml`, which `_configure` writes once after the mode select; a row of it that a mode's own settings decide stays with the mode. A value the setting file leaves to the mode but the datasheet ties to it (an A/D depth, a black level per bit depth) goes into that mode's table. Keep the vendor's order and its sleeps; consecutive registers compile into one burst on their own. Comment each table with the setting file's own section name. A value wider than `val_bits` is refused at compile: split it into bytes in the register's byte order.
 
 ```yaml
 # cam1_init.yaml
@@ -334,13 +337,13 @@ class Cam1(CamPersonality):
 
     def configure(self, config):
         self.declare_param("mode", values=list(range(len(_MODES))), default=0,
-                           kind="reload")
+                           kind="run")
         self.write_table(self.load_table("cam1_init.yaml"))
         self.select("mode", {i: (lambda t=table: self.write_table(self.load_table(t)))
                              for i, (_, table) in enumerate(_MODES)})
 ```
 
-`probe()` first writes the part's software reset register when the datasheet has one (SMIA parts: `0x0103 = 0x01`), since on a connector the part leaves reset before its clock runs and starts undefined. Then it polls the identity register with the mask and value the datasheet gives; a part without one polls a register that answers as soon as the core is out of reset, with mask 0 (any ACK). `configure()` declares `mode` over the offered modes in YAML order, writes the shared table, then one block per mode. Nothing else: the family starts the stream. `I2cProfile` frames every value the program moves: `addr_bytes` from `reg_bits`, `data_width` and `byte_order` when a value is wider than a byte.
+`probe()` first writes the part's software reset register when the datasheet has one (SMIA parts: `0x0103 = 0x01`), since on a connector the part leaves reset before its clock runs and starts undefined. Then it polls the identity register with the mask and value the datasheet gives; a part without one polls a register that answers as soon as the core is out of reset, with mask 0 (any ACK). `configure()` declares `mode` over the offered modes in YAML order, writes the shared table, then one block per mode. Nothing else: the class declares no `action`, so the compiler gives the program one, with the stream gate's streaming value as the start and its standby value as the park. A part whose `controls:` lack `exposure`, `frame_length` or `gain` serves no row on the pod's camera map. A table-only part that declares all three of `exposure`, `frame_length` and `gain` takes the apply the way the `sony_imx` class below does: `_APPLY = laws.apply_law(_FACTS, "<name>")`, the `action` parameter over `sorted(ACTIONS.values())` with an arm for every value in its `select_grouped` (`lambda: self.stream_gate(False)` as the park, `lambda: self.stream_gate(True)` as the start, `lambda: None` for the timing and the trigger), the `frame_length`, `exposure` and `gain` range parameters declared from `_APPLY`, and `self.apply_block(_APPLY)` as the `apply` arm. It declares `line_time` beside them, a range in `ns` from `min(_APPLY.line_times_ns)` to `max(_APPLY.line_times_ns)` that defaults to the default mode's entry: the unit converts a commit's microseconds at the line the last run stored. A part with more than one offered mode also declares `frame_period`, a range in `ns` from `_APPLY.frame_length_min * min(_APPLY.line_times_ns)` to `4_000_000_000` that defaults to `_APPLY.frame_length_min` lines at the default mode's line, since the camera map serves the `mode` row only to a program that stages `mode` and `frame_period`. Each mode's block ends by storing what its table runs: `self.store_param(LINE_TIME_PARAM, line_ns)` with the mode's entry of `_APPLY.line_times_ns`, `self.store_param(FRAME_LENGTH_PARAM, round(1e9 / (fps * line_ns)))` with the mode's `timing.fps`, and with `frame_period` declared `self.store_param(FRAME_PERIOD_PARAM, round(1e9 / fps))`. The compiler refuses a program that stages the apply without `action` or `line_time`. `I2cProfile` frames every value the program moves: `addr_bytes` from `reg_bits`, `data_width` and `byte_order` when a value is wider than a byte.
 
 ### The class, `sony_imx` family
 
@@ -354,11 +357,15 @@ from pathlib import Path
 import yaml
 
 from nxs import CamPersonality, I2cProfile
-from nxs.personality.records import (ACTION_PARAM, ACTIONS, FRAME_LENGTH_PARAM,
-                                     FRAME_PERIOD_PARAM, LINE_TIME_PARAM)
+from nxs.cam import laws
+from nxs.personality.records import (ACTION_PARAM, ACTIONS, EXPOSURE_PARAM, FRAME_LENGTH_PARAM,
+                                     FRAME_PERIOD_PARAM, GAIN_PARAM, LINE_TIME_PARAM)
 
 _FACTS = yaml.safe_load(Path(__file__).with_name("cam2.yaml").read_text())
 _REG = {name: int(str(spec["addr"]), 0) for name, spec in _FACTS["registers"].items()}
+#: The apply law: what the `apply` action writes under REGHOLD, from the
+#: family's facts (SHS, VMAX, GAIN and the limits).
+_APPLY = laws.apply_law(_FACTS, "cam2")
 
 
 def _readout_frame(mode):
@@ -399,30 +406,38 @@ class Cam2(CamPersonality):
 
     def configure(self, config):
         self.declare_param("mode", values=list(range(len(_MODES))), default=0,
-                           kind="reload")
-        self.declare_param("trigger", values=[0, 1], default=0, kind="reload")
+                           kind="run")
+        self.declare_param("trigger", values=[0, 1], default=0, kind="run")
         self.declare_param(ACTION_PARAM, values=sorted(ACTIONS.values()),
-                           default=ACTIONS["configure"], kind="reload")
+                           default=ACTIONS["configure"], kind="run")
         self.declare_param(LINE_TIME_PARAM, values=[_LINE_MIN, _LINE_MAX],
                            default=_LINE_DEFAULT, param_type="range", unit="ns",
-                           kind="live")
+                           kind="apply")
         self.declare_param(FRAME_PERIOD_PARAM, values=[_LINE_MIN, _PERIOD_MAX],
                            default=_PERIOD_DEFAULT, param_type="range", unit="ns",
-                           kind="live")
+                           kind="apply")
         self.declare_param(FRAME_LENGTH_PARAM, values=[0, _VMAX_MAX], default=0,
-                           param_type="range", unit="lines", kind="live")
-        configure, park, start, timing = (ACTIONS[a] for a in ("configure", "park",
-                                                               "start", "timing"))
+                           param_type="range", unit="lines", kind="apply")
+        self.declare_param(EXPOSURE_PARAM, values=[_APPLY.exposure_min, _VMAX_MAX],
+                           default=_APPLY.exposure_min, param_type="range", unit="lines",
+                           kind="apply")
+        self.declare_param(GAIN_PARAM, values=[_APPLY.gain_min, _APPLY.gain_max],
+                           default=_APPLY.gain_min, param_type="range", unit="steps",
+                           kind="apply")
+        configure, park, start, timing, apply, trigger = (
+            ACTIONS[a] for a in ("configure", "park", "start", "timing", "apply", "trigger"))
         self.select_grouped(ACTION_PARAM, {frozenset({configure}): self._configure,
                                            frozenset({park}): self._park,
                                            frozenset({start}): self._start,
-                                           frozenset({timing}): lambda: None})
+                                           frozenset({timing}): lambda: None,
+                                           frozenset({apply}): lambda: self.apply_block(_APPLY),
+                                           frozenset({trigger}): self._freerun_switch})
         self.select_grouped(ACTION_PARAM, {frozenset({configure, timing}): self._timing_start,
-                                           frozenset({park, start}): lambda: None})
+                                           frozenset({park, start, apply, trigger}): lambda: None})
         self.select_grouped(ACTION_PARAM, {
-            frozenset({configure}): lambda: self.select("trigger", {0: lambda: None,
-                                                                    1: self._fast_for_mode}),
-            frozenset({park, start, timing}): lambda: None})
+            frozenset({configure, trigger}): lambda: self.select("trigger", {0: lambda: None,
+                                                                             1: self._fast_for_mode}),
+            frozenset({park, start, timing, apply}): lambda: None})
 
     def _configure(self):
         self.write_table(self.load_table("cam2_init.yaml"))
@@ -460,6 +475,13 @@ class Cam2(CamPersonality):
         self.write(_REG["XMSTA"], 0x00)
         self.sleep_ms(int(settle["start_ms"]))
 
+    def _freerun_switch(self):
+        # The trigger action with trigger value 0: a running sensor back to
+        # free run. Value 1 is the shared fast conversion that follows. The
+        # values are the registry's: freerun 0, fast 1, sequential 2.
+        self.select("trigger", {0: lambda: self._trigger("freerun", _SETTLE["trigger_switch"]),
+                                1: lambda: None})
+
     def _fast_for_mode(self):
         self.select("mode", {i: (lambda v=frame: self._fast(v))
                              for i, (_, _, frame) in enumerate(_MODES)})
@@ -487,7 +509,9 @@ class Cam2(CamPersonality):
         self.sleep_ms(int(settle["start_ms"]))
 ```
 
-The run parameters are the vocabulary the host stages: `action` (0 the whole program, 1 a standby, 2 a start from standby, 3 the timing program alone), `line_time` and `frame_period` in nanoseconds, and `frame_length` in lines, which the timing program stores beside the achieved `line_time`. The timing program is the family's: standby, both registers of the free-run preset, HMAX and VMAX from the staged periods, release, master start, with the `program.timing_start` settles, so a free-running head ends on the free-run preset whatever the tables left. The fast-trigger frame is the mode's own frame; the host's laws hold a synced pair to it. A part without a trigger input drops the `trigger` parameter, the third `select_grouped` and the `_fast*` and `_trigger` blocks. A `<name>_final.yaml` is written by `_configure` after each mode's table. Register addresses, widths, presets and settles come from the YAML so a fact lives once. The class computes nothing but the timing registers: no `knob_*`, `expect_*`, `derive_*` or `export_*` method, the compiler refuses them.
+The run parameters are the vocabulary the host stages: `action` (0 the whole program, 1 a standby, 2 a start from standby, 3 the timing program alone, 4 the apply, 5 the trigger conversion of a running sensor), `line_time` and `frame_period` in nanoseconds, `frame_length` in lines, which the timing program stores beside the achieved `line_time`, and `exposure` in lines and `gain` in the capture stack's steps, which the apply writes. The eight parameters take half of the 16 a personality declares at most. The `apply` action is `apply_block(_APPLY)`: the staged frame length, shutter and gain under REGHOLD, each clamped to the family's law from the facts (`laws.apply_law`). An APPLY commit on the pod's camera map runs it every frame, the unit converting the rows' microseconds and millidecibels with that law. The trigger action converts a running sensor between the presets, normal mode first. The timing program is the family's: standby, both registers of the free-run preset, HMAX and VMAX from the staged periods, release, master start, with the `program.timing_start` settles, so a free-running head ends on the free-run preset whatever the tables left. The fast-trigger frame is the mode's own frame; the host's laws hold a synced pair to it. A part without a trigger input drops the `trigger` parameter, the third `select_grouped` and the `_fast*`, `_trigger` and `_freerun_switch` blocks, and its `trigger` action converts nothing (`frozenset({timing, trigger}): lambda: None`). A `<name>_final.yaml` is written by `_configure` once after the mode select, so the program carries it once. Register addresses, widths, presets and settles come from the YAML so a fact lives once. The class computes nothing but the timing registers: no `knob_*`, `expect_*`, `derive_*` or `export_*` method, the compiler refuses them.
+
+**The compiler builds the camera map's rows from the law, and the class writes none.** `exposure` in `us`, `fps` in `mfps` and `gain` in `mdB` come always. `trigger` comes when the head takes a trigger and the program converts a preset, named by its presets, and `stream` when the law has a stream gate. `mode` comes when the program stages `mode` and `frame_period`, named by the offered modes, and `line_time` with it when the program stages `line_time`. `black_level` and `flips` come where the law names their register and the program stages it, `temperature` where the law reads it, and all three where a native head's limits name them. `inck_hz` comes read-only, in megahertz, when the facts state `limits.inck_hz`. The PRESENTATION record beside the rows says how each reads: the rate in fps, the gain in dB, the temperature in degrees. So the class's `declare_param` calls declare run values alone, with no `id`, `show` or `labels`, and `declare_row` is a hub or host program's verb, never a camera class's. `nxs personality records ./<name>` prints the rows, one per line, with their ranges and defaults, and how each reads.
 
 ## Step 4: Self-check
 
@@ -497,9 +521,10 @@ nxs upload ./<name>/<name>.py -o <name>.nxs
 ```
 
 1. `check` judges the shape against the schema and names the file and key of anything wrong, a mode table that is missing included. It passes with `personality <name>: cam · <compatible> · <N> mode(s)` and `ok`.
-2. The compile prints the budget: bytes per block, the dispatch overhead per `select()`, the trailer. Bytecode sits under 4096 B and the trailer under 2048 B. Over the cap: drop the least useful mode with its table and say so on the card; never trim a table.
-3. Arithmetic, by hand, per mode: `lanes × rate_mbps × 10^6 ≥ width × height × bit_depth × fps × 1.15`; the datasheet's top rate is at or above the mode's; table-only, `pix_clk_hz / (line_length × max_fps) ≥ height`; `sony_imx`, `inck_hz / (hmax × vmax)` of the `sony:` row reproduces the row's `max_fps` within 1 %, `timing.hmax` equals the row's `hmax`, and `pix_clk_hz` is a whole multiple of `inck_hz`. A miss is a transcription error in the YAML, never a reason to change a table.
+2. The compile prints the budget: bytes per block, the dispatch overhead per `select()`, the parameters against 16, the trailer. Bytecode sits under 4096 B and the trailer under 4096 B. Over the cap: drop the least useful mode with its table and say so on the card; never trim a table.
+3. Arithmetic, by hand, per mode: `lanes × rate_mbps × 10^6 ≥ width × height × bit_depth × fps × 1.15`; the datasheet's top rate is at or above the mode's; table-only, `pix_clk_hz / (line_length × max_fps) ≥ height`; `sony_imx`, `inck_hz / (hmax × vmax)` of the `sony:` row reproduces the row's `max_fps` within 1 %, `timing.hmax` equals the row's `hmax`, and `pix_clk_hz` is a whole multiple of `inck_hz`. A miss is a transcription error in the YAML, never a reason to change a table. For a chart, `output_delay_us + (output_delay_lines + Σ output_delay_regs) × 1H` reproduces the t_TGDLY figure the datasheet prints within one line.
 4. Every offered mode has a table, every table row fits `reg_bits` and `val_bits`, and the identity value has `device_id_width` bytes.
+5. `nxs personality records ./<name>` lists the PARAMS rows: `exposure`, `fps`, `gain` and the rows the part offers. A row the facts promise and the list lacks is a YAML or class error.
 
 ## Step 5: Report
 
@@ -510,11 +535,11 @@ nxs personality: <name> — cam
 
   files     ./<name>/<name>.py · ./<name>/<name>.yaml
   tables    ./<name>/<name>_init.yaml · ./<name>/<name>_<mode>.yaml[ · …]
-  family    <generic|sony_imx>
+  family    <generic|sony_imx|native>
   address   0x<addr> · registers <reg_bits>-bit · values <val_bits>-bit
   modes     <mode> <W>x<H> RAW<n> <lanes>-lane <fps> fps[ · …]
-  trigger   freerun[ · fast]
-  budget    <n> B bytecode of 4096 · trailer <n> B of 2048
+  trigger   freerun[ · fast | fast (no timing chart: no readout delay)]
+  budget    <n> B bytecode of 4096 · trailer <n> B of 4096
 
   nxs personality check ./<name>
   nxs upload ./<name>/<name>.py -o <name>.nxs

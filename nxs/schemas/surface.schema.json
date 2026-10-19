@@ -181,15 +181,10 @@
                       "type": "string"
                     },
                     "kind": {
+                      "description": "declare: the knobs that declare the node; rows: one block's rows, its label the block it speaks for.",
                       "enum": [
                         "declare",
-                        "camera",
-                        "sync",
-                        "gain",
-                        "sensor",
-                        "mount",
-                        "egress",
-                        "firmware"
+                        "rows"
                       ]
                     },
                     "unit": {
@@ -481,7 +476,7 @@
                     },
                     "personalities": {
                       "type": "array",
-                      "description": "The personalities the unit holds, read after the walk, every one the same shape: the one it measures with (`sensor`) and the one a camera run executes (`camera`, with its slot, compatible, mode values and last run). A kind the unit does not hold is not listed.",
+                      "description": "The personalities the unit holds, read after the walk, every one the same shape: the one it measures with (`sensor`) and the one a camera run executes (`camera`, with its slot, compatible, mode values and its unit door's state). A kind the unit does not hold is not listed.",
                       "items": {
                         "type": "object",
                         "additionalProperties": false,
@@ -947,6 +942,31 @@
         }
       }
     },
+    "map_check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract", "unit", "camera_door", "ok", "naks", "checks"],
+      "properties": {
+        "contract": {"$ref": "#/$defs/contract"},
+        "unit": {"type": ["string", "null"], "description": "The unit the map belongs to, null for a smart camera, which serves the map alone."},
+        "camera_door": {"type": "integer", "description": "The camera door's I\u00b2C address, one above the unit door's."},
+        "ok": {"type": "boolean"},
+        "naks": {"type": "integer", "description": "NAKs the device answered while it mastered its own bus, each repeated after the wait."},
+        "checks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "ok", "detail"],
+            "properties": {
+              "name": {"type": "string"},
+              "ok": {"type": "boolean"},
+              "detail": {"type": "string"}
+            }
+          }
+        }
+      }
+    },
     "tree": {
       "title": "nxs status --json (bare: the declaration against the rig)",
       "type": "object",
@@ -1037,8 +1057,17 @@
               "hub": {
                 "type": "string"
               },
+              "hub_node": {
+                "type": "string",
+                "description": "The hub node's name in the declaration."
+              },
               "driver": {
-                "type": "string"
+                "type": "string",
+                "description": "Who runs the hub from this host: `nxs`, `kernel`, or `module` when a module masters the hub's bus and this host takes its stream alone."
+              },
+              "owner": {
+                "type": "string",
+                "description": "The node that masters the hub's bus when this host does not."
               },
               "findings": {
                 "type": "array",
@@ -1135,6 +1164,166 @@
                 "type": "boolean",
                 "description": "The unit was not read: its port's bus stayed another run's past the wait (nxsd while it brings the ports up after boot), and a unit not reached is not absent."
               }
+            }
+          }
+        },
+        "graph": {
+          "$ref": "#/$defs/graph"
+        }
+      }
+    },
+    "graph": {
+      "title": "the declaration as its graph: every node against the rig, and every connection (nxs status --json, graph)",
+      "description": "A read-only view, the one an editor of the declaration renders. A node's state is what the rig answers for it: present, absent, or unknown where nothing read it.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "nodes",
+        "connections"
+      ],
+      "properties": {
+        "nodes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "kind",
+              "type",
+              "parameters",
+              "state",
+              "findings"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "kind": {
+                "enum": ["host", "hub", "unit", "camera", "click", "module"],
+                "description": "The kind its type's description gives the node."
+              },
+              "type": {
+                "type": "string"
+              },
+              "parameters": {
+                "type": "object",
+                "description": "The rows and the identity pins the node declares, each in the row's display form."
+              },
+              "state": {
+                "enum": ["present", "absent", "unknown"]
+              },
+              "port": {
+                "type": "string",
+                "description": "The host's camera connector the node's chain feeds."
+              },
+              "findings": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/finding"
+                }
+              }
+            }
+          }
+        },
+        "connections": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "from",
+              "to"
+            ],
+            "properties": {
+              "from": {
+                "type": "string",
+                "description": "The source port, <node>.<port>."
+              },
+              "to": {
+                "type": "string",
+                "description": "The port it feeds, <node>.<port>."
+              }
+            }
+          }
+        }
+      }
+    },
+    "describe": {
+      "title": "nxs describe <type> --json: a node type's description",
+      "description": "What a node of the type offers an editor, from its description alone: its kind, its ports with their types and directions, the identity pins it takes, and its rows with the values each admits in the form a declaration writes. A personality's rows come from its records, a hub's ports from its program's PORTS record, a host's connectors from its plugin, a unit's ports from the contract.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract", "type", "kind", "name", "product", "live", "pins", "ports", "parameters"],
+      "properties": {
+        "contract": {"$ref": "#/$defs/contract"},
+        "type": {"type": "string"},
+        "kind": {"enum": ["host", "hub", "unit", "camera", "click", "module"]},
+        "name": {"type": "string", "description": "The model its compatible names."},
+        "product": {"type": "string", "description": "The product name the block carries, empty for none."},
+        "live": {"type": "boolean", "description": "False for a unit described from the contract alone, its rows unread."},
+        "pins": {
+          "type": "array",
+          "items": {"enum": ["address", "serial", "firmware"]},
+          "description": "The identity fields a declaration asserts on the block."
+        },
+        "ports": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "type", "direction"],
+            "properties": {
+              "name": {"type": "string"},
+              "type": {"enum": ["csi", "gmsl", "i2c", "cyphal-can", "cyphal-serial", "usb", "uart", "head", "click"]},
+              "direction": {"enum": ["input", "output", "bus"]},
+              "feeds": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "The port types a source feeds besides its own: a head feeds a link and a camera connector."
+              },
+              "attributes": {
+                "type": "object",
+                "additionalProperties": {"type": "string"},
+                "description": "The row that states each attribute of the port, by attribute."
+              }
+            }
+          }
+        },
+        "buses": {
+          "type": "array",
+          "description": "The ports a host offers by its devices' names, one entry per form: an I²C adapter i2c-<N>, a CAN interface can<N>, a serial device tty<name> or a /dev/serial/by-id/ name, with the row each attribute takes.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "type", "direction"],
+            "properties": {
+              "name": {"type": "string"},
+              "type": {"type": "string"},
+              "direction": {"enum": ["input", "output", "bus"]},
+              "attributes": {"type": "object", "additionalProperties": {"type": "string"}}
+            }
+          }
+        },
+        "parameters": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "kind", "default", "applicable"],
+            "properties": {
+              "name": {"type": "string"},
+              "kind": {"enum": ["apply", "run", "gate", "trigger"]},
+              "id": {"type": "string", "description": "The standard id of the row, absent for a row offered by name."},
+              "unit": {"type": "string"},
+              "values": {"type": "array", "items": {"type": "string"}, "description": "The values admitted, in display form."},
+              "minimum": {"type": "string"},
+              "maximum": {"type": "string"},
+              "step": {"type": "string"},
+              "default": {"type": "string"},
+              "read_only": {"type": "boolean"},
+              "applicable": {"type": "boolean", "description": "False for a row no declaration sets, with the finding that says why."},
+              "finding": {"type": "string"}
             }
           }
         }
@@ -1488,6 +1677,19 @@
             "string",
             "null"
           ]
+        },
+        "migrated": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Where the earlier declaration, api 2 or the 1.0 form, is kept when generate wrote it again in api 3."
+        },
+        "undeclared": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         },
         "ports": {
           "type": "array",

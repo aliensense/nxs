@@ -16,6 +16,9 @@ from nxs.dsl.emit import BUS_REGISTER, _TraceReadValue, _load_spec_byte
 from nxs.dsl.errors import CompileError
 from nxs.dsl.loop import _ASTCompiler
 
+# One inline burst's run, one bus transaction. The hub images pin this split.
+BURST_RUN_MAX = 128
+
 
 class RegisterClickPersonality(ClickPersonality):
     """Base class for sensors on a register bus (I²C, SPI). Without ``FRAME``,
@@ -314,21 +317,19 @@ class RegisterClickPersonality(ClickPersonality):
         return bytes(count)
 
     def _write_burst(self, reg: int, payload: bytes, dev=None) -> None:
-        """Burst-write `payload` to consecutive registers from `reg`, staged
-        through sample_buf then OP_REG_WRITE_BURST (`write_table`'s runs)."""
+        """Burst-write `payload` to consecutive registers from `reg` as one
+        OP_REG_WRITE_BURST_IMM, the payload inline (`write_table`'s runs)."""
         if self.FRAME is not None:
             raise CompileError(
                 "write_table with a FRAME schema is not supported; write the "
                 "framed registers one by one with self.write(...)")
-        if len(payload) > _ASTCompiler.VM_SAMPLE_BUF_SIZE:
+        if len(payload) > BURST_RUN_MAX:
             raise CompileError(
-                f"write_table run of {len(payload)} B exceeds the "
-                f"{_ASTCompiler.VM_SAMPLE_BUF_SIZE}-byte sample buffer")
+                f"write_table run of {len(payload)} B exceeds the {BURST_RUN_MAX}-byte burst")
         addr = self._companion_addr(dev) if dev is not None else None
-        self._emitter.emit(Op.MEMCPY_IMM, 0, len(payload), *payload)
         if addr is not None:
             self._emitter.emit(Op.I2C_TARGET, addr)
-        self._emitter.emit_reg(Op.REG_WRITE_BURST, reg, 0, len(payload))
+        self._emitter.emit_reg(Op.REG_WRITE_BURST_IMM, reg, len(payload), *payload)
         if addr is not None:
             self._emitter.emit(Op.I2C_TARGET, 0)
 
@@ -384,11 +385,13 @@ class RegisterClickPersonality(ClickPersonality):
 
     def write_table(self, rows, dev=None) -> None:
         """Write `(reg, value)` rows in order: a run of consecutive registers
-        becomes one `REG_WRITE_BURST` (chunked to the sample buffer), a lone
-        8-bit value a `REG_WRITE`; values wider than a byte (the profile's
-        `data_width`) always go by burst, packed in the profile's byte
-        order. A `(SLEEP_ROW, ms)` row (a table's `{sleep_ms: N}` marker)
-        ends the run and sleeps."""
+        becomes one `REG_WRITE_BURST_IMM`, its bytes inline (split at
+        `BURST_RUN_MAX` bytes, one bus transaction each), a lone 8-bit value a
+        `REG_WRITE`; values wider than a byte (the profile's `data_width`)
+        always go by burst, packed in the profile's byte order. A
+        `(SLEEP_ROW, ms)` row (a table's `{sleep_ms: N}` marker) ends the run
+        and sleeps. A companion's table (`dev=`) is retargeted once around its
+        rows, not around each."""
         rows = [(r if r == SLEEP_ROW else int(r), int(v)) for r, v in rows]
         prof = self._i2c_profile()
         width = prof.data_width
@@ -402,7 +405,7 @@ class RegisterClickPersonality(ClickPersonality):
                     f"write_table: value 0x{val:X} at register 0x{reg:X} "
                     f"does not fit the {8 * width}-bit register value the "
                     f"profile declares")
-        max_regs = _ASTCompiler.VM_SAMPLE_BUF_SIZE // width
+        max_regs = BURST_RUN_MAX // width
         run: List[Tuple[int, int]] = []
 
         def flush():
@@ -410,13 +413,16 @@ class RegisterClickPersonality(ClickPersonality):
                 return
             start = run[0][0]
             if len(run) == 1 and width == 1:
-                self.write(start, run[0][1], dev=dev)
+                self.write(start, run[0][1])
             else:
                 payload = b"".join(v.to_bytes(width, prof.byte_order)
                                    for _, v in run)
-                self._write_burst(start, payload, dev=dev)
+                self._write_burst(start, payload)
             run.clear()
 
+        addr = self._companion_addr(dev) if dev is not None else None
+        if addr is not None:
+            self._emitter.emit(Op.I2C_TARGET, addr)
         for reg, val in rows:
             if reg == SLEEP_ROW:
                 flush()
@@ -426,6 +432,8 @@ class RegisterClickPersonality(ClickPersonality):
                 flush()
             run.append((reg, val))
         flush()
+        if addr is not None:
+            self._emitter.emit(Op.I2C_TARGET, 0)
 
 
 #: The register slot of a table row that is a settle, not a write: a

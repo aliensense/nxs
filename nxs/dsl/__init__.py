@@ -22,6 +22,10 @@ from nxs.dsl.fields import (
     PWM_FREQ_MAX_HZ,
     ParamDescriptor,
     PatchEntry,
+    Port,
+    PortDirection,
+    PortType,
+    Show,
 )
 from nxs.dsl.values import U32_MAX, RunValue
 from nxs.dsl.compiled import ImageKind, CompiledDriver, compile_report, Sample
@@ -39,6 +43,7 @@ from nxs.dsl.base import ClickPersonality
 from nxs.dsl.register import RegisterClickPersonality, SLEEP_ROW, _source_dir, load_table
 from nxs.dsl.camera import CamPersonality
 from nxs.dsl.hub import HubDevice
+from nxs.dsl.host import HostDevice
 from nxs.dsl.stream import (
     I2cCommandClickPersonality,
     StreamClickPersonality,
@@ -66,6 +71,10 @@ __all__ = [
     "PWM_FREQ_MAX_HZ",
     "ParamDescriptor",
     "PatchEntry",
+    "Port",
+    "PortDirection",
+    "PortType",
+    "Show",
     "U32_MAX",
     "RunValue",
     "ImageKind",
@@ -83,6 +92,7 @@ __all__ = [
     "load_table",
     "CamPersonality",
     "HubDevice",
+    "HostDevice",
     "I2cCommandClickPersonality",
     "StreamClickPersonality",
     "ChecksumDescriptor",

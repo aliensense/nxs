@@ -1,18 +1,20 @@
-"""What firmware a device runs: the register-map contract it speaks, the version floor this tool drives, and the verdict on a push."""
+"""What firmware a device runs: the host interface it speaks, the version floor this tool drives, and the verdict on a push."""
 
 import os
 import re
 import time
 from typing import Optional
 
+from nxs._generated_constants import NxsDriverImage, NxsMap
 
-# Highest register-map contract version this SDK understands; bump it only
-# when this code speaks a new contract version.
-SUPPORTED_PROTO_VERSION = 1
+#: The host interface this SDK speaks, `PROTO_VERSION` (Interface Description §2).
+SUPPORTED_PROTO_VERSION = NxsMap.PROTO_VERSION_VALUE
+#: The first host interface, its 8-bit register map: `nxs switch` upgrades such a device.
+FIRST_PROTO_VERSION = 1
 
 def contract_mismatch(transport, *, unreadable_is_skew: bool = False) -> Optional[str]:
-    """None when the device speaks this SDK's register-map contract or serves
-    no version, else a one-line description of the skew. Pass
+    """None when the device speaks this SDK's host interface or serves no
+    version, else a one-line description of the skew. Pass
     `unreadable_is_skew=True` before mutating."""
     reader = getattr(transport, "interface_version", None)
     if reader is None:
@@ -23,18 +25,21 @@ def contract_mismatch(transport, *, unreadable_is_skew: bool = False) -> Optiona
         return None
     except (OSError, RuntimeError) as e:
         if unreadable_is_skew:
-            return f"could not read the device's register-map version ({e})"
+            return f"could not read the device's interface version ({e})"
         return None
     if ver is None or ver == SUPPORTED_PROTO_VERSION:
         return None
-    return (f"device speaks register-map v{ver}; this nxs speaks "
-            f"v{SUPPORTED_PROTO_VERSION} only")
+    if ver == FIRST_PROTO_VERSION:
+        return (f"device speaks interface version {ver}, the first interface; this nxs speaks "
+                f"version {SUPPORTED_PROTO_VERSION}, and nxs switch upgrades the device")
+    return (f"device speaks interface version {ver}; this nxs speaks "
+            f"version {SUPPORTED_PROTO_VERSION} only")
 
-# The oldest firmware this wheel drives: the image format the compiler emits
-# and the camera-run surface both arrived with it. Older units are refused
+# The oldest firmware this wheel drives: the release the compiler's image
+# format arrived with, the format's MAJOR.MINOR. Older units are refused
 # with the push that ends the mismatch; the asset is the release's
 # production-signed firmware.
-MIN_FIRMWARE = "1.1.0"
+MIN_FIRMWARE = f"{NxsDriverImage.NXS_MAJOR}.{NxsDriverImage.NXS_MINOR}.0"
 
 MIN_FIRMWARE_ASSET = f"nxs-v{MIN_FIRMWARE}-firmware.bin"
 
@@ -142,10 +147,12 @@ def read_identity(transport):
     except Exception:
         return None
 
-def update_verdict(before, after, pushed_version, confirmed=None, pushed_identity=None):
+def update_verdict(before, after, pushed_version, confirmed=None, pushed_identity=None,
+                   next_step="check the device log"):
     """What a push achieved, from the identities read either side of it, as
     `(ok, line)`. When `pushed_identity` is known the device serving it
-    afterwards is the proof; `confirmed` False proves it is running."""
+    afterwards is the proof; `confirmed` False proves it is running.
+    `next_step` closes the line of a push the device did not keep."""
     from nxs.suite.schema import device_runs, parse_version
     if after is None:
         return False, "✗ the device answers but reports no firmware version"
@@ -154,7 +161,7 @@ def update_verdict(before, after, pushed_version, confirmed=None, pushed_identit
         # `confirmed` only annotates a verdict that already matches.
         if after != pushed_identity:
             return False, (f"✗ rejected or reverted: the device still reports {after}; "
-                           f"the pushed image is {pushed_identity} — check the device log")
+                           f"the pushed image is {pushed_identity} — {next_step}")
         test = " (running in TEST until confirmed)" if confirmed is False else ""
         if before != after:
             return True, f"✓ updated: {before or 'unknown'} → {after}{test}"
@@ -166,7 +173,7 @@ def update_verdict(before, after, pushed_version, confirmed=None, pushed_identit
     if device_runs(after, parse_version(pushed_version.split("+", 1)[0])):
         return True, f"✓ unchanged: the device already ran {after}"
     return False, (f"✗ rejected or reverted: the device still reports {after} "
-                   f"after the push of {pushed_version} — check the device log")
+                   f"after the push of {pushed_version} — {next_step}")
 
 def push_and_verify(transport, bin_path, pushed_version, progress_cb=None, before=None):
     """Push an image, wait for the reboot, and judge what it achieved as
@@ -174,7 +181,13 @@ def push_and_verify(transport, bin_path, pushed_version, progress_cb=None, befor
     downgrade check."""
     from nxs import mcuboot_image
     with open(bin_path, "rb") as fh:
-        pushed_identity = mcuboot_image.identity(fh.read())
+        data = fh.read()
+    pushed_identity = mcuboot_image.identity(data)
+    # A released unit's bootloader takes the production key alone and boots
+    # the image it held before: the key is the reason a push did not stay.
+    foreign = mcuboot_image.foreign_key(data)
+    next_step = (f"its signing key ({foreign[:16]}…) is not the production key, the only key a "
+                 f"released unit's bootloader takes" if foreign else "check the device log")
     if before is None:
         before = read_identity(transport)
     # The client's push returns once the unit is back from its reboot; the
@@ -185,5 +198,5 @@ def push_and_verify(transport, bin_path, pushed_version, progress_cb=None, befor
                        f"within {DFU_REBOOT_TIMEOUT_S:.0f} s — check the device log"), None
     after = read_identity(transport)
     ok, line = update_verdict(before, after, pushed_version, transport.read_fw_confirmed(),
-                              pushed_identity)
+                              pushed_identity, next_step)
     return ok, line, after

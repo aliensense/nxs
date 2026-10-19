@@ -40,13 +40,12 @@ def _call(fn, *args, **kwargs):
 
 
 def _law_module(hub, descriptor):
-    chip_module = getattr(hub, "chip_module", None)
-    if chip_module is not None:
-        module = chip_module(descriptor.compatible)
-        if module is not None:
-            return module
-    from . import chips
-    return chips.bind(descriptor)
+    """The laws of the descriptor's sensor as the hub knows it, else the
+    family the descriptor's own facts name."""
+    from . import laws as cam_laws
+
+    module = cam_laws.laws(hub.descriptor(descriptor.compatible)) if hub is not None else None
+    return module if module is not None else cam_laws.bind(descriptor)
 
 
 def _lane_law(hub):

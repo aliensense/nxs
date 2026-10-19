@@ -53,6 +53,7 @@ from nxs.target_cli import (
     _platform_ports,
     _resolve_default_link,
 )
+from nxs.map_cli import cmd_map, map_answers_alone
 from nxs.unit_cli import (
     _bare_timesync,
     _describe_target,
@@ -146,6 +147,7 @@ __all__ = [
     "cmd_store_ls",
     "cmd_store_rm",
     "cmd_stream",
+    "cmd_map",
     "cmd_timesync",
     "cmd_upload",
     "main",
@@ -157,7 +159,7 @@ def _is_mutating(args) -> bool:
     """True for verbs that change device state; the read forms of dual-mode
     verbs (`commission --show`, `store ls`) stay silent."""
     if args.command in ('upload', 'set', 'run',
-                        'push-fw', 'recover', 'reboot', 'confirm-fw'):
+                        'push-fw', 'recover', 'reboot', 'confirm-fw', 'map'):
         return True
     if args.command == 'store':
         return args.store_cmd != 'ls'
@@ -228,8 +230,8 @@ def suite_managed_note(name: str) -> str:
             f"keep it with `nxs tune --freeze --unit {name}`")
 
 
-# The verbs that must reach an off-contract device: `probe` reports the
-# version, `push-fw` and `recover` carry the firmware that ends the mismatch.
+# The verbs that must reach an off-contract device: `probe` reports the version, `push-fw` and
+# `recover` carry the firmware, `reboot` swaps it in and `confirm-fw` keeps it from reverting.
 VERSION_GATE_EXEMPT = ('probe', 'push-fw', 'recover', 'reboot', 'confirm-fw')
 
 
@@ -388,7 +390,8 @@ def build_parser():
     p_gen = sub.add_parser(
         'generate',
         help='Walk the rig and write hardware.yaml; seed suite.yaml when '
-             'there is none (the rig\'s nixos-generate-config)')
+             'there is none, and write an api-2 or 1.0 declaration again in api 3 '
+             '(the rig\'s nixos-generate-config)')
     p_gen.add_argument('-c', '--config', default=None,
                        help='Manifest path (default: the platform manifest)')
     p_gen.add_argument('--dry-run', action='store_true',
@@ -397,6 +400,10 @@ def build_parser():
     p_gen.add_argument('--json', action='store_true',
                        help='The walk as data: every port with the nodes that '
                             'answered on it, and what was written')
+
+    from nxs.describe import add_parser as add_describe_parser
+    add_describe_parser(sub)
+
     add_unit_parsers(sub)
 
     add_stream_parser(sub)
@@ -477,6 +484,10 @@ def _main():
     if args.command == 'generate':
         from nxs.generate import cmd_generate
         return cmd_generate(args)
+
+    if args.command == 'describe':
+        from nxs.describe import cmd_describe
+        return cmd_describe(args)
 
     if args.command == 'switch':
         from nxs.suite.switch import cmd_switch
@@ -576,6 +587,7 @@ def _main():
             'push-fw': cmd_push_fw,
             'timesync': cmd_timesync,
             'commission': cmd_commission,
+            'map': cmd_map,
         }
         if args.command == 'calibrate':
             from nxs.calibrate import cmd_calibrate
@@ -586,10 +598,12 @@ def _main():
     # A command reading live state misreports an unreachable node as empty;
     # `probe`/`status` and DFU are exempt, and an upload warns and proceeds.
     NEEDS_DEVICE = {'caps', 'get', 'set', 'stream', 'run', 'commission', 'store',
-                    'identify', 'calibrate'}
+                    'identify', 'calibrate', 'map'}
     RECOVERY_VERBS = {'upload'}
     command = args.command
-    if command in NEEDS_DEVICE | RECOVERY_VERBS and not t.probe():
+    # A smart camera answers no unit door: its check runs on the camera door alone.
+    if command in NEEDS_DEVICE | RECOVERY_VERBS and not t.probe() \
+            and not (command == 'map' and map_answers_alone(t, args)):
         # A unit at a camera link's alias that does not answer is named with
         # its port and the next command, an upload included: no attempt on
         # a silent I²C address reaches a unit.

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+import errno
+from typing import Any, Dict, List, Optional, Tuple
 
 
 
@@ -61,6 +62,29 @@ def _verify_hub_identity(hub, topology: Topology, i2c: CamI2c) -> None:
             f"nxs {_port_name(topology)} status")
 
 
+def verify_hub(hub, topology: Topology) -> None:
+    """The hub answers as the declared silicon (`_verify_hub_identity`),
+    read through a handle of its own before a walk's first write; a bus
+    that does not open is a hub that does not answer."""
+    if topology.is_direct:
+        return
+    i2c = CamI2c(addr=hex(topology.des_addr), bus=topology.i2c_bus)
+    try:
+        i2c.open()
+    except Exception as exc:
+        if isinstance(getattr(exc, "__cause__", None), PermissionError):
+            raise
+        raise _refuse(
+            f"hub at {topology.i2c_bus}:{hex(topology.des_addr)} does not answer "
+            f"({exc.__class__.__name__})",
+            "check DES power and cabling", f"nxs {_port_name(topology)} status",
+            "nxs generate (writes what answers on the port)") from exc
+    try:
+        _verify_hub_identity(hub, topology, i2c)
+    finally:
+        i2c.close()
+
+
 def acks(i2c: CamI2c, addr: int) -> bool:
     """Whether a device answers at ``addr`` (one register read)."""
     try:
@@ -68,6 +92,20 @@ def acks(i2c: CamI2c, addr: int) -> bool:
         return True
     except Exception:
         return False
+
+
+def unit_acks(i2c: CamI2c, addr: int, tries: int = 1) -> bool:
+    """Whether a unit answers at ``addr``: a one-byte read at register 0,
+    which every interface answers, up to `tries` times. A walk that judges a pod by one look tries as the
+    unit door's probe does (`nxs._libnxs_map.UNIT_PROBES`), since a pod's
+    answer can land inside its own transfer and NAK once."""
+    for _ in range(tries):
+        try:
+            i2c.read_reg(0x00, reg_width=8, data_width=8, addr=hex(int(addr)))
+            return True
+        except Exception:
+            continue
+    return False
 
 
 def answering_address(hub, i2c: CamI2c, link: LinkSpec) -> Tuple[int, bool]:
@@ -88,8 +126,9 @@ def detect_sensor(hub, i2c: CamI2c, link: LinkSpec) -> Tuple[Optional[str], Opti
     sensors answers with its id. Returns (compatible, detail); (None, None)
     when none does. The probe goes where the link's sensor answers: the
     alias its serializer maps while the port is up, else the link's
-    declared address, else each candidate's own."""
-    host = getattr(link, "host_addr", None)
+    declared address, else each candidate's own. Behind a pod the link's
+    host address is the unit's camera map, never the sensor."""
+    host = None if getattr(link, "nxs_units", ()) else getattr(link, "host_addr", None)
     declared = getattr(link, "sensor_addr", None)
     mapped = host is not None and acks(i2c, int(host))
     # The declared sensor is the hypothesis: it is tried first, so two heads
@@ -117,6 +156,57 @@ def detect_sensor(hub, i2c: CamI2c, link: LinkSpec) -> Tuple[Optional[str], Opti
     return None, None
 
 
+def map_head(hub, topology: Topology, link: LinkSpec) -> Dict[str, Any]:
+    """A pod's head as its camera map says it runs, never a read of the
+    sensor (R-10.2): the pod's serializer forwards the address a head
+    straps, so a read there could answer from the other link's head. The
+    presence walk's entry for the link: `sen` is the map's own answer at
+    the link's map address, and `sensor` is ok while the map serves the
+    declared personality's rows and runs a mode, READY or BUSY. An INERT
+    map has not configured its head, and a FAULT one faulted on its last
+    commit; a fault of a head that did not answer the pod (ENODEV at the
+    personality's address, EIO past the register retries) is the head's
+    absence, `head: silent` with the head's address on the pod's bus."""
+    from nxs._libnxs_map import MapState, open_door
+    from nxs.cam import pods, smart_camera
+    from nxs.cam.contracts import InfeasibleConfig
+    from nxs.cam.hubs import map_address, native_sensor_address
+
+    addr = int(map_address(hub, link))
+    declared = str(link.sensor_compatible)
+    entry: Dict[str, Any] = {"sen_addr": addr, "mapped": addr != int(link.nxs_units[0].map_target)}
+    line, running, serves, silent = "", False, None, False
+    try:
+        with open_door(topology.i2c_bus, addr) as cmap:
+            if smart_camera.answers(cmap):
+                boot = cmap.header()
+                line = smart_camera.map_line(cmap)
+                running = (boot["current_mode"] != 0xFF
+                           and boot["state"] in (MapState.READY, MapState.BUSY))
+                silent = (boot["state"] == MapState.FAULT
+                          and int(boot["error"]) in (errno.ENODEV, errno.EIO))
+                try:
+                    serves = smart_camera.serves(cmap, pods.declared_records(hub, link))
+                except InfeasibleConfig:
+                    serves = None       # this host holds no build of the declared personality
+    except OSError:
+        line = ""
+    if not line:
+        return {**entry, "sen": "no ACK",
+                "sensor": {"declared": declared, "detected": None, "detail": f"no ACK at {addr:#04x}",
+                           "ok": False, "text": f"{declared}: no camera door answers at {addr:#04x}"}}
+    if silent:
+        head = int(native_sensor_address(hub, link))
+        return {**entry, "sen": "present",
+                "sensor": {"declared": declared, "detected": None, "detail": line, "ok": False,
+                           "head": "silent", "head_addr": head,
+                           "text": f"{declared}: no head answers at {head:#04x} on the pod"}}
+    text = f"{line}; its rows are not {declared}'s" if serves is False else f"{declared} ({line})"
+    return {**entry, "sen": "present",
+            "sensor": {"declared": declared, "detected": declared if serves else None, "detail": line,
+                       "ok": running and serves is not False, "text": text}}
+
+
 def sensor_identity_line(link: LinkSpec, declared_desc, detected: Optional[str],
                          detail: Optional[str]) -> Tuple[bool, str]:
     """The probe's verdict on a link's sensor: (ok, text)."""
@@ -133,8 +223,13 @@ def sensor_identity_line(link: LinkSpec, declared_desc, detected: Optional[str],
 
 
 def _require_nxs_hub(topology: Topology, verb: str) -> None:
-    """Write verbs refuse a kernel-owned hub; a second register writer races
-    the kernel driver."""
+    """Write verbs refuse a hub this host does not master: a kernel driver's,
+    which a second register writer races, or a module's, whose bus this
+    host does not touch."""
+    if topology.hub_driver == "module":
+        raise _refuse(f"port {_port_name(topology)}'s hub is a module's, which masters its bus: "
+                      f"{verb} is not this host's to run",
+                      f"nxs {_port_name(topology)} status")
     if topology.hub_driver != "nxs":
         raise _refuse(f"port {_port_name(topology)}'s hub is kernel-managed: "
                       f"{verb} is not its to run",
@@ -143,17 +238,17 @@ def _require_nxs_hub(topology: Topology, verb: str) -> None:
 
 def _declared_camera(hub, topology: Topology, links: List[LinkSpec],
                      modes: Dict[str, str], args) -> Dict[str, str]:
-    """Fill the mode from the manifest's camera declaration where no `--mode`
-    names one. A declared free-run fps (a link's, else the port's) is the
-    flows' to resolve per link against the lawful range; under a declared
-    frame sync the rate is the generator's, applied after `on`."""
+    """Fill the mode from the declaration's camera nodes where no `--mode`
+    names one. A camera node's free-run fps is the flows' to resolve per
+    link against the lawful range; under a declared frame sync the rate is
+    the generator's, applied after `on`."""
     from nxs.cam.descriptors import resolve_mode
 
     modes = dict(modes)
     for link in links:
         if link.name in modes or not link.has_camera:
             continue
-        token = link.mode or topology.camera_mode
+        token = link.mode
         if token is None:
             continue
         send = hub.descriptor(link.sensor_compatible)

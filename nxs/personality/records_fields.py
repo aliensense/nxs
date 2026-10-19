@@ -6,7 +6,7 @@ import struct
 import zlib
 from typing import Any, Dict, List, Tuple
 
-from nxs._generated_constants import NxsDriverImage
+from nxs._generated_constants import NxsMap, NxsDriverImage
 from nxs.cam.contracts import ContractError
 from nxs.cam.descriptors import Descriptor, to_int
 
@@ -19,7 +19,11 @@ RETIRED_RECORDS = frozenset(TrailerRecord.RETIRED)
 IDENTITY = TrailerRecord.IDENTITY
 PROGRAM = TrailerRecord.PROGRAM
 TRIGGERS = TrailerRecord.TRIGGERS
-RUN_PARAMS = TrailerRecord.RUN_PARAMS
+CAMERA_MAP = TrailerRecord.CAMERA_MAP
+PARAMS = TrailerRecord.PARAMS
+OUTPUTS = TrailerRecord.OUTPUTS
+PORTS = TrailerRecord.PORTS
+PRESENTATION = TrailerRecord.PRESENTATION
 
 #: The enum params a cam personality dispatches on, by the name its
 #: behaviour class declares them under; the wire carries their indices.
@@ -33,13 +37,17 @@ ACTION_PARAM = "action"
 LINE_TIME_PARAM = "line_time"          # ns
 FRAME_PERIOD_PARAM = "frame_period"    # ns
 FRAME_LENGTH_PARAM = "frame_length"    # lines, what the run achieved
-#: What a run does: the whole program (the tables, the timing, the start),
-#: a standby, a start from standby, or the timing program alone (the
-#: staged line and frame periods written under standby, then the start).
-ACTIONS: Dict[str, int] = {"configure": 0, "park": 1, "start": 2, "timing": 3}
+#: The run parameters the camera map stages for an apply, written under the group hold with
+#: the staged frame length; the gain is in the capture stack's unit, `GAIN_FACTOR` units per decibel.
+EXPOSURE_PARAM = "exposure"            # lines
+GAIN_PARAM = "gain"                    # the capture stack's gain unit
+#: What a run does, numbered as `CamAction`: the whole program, a standby, a start from standby,
+#: the timing program under standby, the apply under the group hold, or the trigger conversion.
+ACTIONS: Dict[str, int] = {"configure": 0, "park": 1, "start": 2, "timing": 3,
+                           "apply": 4, "trigger": 5}
 
 #: Law families by wire id; a descriptor naming no family is generic.
-FAMILY_IDS: Dict[str, int] = {"generic": 1, "sony_imx": 2}
+FAMILY_IDS: Dict[str, int] = {"generic": 1, "sony_imx": 2, "native": 3}
 _FAMILY_NAMES = {v: k for k, v in FAMILY_IDS.items()}
 
 #: The kernel control vocabulary: every row a law family emits, by wire
@@ -68,17 +76,14 @@ PIXEL_PHASES = ("rggb", "grbg", "gbrg", "bggr")
 _SYNC_ROLES = ("master", "slave")
 _TRIGGER_SLOTS = ("freerun", "fast", "sequential")
 
-#: Payload caps the records inherit from their length fields.
+#: The payload cap a record's names inherit from their length fields.
 MAX_NAME = 32
-MAX_COMPATIBLE = 48
 _NONE_U16 = 0xFFFF
 _NONE_U8 = 0xFF
 
 _MODE_FLAG_DEFAULT = 0x01
 _MODE_FLAG_TRIGGERABLE = 0x02
 _MODE_FLAG_SERIALIZER_CSI = 0x04
-_IDENTITY_FLAG_TAKES_TRIGGER = 0x01
-_IDENTITY_FLAG_PULSE_EXPOSURE = 0x02
 _PROGRAM_FLAGS = ("timing_start", "trigger_switch", "fast_trigger",
                   "sync_switch", "restart", "start", "stop_ms", "hmax_live")
 #: A mode's timing facts, in presence-bit order, with the struct format of
@@ -97,22 +102,27 @@ _RETIRED_TIMING = frozenset({"vmax_clean", "vmax_jump_threshold", "trigger_vmax"
 #: The law families' `limits`, in presence-bit order: scalars with their
 #: struct format, "n" for a number carried as nanoseconds, "g" for the gain
 #: law, "w" for the wait table, "i" for the floor's wait indices, "d" for
-#: a delta that is one value or a table, "t" for a table by readout kind.
+#: a delta that is one value or a table, "t" for a table by readout kind,
+#: "f" for the fast-trigger chart (the output delay as ns u32 and lines u8,
+#: then its wait indices and the exposure's), "m" for the modes' own waits
+#: (count u8, then per mode its index u8 and a wait table). A decoder reads
+#: the fields it knows and never looks past them, so a field appended here
+#: reaches an older tool as bytes it ignores; a field inserted would not.
 _LAW_FIELDS = (("inck_hz", "I"), ("integration_offset_us", "n"),
                ("min_integration_lines", "H"), ("gain_max", "I"),
                ("gain_reg_per_db", "g"), ("gain_hcg_reg_min", "I"),
                ("min_fps", "q"), ("captured_waits", "w"),
                ("shs_floor_regs", "i"), ("min_frame_length_delta", "d"),
-               ("frame_length_delta_const", "t"), ("shs_floor", "H"))
+               ("frame_length_delta_const", "t"), ("shs_floor", "H"),
+               ("fast_trigger", "f"), ("mode_waits", "m"))
+#: The chart's two register lists, in wire order.
+_CHART_REG_LISTS = ("output_delay_regs", "exposure_regs")
 _DELTA_SCALAR = 1
 _DELTA_TABLE = 2
 
-_IDENTITY_HEAD = struct.Struct("<BBBBHBHHB")
 _MODES_HEAD = struct.Struct("<BB")
 _MODE_HEAD = struct.Struct("<BHHBBHBBBBH")
 _TRIGGERS_HEAD = struct.Struct("<BB")
-_RUN_PARAMS_HEAD = struct.Struct("<B")
-_RUN_PARAM = struct.Struct("<BIII")
 _CONTROL_ROW = struct.Struct("<BHBBBIIII")
 _LAWS_HEAD = struct.Struct("<BH")
 _CAPTURE_HEAD = struct.Struct("<IIBIiiIiHHIIIIIIIB")
@@ -122,6 +132,36 @@ _CAPTURE_HEAD = struct.Struct("<IIBIiiIiHHIIIIIIIB")
 #: decoder takes the row size from the record's length.
 _CAPTURE_ENTRY = struct.Struct("<HHBBIIIB")
 _CAPTURE_ENTRY_V1 = struct.Struct("<HHBBIII")
+#: The CAMERA_MAP record, the camera law a pod converts its PARAMS rows
+#: with: mode count u8, gain factor u16 (capture units per decibel), the
+#: run-value indices in `_CAMERA_MAP_PARAM_NAMES` order (0xFF absent), the
+#: law head (gain min / max / step in capture units u16, frame length max
+#: u32, exposure min u32, exposure margin u16, in lines), one law row per
+#: unit mode (line time ns u32, frame length floor u32), then one
+#: `ModeEntry` row per unit mode (width u16, height u16, bit depth u8,
+#: lanes u8, rate u16, data type u8, flags u8, max fps x1000 u32, mode
+#: value u8, pixel phase u8: the `PIXEL_PHASES` index, 0xFF none).
+_CAMERA_MAP_HEAD = struct.Struct("<BH")
+_CAMERA_MAP_PARAMS = struct.Struct("<11B")
+_CAMERA_MAP_LAW = struct.Struct("<HHHIIH")
+_CAMERA_MAP_LAW_MODE = struct.Struct("<II")
+_CAMERA_MAP_MODE = struct.Struct("<HHBBHBBIBB")
+_MODE_ENTRY_FIELDS = ("width", "height", "bit_depth", "lanes", "rate_mbps", "data_type", "flags",
+                      "max_fps_milli", "value", "phase")
+
+
+def mode_entries(rows: bytes) -> List[Dict[str, int]]:
+    """The `ModeEntry` rows of a CAMERA_MAP record decoded, one dict per
+    mode in the record's order: `width`, `height`, `bit_depth`, `lanes`,
+    `rate_mbps`, `data_type`, `flags`, `max_fps_milli`, `value`, `phase`."""
+    size = _CAMERA_MAP_MODE.size
+    return [dict(zip(_MODE_ENTRY_FIELDS, _CAMERA_MAP_MODE.unpack_from(rows, at)))
+            for at in range(0, len(rows) - len(rows) % size, size)]
+_CAMERA_MAP_PARAM_NAMES = (ACTION_PARAM, EXPOSURE_PARAM, FRAME_LENGTH_PARAM, GAIN_PARAM,
+                           TRIGGER_PARAM, "test_pattern", LINE_TIME_PARAM, MODE_PARAM,
+                           FRAME_PERIOD_PARAM, "black_level", "flips")
+assert _CAMERA_MAP_PARAMS.size == len(_CAMERA_MAP_PARAM_NAMES)
+assert _CAMERA_MAP_MODE.size == NxsMap.MODE_ENTRY_SIZE
 _CAPTURE_FLAG_CLOCK_NONCONTINUOUS = 0x01
 _PROGRAM_HEAD = struct.Struct("<BHHHBB")
 _PROGRAM_REPAIR = struct.Struct("<HBBI")
@@ -210,12 +250,12 @@ def _read_table(data: bytes, pos: int, what: str) -> Tuple[Dict[str, int], int]:
     return table, pos
 
 def _family_name(descriptor: Descriptor) -> str:
-    from nxs.cam import chips
-    return chips.family_for(descriptor)
+    from nxs.cam import laws
+    return laws.family_for(descriptor)
 
 def _surface(descriptor: Descriptor):
-    from nxs.cam import chips
-    return chips.bind(descriptor)
+    from nxs.cam import laws
+    return laws.bind(descriptor)
 
 def _register_spec(descriptor: Descriptor, name: str) -> Tuple[int, int, int]:
     spec = descriptor.registers[name]

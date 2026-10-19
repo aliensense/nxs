@@ -10,6 +10,12 @@ from nxs.dsl.fields import MAX_PARAMS, MAX_PATCH_SITES, MAX_TRAILER_SIZE, ParamD
 
 
 ImageKind = NxsDriverImage.ImageKind
+#: The kinds that sample: their PARAMS rows are the VM's parameters, the
+#: stream row among them.
+SAMPLING_KINDS = frozenset({ImageKind.CLICK, ImageKind.MODULE})
+#: The kinds the host executor runs, under its own program budget, and the
+#: host's own description; a unit's store never takes them.
+HOST_KINDS = frozenset({ImageKind.HUB, ImageKind.GRAPH, ImageKind.HOST})
 
 # ── Compiled output ─────────────────────────────────────────
 
@@ -33,12 +39,12 @@ class CompiledDriver:
     # Bus-config trailer: one register-access profile per supported bus.
     # None means no trailer (a stream personality with no UART profile).
     bus_config: Optional[list] = None
-    # Image kind (`ImageKind.DRIVER` measures; `CAMERA` runs once under the
+    # Image kind (`ImageKind.CLICK` measures; `CAMERA` runs once under the
     # host's token) and the header flag byte.
-    kind: int = ImageKind.DRIVER
+    kind: int = ImageKind.CLICK
     flags: int = 0
-    # A sealed section reads back opaque: the CTR nonce and, in `bytecode`,
-    # the ciphertext; the required minor is then carried, not recomputed.
+    # A sealed section reads back opaque: the CTR nonce and the ciphertext in `bytecode`.
+    # `required_minor` is the minor an image read back carries; a fresh compile stamps this wheel's.
     seal_nonce: bytes = b""
     required_minor: Optional[int] = None
     # Descriptor trailer records as `(type, bytes)`, supplied by the caller

@@ -9,3 +9,15 @@ params:
   - {name: gyro_fs, values: [41, 61, 82, 123, 164, 218, 246, 328, 437, 492, 655, 874, 1311, 1966], default: 655, unit: dps}
   - {name: filter_hz, values: [10, 46, 60], default: 60, unit: Hz}
   - {name: sample_rate, values: [10, 25, 50, 100, 200, 250], default: 100, unit: Hz}
+  # The mount rotation of the sensor's frame, a Rotation code.
+  - name: orientation
+    type: range
+    values: [0, 23]
+    default: 0
+    kind: apply
+    id: MOUNT_ORIENTATION
+    labels: [NONE, YAW_90, YAW_180, YAW_270, PITCH_90, PITCH_180, PITCH_270, ROLL_90, ROLL_180,
+             ROLL_270, PITCH_90_YAW_90, PITCH_90_YAW_180, PITCH_90_YAW_270, PITCH_180_YAW_90,
+             PITCH_180_YAW_270, PITCH_270_YAW_90, PITCH_270_YAW_180, PITCH_270_YAW_270,
+             ROLL_90_YAW_90, ROLL_90_YAW_180, ROLL_90_YAW_270, ROLL_90_PITCH_180,
+             ROLL_270_YAW_90, ROLL_270_YAW_270]

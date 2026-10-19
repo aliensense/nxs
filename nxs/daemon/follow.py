@@ -1,17 +1,17 @@
 # Copyright (c) 2026 Aliensense.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The followers nxsd runs (ADR 0013, R-SYNC-4, R-SYNC-8): a synced pair's one
+"""The followers nxsd runs (ADR 0013, R-7.4, R-7.8): a synced pair's one
 gain on every owned hub port whose record says the pair follows its leader.
 
 Once a second the port records are read. A port under frame sync whose pair
-follows (`sync.ae.mode` `follow`) with both links up gets one thread and one
-bus handle running `nxs.cam.follow.Follower` at the pair's rate. A follower
-stops when its port runs free, parks or changes its rate or its leader, its
-heartbeat removed; a reload stops every follower before the changed ports
-reconverge. A follower that stops on its own faults keeps its heartbeat,
-which names the reason, and runs again once its port's record changes or
-the daemon reloads."""
+follows (`sync.ae.mode` `follow`) with both links up gets one thread and the
+two heads' capture nodes running `nxs.cam.follow.Follower` at the pair's
+rate. A follower stops when its port runs free, parks or changes its rate or
+its leader, its heartbeat removed; a reload stops every follower before the
+changed ports reconverge. A follower that stops on its own faults keeps its
+heartbeat, which names the reason, and runs again once its port's record
+changes or the daemon reloads."""
 
 from __future__ import annotations
 
@@ -20,10 +20,9 @@ import logging
 import threading
 from typing import Any, Callable, Dict, Optional, Tuple
 
-from nxs import _libnxs
-from nxs.cam import port_state
+from nxs.cam import daemon_records, port_state
 from nxs.cam.contracts import ContractError, InfeasibleConfig, Topology
-from nxs.cam.follow import Follower
+from nxs.cam.follow import Follower, HeadControls
 
 log = logging.getLogger("nxsd")
 
@@ -52,7 +51,7 @@ def _wants(topology: Topology) -> Tuple[Optional[_Want], str]:
     if sync.get("source") != "fsync":
         return None, "the port runs free"
     if ae.get("mode") != "follow":
-        return None, ("camera.gain_db locks the pair" if ae.get("mode") == "locked"
+        return None, ("a declared gain locks the pair" if ae.get("mode") == "locked"
                       else str(ae.get("reason") or "the record names no leader"))
     for name in (ae["leader"], ae["follower"]):
         try:
@@ -73,7 +72,7 @@ def _changed(before: _Want, after: _Want) -> str:
 
 def _pair_ports(cfg) -> Dict[str, Tuple[Topology, Any]]:
     """The owned hub ports that declare a pair, each with its topology (each
-    head at its capture node's host address, from the booted tree) and its
+    head at its camera map's host address, from the booted tree) and its
     hub; a port that does not resolve runs no follower, and its `on` says
     why."""
     from nxs.cam import hubs
@@ -98,12 +97,12 @@ class _Run:
     """One port's follower on its own thread: what it follows, its stop, and
     what its run returned once it ended."""
 
-    def __init__(self, port: str, want: _Want, follower, bus) -> None:
+    def __init__(self, port: str, want: _Want, follower, controls) -> None:
         self._port = port
         self._want = want
         self._stop = threading.Event()
         self._result: Optional[str] = None
-        self._thread = threading.Thread(target=self._serve, args=(follower, bus),
+        self._thread = threading.Thread(target=self._serve, args=(follower, controls),
                                         name=f"nxsd-follow-{port}", daemon=True)
         self._thread.start()
 
@@ -125,24 +124,24 @@ class _Run:
         """Whether the run ended on its own: its faults stopped it."""
         return not self._thread.is_alive() and not self._stop.is_set()
 
-    def _serve(self, follower, bus) -> None:
+    def _serve(self, follower, controls) -> None:
         try:
             self._result = follower.run(self._stop)
         except Exception as exc:        # noqa: BLE001 (the journal names it)
             self._result = f"{type(exc).__name__}: {exc}"
         finally:
-            bus.close()
+            controls.close()
 
 
 class Followers:
     """The followers of the owned hub ports, reconciled against the port
-    records once a second on a thread of their own. `open_bus` opens a
-    port's bus (`_libnxs.Bus.open`) and `follower` builds a follower
-    (`nxs.cam.follow.Follower`)."""
+    records once a second on a thread of their own. `controls` opens a
+    port's heads' capture nodes by the port's bus (`HeadControls`) and
+    `follower` builds a follower (`nxs.cam.follow.Follower`)."""
 
-    def __init__(self, open_bus: Callable[[str], Any] = _libnxs.Bus.open,
+    def __init__(self, controls: Callable[[str], Any] = HeadControls,
                  follower: Callable[..., Any] = Follower) -> None:
-        self._open_bus = open_bus
+        self._controls = controls
         self._follower = follower
         self._runs: Dict[str, _Run] = {}
         self._faulted: Dict[str, _Want] = {}
@@ -180,7 +179,7 @@ class Followers:
             for name, (want, _reason) in wants.items():
                 if name in self._faulted and self._faulted[name] != want:
                     del self._faulted[name]
-                    port_state.remove_follow(name)
+                    daemon_records.remove_follow(name)
                 if want is not None and name not in self._runs and name not in self._faulted:
                     self._start_run(name, want)
 
@@ -195,7 +194,7 @@ class Followers:
             for name in list(self._runs):
                 self._stop_run(name, reason)
             for name in list(self._faulted):
-                port_state.remove_follow(name)
+                daemon_records.remove_follow(name)
             self._faulted.clear()
 
     def _tick(self, cfg) -> None:
@@ -212,7 +211,7 @@ class Followers:
             if build is None:
                 raise InfeasibleConfig(f"hub {hub.name} copies no gain")
             plan = build(hub, topology, want.leader, want.follower)
-            bus = self._open_bus(want.bus)
+            controls = self._controls(want.bus, mapped=plan.mapped)
         except (InfeasibleConfig, OSError) as exc:
             # Not tried again until the port's record changes: the same
             # record gives the same refusal.
@@ -220,11 +219,12 @@ class Followers:
             log.warning("%s: %s does not follow %s (%s)", name, want.follower, want.leader,
                         getattr(exc, "reason", None) or exc)
             return
-        self._runs[name] = _Run(name, want, self._follower(plan, bus, 1.0 / want.fps, port=name), bus)
+        self._runs[name] = _Run(name, want, self._follower(plan, controls, 1.0 / want.fps, port=name),
+                                controls)
         log.info("%s: %s follows %s at %g fps", name, want.follower, want.leader, want.fps)
 
     def _stop_run(self, name: str, reason: str) -> None:
         run = self._runs.pop(name)
         run.stop()
-        port_state.remove_follow(name)
+        daemon_records.remove_follow(name)
         log.info("%s: %s stops following %s (%s)", name, run.want.follower, run.want.leader, reason)

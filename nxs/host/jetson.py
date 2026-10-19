@@ -8,6 +8,7 @@ extlinux boot label, and speaks to the Argus capture stack."""
 
 from __future__ import annotations
 
+import functools
 import glob
 import os
 import platform
@@ -20,14 +21,17 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Collection, Dict, List, Optional, Tuple
 
-from . import Host
+from nxs.compiler import HostDevice, Port, PortDirection, PortType
+
+from . import DRIVERS, Host
 from . import capture_table as tables
 from . import jetson_dt as dt
 from . import jetson_overlay as gen
-from .jetson_boot import (FDT_ALTERNATIVE, GMSL_OVERLAY_SUFFIX, LABEL_MARKER, blessed_dtb, carried_overlays,
+from .jetson_boot import (FDT_ALTERNATIVE, LABEL_MARKER, RETIRED_OVERLAY_SUFFIX, blessed_dtb, carried_overlays,
                           companion_overlays, default_label, fdtoverlay_result, label_fdt, label_overlay_order,
                           label_overlays, mux_overlay, on_disk, overlay_port, template_label,
                           undeclared_overlays, with_label)
+from .jetson_gst import JetsonGst
 from .root import as_root
 
 DT_BASE = "/proc/device-tree"
@@ -56,8 +60,10 @@ GENERATED_LABEL = "aliensense_gen"
 #: release page of aliensense/nxs-jetson.
 TESTED_L4T = ("36.4.4", "39.2.1")
 KERNEL_PACKAGE_REPO = "aliensense/nxs-jetson"
-#: What the package installs under /lib/modules/<kernel>/.
-KERNEL_MODULES = ("universal_aliensense.ko", "aliensense_generic_des.ko")
+#: What the package installs under /lib/modules/<kernel>/: the universal driver a bare head's
+#: node binds, and the camera map's core with the driver a pod's or a smart camera's node binds.
+KERNEL_MODULES = ("universal_aliensense.ko",)
+CAMERA_MAP_MODULES = ("nxs-csi2-core.ko", "nxs-csi2-tegra.ko")
 KERNEL_MODULES_SUBDIR = "updates/drivers/media/i2c"
 LIB_MODULES = "/lib/modules"
 
@@ -68,10 +74,11 @@ def kernel_package_name(l4t: Optional[str]) -> str:
     return f"nxs-jetson_{l4t or '<l4t>'}_arm64.deb"
 
 
-def kernel_modules_missing(kernel: str, lib_modules: str = LIB_MODULES) -> bool:
-    """Whether the booted kernel lacks the camera package's modules."""
+def kernel_modules_missing(kernel: str, lib_modules: str = LIB_MODULES, camera_maps: bool = False) -> bool:
+    """Whether the booted kernel lacks the camera package's modules, the
+    camera map driver among them where an overlay carries a camera map node (`camera_maps`)."""
     d = Path(lib_modules, kernel, KERNEL_MODULES_SUBDIR)
-    return not all((d / m).is_file() for m in KERNEL_MODULES)
+    return not all((d / m).is_file() for m in KERNEL_MODULES + (CAMERA_MAP_MODULES if camera_maps else ()))
 
 #: The capture daemon has a configuration mode (the tuning build) from L4T 39
 #: on; L4T 36's Argus has none and streams on its built-in tuning.
@@ -135,6 +142,45 @@ def detect() -> Optional["JetsonHost"]:
     return JetsonHost() if is_supported_jetson(DT_BASE) else None
 
 
+
+
+class JetsonDevice(HostDevice):
+    """The Jetson host on the p3768 carrier as a block: each camera
+    connector a CSI input with its I2C bus an output beside it, from the
+    connector table (`jetson_overlay.PORTS`)."""
+
+    COMPATIBLE = "jetson"
+    PRODUCT = "Jetson"
+    PORTS = tuple(port for name in sorted(gen.PORTS)
+                  for port in (Port(name, PortType.CSI, PortDirection.INPUT),
+                               Port(f"bus_{name}", PortType.I2C, PortDirection.OUTPUT)))
+
+    def declare_rows(self) -> None:
+        """Per connector `<connector>_lanes`, the CSI lanes it runs: 2, and
+        4 where it wires four, the wired count by default; and
+        `<connector>_driver`, who drives the hub behind it (`DRIVERS`), nxs
+        by default."""
+        for name, entry in sorted(gen.PORTS.items()):
+            wired = int(entry["lanes"])
+            self.declare_row(f"{name}_lanes", values=[2, 4] if wired >= 4 else [wired],
+                             default=wired)
+            self.declare_row(f"{name}_driver", values=list(range(len(DRIVERS))), default=0,
+                             labels=DRIVERS)
+
+
+@functools.lru_cache(maxsize=1)
+def description():
+    """The Jetson plugin's description: the HOST image `JetsonDevice`
+    compiles, read back (`nxs.description`), with the buses a host offers
+    by their device's name (`nxs.host.buses`)."""
+    import dataclasses
+
+    from nxs.description import from_compiled
+    from nxs.host import buses
+
+    return dataclasses.replace(from_compiled(JetsonDevice().compile({})), buses=buses.bus_port)
+
+
 #: The udev rules naming this carrier's camera buses, beside this module.
 BUS_RULES = "jetson-orin-nano.rules"
 #: The tool restarts nvargus-daemon itself, so apport's crash report for it is noise.
@@ -168,24 +214,7 @@ TUNING_BADGE_CHARS = 31
 TUNING_DAEMON_SETTLE_S = 3.0
 TUNING_SESSION_S = 15
 
-#: The Argus source's white-balance modes a fixed picture runs: off for a
-#: developer's locked one, auto on each link of a synced pair.
-WB_OFF, WB_AUTO = 0, 1
-
-
-def _fixed_props(exposure_ns: Optional[int], wbmode: int, gain: Optional[float] = None) -> str:
-    """The Argus source's properties for a picture the ISP leaves alone: the
-    exposure pinned at `exposure_ns` (none when None), no digital gain,
-    noise reduction or edge enhancement, white balance `wbmode`; with `gain`
-    the exposure loop locked at that linear gain."""
-    props = [f'exposuretimerange="{exposure_ns} {exposure_ns}"'] if exposure_ns is not None else []
-    props += ['ispdigitalgainrange="1 1"', f"wbmode={int(wbmode)}", "tnr-mode=0", "ee-mode=0"]
-    if gain is not None:
-        props += ["aelock=true", f'gainrange="{gain:g} {gain:g}"']
-    return " ".join(props)
-
-
-class JetsonHost(Host):
+class JetsonHost(JetsonGst, Host):
     name = "jetson"
     capture_contract = True
 
@@ -219,9 +248,9 @@ class JetsonHost(Host):
         return HOTFIX_STEP
 
     # --- the camera kernel package ----------------------------------------
-    def kernel_package_missing(self) -> Optional[str]:
+    def kernel_package_missing(self, camera_maps: bool = False) -> Optional[str]:
         kernel = platform.release()
-        if kernel_modules_missing(kernel, self._lib_modules):
+        if kernel_modules_missing(kernel, self._lib_modules, camera_maps):
             return f"no camera kernel package for {kernel}"
         return None
 
@@ -332,31 +361,41 @@ class JetsonHost(Host):
         return dt.booted_modes(bus, sysfs_i2c=self._sysfs_i2c)
 
     def lane_mismatch(self, bus: str, declared: int) -> Optional[str]:
-        return dt.lane_mismatch(bus, declared, sysfs_i2c=self._sysfs_i2c)
+        port = next((name for name, path in self.camera_buses().items() if path == bus), None)
+        return dt.lane_mismatch(bus, declared, sysfs_i2c=self._sysfs_i2c, port=port)
 
     # --- the generated contract ------------------------------------------
     def overlay(self, hub, port: str, lanes: int,
                 sensors: Optional[List[str]] = None, direct: bool = False,
                 node_addr: Optional[int] = None, fps: Optional[float] = None,
-                bit_depth: Optional[int] = None) -> str:
+                bit_depth: Optional[int] = None,
+                camera_maps: Optional[Dict[int, int]] = None,
+                passive: Optional[Dict[int, bytes]] = None) -> str:
         # A port without a hub tops its rows out at the sensor's own ceiling.
         layout = {"lanes": None if direct else int(lanes), "default_fps": fps,
                   "bit_depth": bit_depth}
         table = tables.capture_table(hub, sensors, **layout)
         return gen.overlay_dts(port, int(lanes), table, tables.pool_sensors(hub, sensors, **layout),
-                               direct=direct, node_addr=node_addr)
+                               direct=direct, node_addr=node_addr, camera_maps=camera_maps,
+                               passive=passive)
 
     def compile(self, dts: str, out: Path) -> Path:
         dtc = shutil.which("dtc")
         if dtc is None:
             raise RuntimeError(
                 "dtc is not installed — sudo apt install device-tree-compiler")
+        from nxs.cam.port_state import ensure_dir
         out = Path(out)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        result = subprocess.run([dtc, "-@", "-q", "-I", "dts", "-O", "dtb", "-o", str(out)],
+        ensure_dir(out.parent)
+        # dtc lands beside the target and the rename replaces a file
+        # another user wrote (nxsd compiles as root, the operator next).
+        staged = out.with_name(out.name + ".tmp")
+        result = subprocess.run([dtc, "-@", "-q", "-I", "dts", "-O", "dtb", "-o", str(staged)],
                                 input=dts, capture_output=True, text=True)
         if result.returncode != 0:
+            staged.unlink(missing_ok=True)
             raise RuntimeError(f"dtc failed: {result.stderr.strip()}")
+        os.replace(staged, out)
         return out
 
     def install_many(self, dtbos: List[Path], label: str = GENERATED_LABEL,
@@ -388,8 +427,8 @@ class JetsonHost(Host):
                 names.append(entry)
             else:
                 dropped.append(entry)
-        # The caller's order is meaning (a port's GMSL overlay follows the
-        # universal ones): keep a target where the list has it, else append.
+        # The caller's order is meaning (the mux overlay leads, a port's
+        # overlay follows it): keep a target where the list has it, else append.
         for target in targets:
             if str(target) not in names:
                 names.append(str(target))
@@ -503,9 +542,9 @@ class JetsonHost(Host):
                         declared: Optional[Collection[str]] = None) -> List[str]:
         """Install compiled overlays under a boot label: the other declared
         ports' overlays of the current DEFAULT label ride along, an undeclared
-        port's are dropped with a line each, this port's are replaced, and the
-        package's mux and GMSL overlays take their places. ``declared`` None
-        declares every port the label names."""
+        port's are dropped with a line each, this port's are replaced, the
+        package's mux overlay leads, and a retired GMSL companion goes with a
+        line. ``declared`` None declares every port the label names."""
         for record in records:
             if not record["dtbo"]:
                 raise RuntimeError("nothing compiled to install — "
@@ -514,14 +553,10 @@ class JetsonHost(Host):
         target_label = label or GENERATED_LABEL
         current = carried_overlays(text, target_label) if keep_other_ports else []
         port = records[0]["port"]
-        companions = companion_overlays(port, BOOT_DTBO_DIR)
-        if records[0].get("direct"):
-            # The receiver takes the sensor's own lanes: the port's GMSL
-            # overlay describes a deserializer node and goes.
-            companions.pop("gmsl", None)
-            current = [o for o in current
-                       if not Path(o).name.endswith(f"{port}{GMSL_OVERLAY_SUFFIX}")]
+        companions = companion_overlays(BOOT_DTBO_DIR)
         dropped = undeclared_overlays(current, port, declared)
+        retired = [o for o in current
+                   if Path(o).name.endswith(RETIRED_OVERLAY_SUFFIX) and o not in dropped]
         carried = label_overlay_order(current, port,
                                       [Path(r["dtbo"]).name for r in records],
                                       BOOT_DTBO_DIR, companions, declared)
@@ -529,6 +564,8 @@ class JetsonHost(Host):
         # extlinux.conf, and the label never names a missing file.
         return ([f"dropped {entry} from {target_label}: port {owner} is not declared"
                  for entry, owner in dropped.items()]
+                + [f"dropped {entry} from {target_label}: the package's GMSL overlay is retired"
+                   for entry in retired]
                 + self.install_many([Path(r["dtbo"]) for r in records], target_label,
                                     select=select, overlays=carried, fdt=fdt))
 
@@ -664,98 +701,6 @@ class JetsonHost(Host):
             raise RuntimeError(f"no camera port {port!r} on this carrier "
                                f"(have {', '.join(sorted(gen.PORTS))})") from None
 
-    # --- the capture consumer (Argus) --------------------------------------
-    def source(self, capture_id: int, mode_index: int) -> str:
-        return f"{self.source_match(capture_id)}sensor-mode={int(mode_index)}"
-
-    def source_match(self, capture_id: int) -> str:
-        return f"nvarguscamerasrc sensor-id={int(capture_id)} "
-
-    def viewers_pattern(self) -> str:
-        return "nxs[.]cam[.]hud|gst-launch-1[.]0 .*nvarguscamerasrc"
-
-    def caps(self, width: int, height: int, framerate=None) -> str:
-        out = f"video/x-raw(memory:NVMM),width={int(width)},height={int(height)}"
-        if framerate:
-            out += f",framerate={framerate[0]}/{framerate[1]}"
-        return out
-
-    def convert(self) -> str:
-        return "nvvidconv ! video/x-raw,format=I420"
-
-    def rgba_convert(self) -> str:
-        # The converter reaches system memory as RGBA only from an RGBA
-        # device buffer; straight from the source's buffer it hands out
-        # nothing on this release.
-        return ("nvvidconv ! video/x-raw(memory:NVMM),format=RGBA ! "
-                "nvvidconv ! video/x-raw,format=RGBA")
-
-    def topic_convert(self, encoding: str) -> str:
-        # The hardware converter writes UYVY and GRAY8 into system memory
-        # by itself, at the link's rate; RGB needs the software converter
-        # after the RGBA path, which costs a core at 1080p.
-        tail = "queue max-size-buffers=2 leaky=downstream"
-        if encoding == "jpeg":
-            return f"nvjpegenc ! {tail}"
-        if encoding == "rgb8":
-            return f"{self.rgba_convert()} ! videoconvert ! video/x-raw,format=RGB ! {tail}"
-        fmt = {"yuv422": "UYVY", "mono8": "GRAY8"}[encoding]
-        return (f"nvvidconv ! video/x-raw(memory:NVMM),format={fmt} ! "
-                f"nvvidconv ! video/x-raw,format={fmt} ! {tail}")
-
-    def exposure_props(self, exposure_us: float) -> str:
-        """The Argus property pinning the exposure at a port's value (the
-        source takes nanoseconds); gain stays the loop's."""
-        ns = int(round(float(exposure_us) * 1000))
-        return f'exposuretimerange="{ns} {ns}"'
-
-    def ae_props(self, exposure_min_us: Optional[float], exposure_max_us: float) -> str:
-        """The Argus property bounding its exposure loop to the frame the
-        sensor runs: a longer request would stretch the frame."""
-        low = int(round(float(exposure_min_us or 1.0) * 1000))
-        high = int(round(float(exposure_max_us) * 1000))
-        return f'exposuretimerange="{low} {high}"'
-
-    def locked_props(self, exposure_ns: int, gain: int) -> str:
-        return _fixed_props(int(exposure_ns), WB_OFF, float(gain))
-
-    def pair_props(self, role: str, exposure_us: Optional[float],
-                   gain_db: Optional[float] = None) -> str:
-        """Argus takes its exposure in nanoseconds and its gain as a linear
-        factor: the `gain_db` of a locked link or a follower is 10^(dB/20),
-        what the driver's decibel gain control converts back; a follower
-        without one runs at unity."""
-        ns = None if exposure_us is None else int(round(float(exposure_us) * 1000))
-        if role == "leader":
-            return _fixed_props(ns, WB_AUTO)
-        if role == "follower" and gain_db is None:
-            return _fixed_props(ns, WB_AUTO, 1.0)
-        if role in ("follower", "locked") and gain_db is not None:
-            return _fixed_props(ns, WB_AUTO, 10 ** (float(gain_db) / 20))
-        raise ValueError(f"no source properties for a pair's {role!r} link"
-                         + (" without its gain" if role == "locked" else ""))
-
-    def viewer_pipeline(self, capture_id: int, mode_index: int, props: str, caps: str,
-                        crop_bottom: int, geometry: Dict[str, int]) -> str:
-        # videocrop removes a triggered pair's filler rows; it needs system
-        # memory, so the buffers are handed back to NVMM for nv3dsink.
-        crop = (f"{self.convert()} ! videocrop bottom={int(crop_bottom)} ! nvvidconv ! "
-                f"video/x-raw(memory:NVMM),format=NV12 ! " if crop_bottom else "")
-        return (f"{self.source(capture_id, mode_index)} {props} ! {caps} ! {crop}queue ! "
-                f"nv3dsink window-x={geometry['x']} window-y={geometry['y']} "
-                f"window-width={geometry['w']} window-height={geometry['h']}")
-
-    def jpeg_encoder(self) -> str:
-        return "nvjpegenc"
-
-    def consumer_errors(self, output: str) -> int:
-        return sum(1 for line in output.splitlines()
-                   if "Error generated" in line or "(Argus) Error" in line)
-
-    def consumer_hint(self) -> str:
-        return ("a missing nvarguscamerasrc means the nvidia-l4t-gstreamer package "
-                "is not installed on this host")
-
     def capture_daemon_unit(self) -> Optional[str]:
         return CAPTURE_DAEMON_UNIT
 
@@ -787,6 +732,9 @@ class JetsonHost(Host):
         return [f"installed {blacklist} (apport stays quiet about nvargus-daemon)"]
 
     # --- identity ---------------------------------------------------------
+    def description(self):
+        return description()
+
     def keeps_system_declaration(self) -> bool:
         return True
 

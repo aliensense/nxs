@@ -18,6 +18,11 @@ SESSION_LIVE_REASON = ("a transfer session is live (an upload or firmware "
                        "session whose holder has gone silent is reclaimed "
                        "automatically")
 
+# ENOTSUP from LOAD and the store: the image format gate (Interface Description §10.1). A hub, graph
+# or module image the device log names never reaches a unit, whose store takes personalities alone.
+FORMAT_NEWER_REASON = ("the unit does not take this image: it needs a newer firmware "
+                       "(nxs <unit> push-fw <file>)")
+
 # Device store-op errno to reason (device libc numbering). The I2C path reads
 # the errno from CMD_ERROR, the Cyphal path from `aliensense.nxs.cmd_error`.
 STORE_ERR_REASON = {
@@ -28,7 +33,7 @@ STORE_ERR_REASON = {
     22: "invalid slot",                                                 # EINVAL
     2:  "no such slot",                                                 # ENOENT
     5:  "flash (NVS) write error",                                      # EIO
-    134: "the store takes no hub image; the host runs those",           # ENOTSUP
+    134: FORMAT_NEWER_REASON,                                           # ENOTSUP
 }
 
 # STORE_PERSIST (identity commit) shares the error channel with the store ops,
@@ -41,10 +46,10 @@ COMMISSION_ERR_REASON = {
 # Transfer-session refusals, keyed by the device's errno numbers (Zephyr
 # newlib values, which match Linux here; macOS differs).
 XFER_ERR_REASON = {
-    16: "another transfer session is live (a concurrent upload or firmware "
-        "push) — retry when it ends, or release it with XFER_ABORT",  # EBUSY
-    71: "out-of-sequence transfer op: wrong XFER_TYPE for this operation, "
-        "or a config stage trampled by an interleaved write",         # EPROTO
+    16: "another session is live (an upload, a firmware push or a calibration "
+        "procedure) — retry when it ends, or release it with SESSION_ABORT",  # EBUSY
+    71: "a chunk arrived outside its session: no upload or firmware push is "
+        "open",                                                       # EPROTO
     27: "image exceeds the device staging buffer",                    # EFBIG
     2:  "no transfer session to release",                             # ENOENT
     11: "the device dropped the command before dispatch (queue full) — "
@@ -57,8 +62,9 @@ LOAD_ERR_REASON = {
     16: SESSION_LIVE_REASON,                                            # EBUSY
     61: "the staged image arrived short of the announced size — bytes were "
         "lost in transit; re-run the upload",                         # ENODATA
-    8:  "the device rejected the image: not a valid personality image (stale SDK "
-        "wheel or corrupt content — detail in the device log)",       # ENOEXEC
+    8:  "the device rejected the image: not a valid personality image (corrupt "
+        "content — detail in the device log)",                        # ENOEXEC
+    134: FORMAT_NEWER_REASON,                                           # ENOTSUP
     11: "the device dropped the command before dispatch (queue full) — "
         "retry",                                                      # EAGAIN
     5:  "the file pull failed on the device (server silent past the "
@@ -68,7 +74,7 @@ LOAD_ERR_REASON = {
 # Calibration errnos in the device's numbering: its libc diverges from glibc
 # above 71 (EBADMSG 77, ETIMEDOUT 116, ECANCELED 140).
 CALIB_ERR_REASON = {
-    22: "calibration record rejected (bad version, orientation, or non-finite values)",  # EINVAL
+    22: "calibration record rejected (bad version or non-finite values)",  # EINVAL
     19: "device has no calibration engine",                                              # ENODEV
     5:  "flash (NVS) write error",                                                       # EIO
     16: "another calibration procedure is running",                                      # EBUSY
@@ -108,11 +114,11 @@ PULL_ERR_REASON = {
     116: "no response from the file server",                           # ETIMEDOUT
 }
 
-# The verdict of a finished run: `CAM_ERROR` on the terminal edge (the
-# device's libc numbering: ETIMEDOUT 116, EILSEQ 138, ECANCELED 140).
+# The verdict of a camera run: the map's `ERROR` when its commit ends FAULT
+# (the device's libc numbering: ETIMEDOUT 116, EILSEQ 138, ECANCELED 140).
 CAM_VERDICT_REASON = {
     5:   "the sensor stopped answering past the register retries",      # EIO
-    6:   "no sensor answered at the personality's address",             # ENXIO
+    6:   "the personality names no I²C address or bus profile",         # ENXIO
     19:  "no sensor answered at the personality's address",             # ENODEV
     116: "a poll did not see its value within its timeout",             # ETIMEDOUT
     140: "the run was aborted",                                         # ECANCELED
@@ -129,28 +135,156 @@ CAM_VERDICT_REASON = {
          "clock",                                                       # ENOTSUP
     138: "a register read did not match the value the personality "
          "expects",                                                     # EILSEQ
+    133: "the slot took another image between the run's accept and its "
+         "load; run it again",                                          # ESTALE
 }
 
-# `Cmd::CAM_RUN`'s result, device numbering: the accept's refusal, or the verdict of a run
-# that ended before the host read the accept; the accept's reason stands where both name a code.
-CAM_RUN_ERR_REASON = {
+# A map commit that ended FAULT, the map's `ERROR`: its own refusals, else its run's verdict
+# (`src/nxs/unit/DeviceErrors.h`, COMMIT then CAM_VERDICT).
+COMMIT_ERR_REASON = {
     **CAM_VERDICT_REASON,
-    8:  "the slot holds a click personality, not a cam one",       # ENOEXEC
-    2:  "the slot is empty; upload the cam personality and save it",  # ENOENT
-    16: "the unit is busy: a run, an upload, or a firmware push holds "
-        "the transfer session",                                         # EBUSY
-    19: "the unit's firmware carries no camera runner",                 # ENODEV
-    22: "a staged parameter value the personality does not accept",     # EINVAL
-    11: "the device dropped the command before dispatch (queue full) — "
-        "retry",                                                        # EAGAIN
+    22:  "the commit broke a rule: one owner and one kind, rows the door "
+         "serves and may write, listed values, a RUN in standby",       # EINVAL
+    140: "the commit was aborted",                                      # ECANCELED
 }
 
-# `Cmd::CAM_ABORT`'s result.
-CAM_ABORT_ERR_REASON = {
-    2:  "no camera run is live",                                        # ENOENT
-    11: "the device dropped the command before dispatch (queue full) — "
-        "retry",                                                        # EAGAIN
+#: The device's errno numbering, its C library's (newlib's): `ETIMEDOUT` is
+#: 116 there and `EILSEQ` 138, where a Linux host would read other names.
+DEVICE_ERRNO_NAMES = {
+    1: "EPERM",
+    2: "ENOENT",
+    3: "ESRCH",
+    4: "EINTR",
+    5: "EIO",
+    6: "ENXIO",
+    7: "E2BIG",
+    8: "ENOEXEC",
+    9: "EBADF",
+    10: "ECHILD",
+    11: "EAGAIN",
+    12: "ENOMEM",
+    13: "EACCES",
+    14: "EFAULT",
+    15: "ENOTBLK",
+    16: "EBUSY",
+    17: "EEXIST",
+    18: "EXDEV",
+    19: "ENODEV",
+    20: "ENOTDIR",
+    21: "EISDIR",
+    22: "EINVAL",
+    23: "ENFILE",
+    24: "EMFILE",
+    25: "ENOTTY",
+    26: "ETXTBSY",
+    27: "EFBIG",
+    28: "ENOSPC",
+    29: "ESPIPE",
+    30: "EROFS",
+    31: "EMLINK",
+    32: "EPIPE",
+    33: "EDOM",
+    34: "ERANGE",
+    35: "ENOMSG",
+    36: "EIDRM",
+    37: "ECHRNG",
+    38: "EL2NSYNC",
+    39: "EL3HLT",
+    40: "EL3RST",
+    41: "ELNRNG",
+    42: "EUNATCH",
+    43: "ENOCSI",
+    44: "EL2HLT",
+    45: "EDEADLK",
+    46: "ENOLCK",
+    50: "EBADE",
+    51: "EBADR",
+    52: "EXFULL",
+    53: "ENOANO",
+    54: "EBADRQC",
+    55: "EBADSLT",
+    56: "EDEADLOCK",
+    57: "EBFONT",
+    60: "ENOSTR",
+    61: "ENODATA",
+    62: "ETIME",
+    63: "ENOSR",
+    64: "ENONET",
+    65: "ENOPKG",
+    66: "EREMOTE",
+    67: "ENOLINK",
+    68: "EADV",
+    69: "ESRMNT",
+    70: "ECOMM",
+    71: "EPROTO",
+    74: "EMULTIHOP",
+    75: "ELBIN",
+    76: "EDOTDOT",
+    77: "EBADMSG",
+    79: "EFTYPE",
+    80: "ENOTUNIQ",
+    81: "EBADFD",
+    82: "EREMCHG",
+    83: "ELIBACC",
+    84: "ELIBBAD",
+    85: "ELIBSCN",
+    86: "ELIBMAX",
+    87: "ELIBEXEC",
+    88: "ENOSYS",
+    89: "ENMFILE",
+    90: "ENOTEMPTY",
+    91: "ENAMETOOLONG",
+    92: "ELOOP",
+    95: "EOPNOTSUPP",
+    96: "EPFNOSUPPORT",
+    104: "ECONNRESET",
+    105: "ENOBUFS",
+    106: "EAFNOSUPPORT",
+    107: "EPROTOTYPE",
+    108: "ENOTSOCK",
+    109: "ENOPROTOOPT",
+    110: "ESHUTDOWN",
+    111: "ECONNREFUSED",
+    112: "EADDRINUSE",
+    113: "ECONNABORTED",
+    114: "ENETUNREACH",
+    115: "ENETDOWN",
+    116: "ETIMEDOUT",
+    117: "EHOSTDOWN",
+    118: "EHOSTUNREACH",
+    119: "EINPROGRESS",
+    120: "EALREADY",
+    121: "EDESTADDRREQ",
+    122: "EMSGSIZE",
+    123: "EPROTONOSUPPORT",
+    124: "ESOCKTNOSUPPORT",
+    125: "EADDRNOTAVAIL",
+    126: "ENETRESET",
+    127: "EISCONN",
+    128: "ENOTCONN",
+    129: "ETOOMANYREFS",
+    130: "EPROCLIM",
+    131: "EUSERS",
+    132: "EDQUOT",
+    133: "ESTALE",
+    134: "ENOTSUP",
+    135: "ENOMEDIUM",
+    136: "ENOSHARE",
+    137: "ECASECLASH",
+    138: "EILSEQ",
+    139: "EOVERFLOW",
+    140: "ECANCELED",
+    141: "ENOTRECOVERABLE",
+    142: "EOWNERDEAD",
+    143: "ESTRPIPE",
 }
+
+
+def errno_name(code: int) -> str:
+    """The name of a device errno in the device's own numbering, the number
+    as text where it has none."""
+    return DEVICE_ERRNO_NAMES.get(int(code), str(code))
+
 
 ERRNO_EEXIST = 17
 
@@ -169,8 +303,8 @@ ERRNO_EOPNOTSUPP = 95
 
 ERRNO_ECANCELED = 140
 
-# A hub image offered to the store: the host runs those. A slot's peek
-# answers it for an image of another format version.
+# An image of another format than the unit runs, at LOAD, at the store and at a slot's peek, or a
+# hub, graph or module image offered to the store.
 ERRNO_ENOTSUP = 134
 
 # A slot's peek on an image that does not parse.
@@ -211,10 +345,3 @@ def op_error_name(code: int) -> str:
     a personality-defined value."""
     name = OpErrors.OpErrorCode._NAMES.get(code)
     return f"{name} ({code})" if name else f"device code ({code})"
-
-# The queued personality-info select: the unit's verdict on the slot asked for.
-PERSONALITY_INFO_ERR_REASON = {
-    2: "the slot is empty",
-    8: "the slot holds a click personality, which has no descriptor trailer",
-    19: "the device has no personality store",
-}

@@ -57,6 +57,7 @@ def _silent_pods(topology, links) -> List[str]:
     a pod reads silent when the hub itself does not answer."""
     from nxs.cam import port_state
     from nxs.cam import run as cam_run
+    from nxs.cam.identity import unit_acks
 
     pods = [link for link in links if link.nxs_units]
     if not pods:
@@ -67,10 +68,7 @@ def _silent_pods(topology, links) -> List[str]:
         try:
             i2c.open()
             for link in pods:
-                try:
-                    i2c.read_reg(0x0000, reg_width=16, data_width=8,
-                                 addr=hex(link.nxs_units[0].alias_addr))
-                except Exception:        # noqa: BLE001 (a silent pod, or a silent hub)
+                if not unit_acks(i2c, link.nxs_units[0].alias_addr):
                     silent.append(link.name)
         finally:
             i2c.close()

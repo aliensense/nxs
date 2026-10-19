@@ -72,7 +72,7 @@ class VcGeometry:
 class CsiContract:
     """What the deserializer puts on the CSI-2 port; exported by the serdes
     layer, consumed by the capture layer. ``transport`` names the
-    serializer's path: the pixel block (RAW10 doubled, RAW12 as is)."""
+    serializer's path: the pixel block (RAW10 and RAW12, both doubled)."""
 
     port: int
     transport: str  # "pixel"
@@ -137,12 +137,24 @@ def _rate_text(fps: float) -> str:
 
 @dataclass(frozen=True)
 class NxsUnitSpec:
-    """A sensor pod wired in-line on a link. The pod answers a fixed address; the
-    deserializer's I2C translation presents it to the host at a distinct alias.
-    On a direct port nothing translates: the alias is the pod's own address."""
+    """A sensor pod wired in-line on a link. The pod answers two fixed
+    addresses, its register map and its camera map; the serializer's I2C
+    translation presents each to the host at a distinct alias, the camera map's
+    one above the map's. On a direct port nothing translates: the aliases
+    are the pod's own addresses."""
 
-    alias_addr: int  # host-side address (after translation behind a hub)
+    alias_addr: int  # host-side address of the register map (after translation behind a hub)
     target_addr: int = 0x30  # the pod's own fixed address
+    # Host-side address of the camera map (`map_target` behind it): one above the map's alias
+    # behind a hub, the camera map's own where nothing translates. Left out, it follows the map's alias.
+    camera_map_addr: Optional[int] = None
+    map_target: int = 0x31  # the pod's own camera-map address
+
+    def __post_init__(self) -> None:
+        if self.camera_map_addr is None:
+            direct = int(self.alias_addr) == int(self.target_addr)
+            object.__setattr__(self, "camera_map_addr",
+                               int(self.map_target) if direct else int(self.alias_addr) + 1)
 
 
 @dataclass(frozen=True)
@@ -157,6 +169,7 @@ class LinkSpec:
     csi_vc: int
     sensor_compatible: Optional[str]
     ser_compatible: Optional[str]
+    camera_node: Optional[str] = None  # the camera node that declares the head
     ser_addr: int = 0x42
     # None: the sensor descriptor's own address (meta.i2c_addr); the IMX219
     # sits at 0x10, the Sony industrial parts at 0x1A.
@@ -177,10 +190,8 @@ class LinkSpec:
     # The declared free-run rate for this link (a link's `camera.fps`);
     # None follows the port's declaration, then the mode's ceiling.
     fps: Optional[float] = None
-    # The address the host reaches the sensor at: its capture node's, from
-    # the booted tree, which the link's serializer maps to the sensor's
-    # own. None: the sensor answers at its own address (no node, or a
-    # direct port).
+    # The link's capture node address in the booted tree, where its per-frame controls go: a pod's
+    # camera map, else the sensor. None: no node, or a direct port, where nothing translates.
     host_addr: Optional[int] = None
 
     @property
@@ -218,8 +229,7 @@ class Topology:
     # sensor->serializer MIPI side is a descriptor property.
     hub_driver: str = "nxs"  # "kernel" = a kernel driver owns the SerDes; nxs
     # then writes nothing, so link walks are skipped and get/set refuse.
-    camera_mode: Optional[str] = None  # declared mode token (suite.yaml)
-    camera_fps: Optional[float] = None
+    hub_node: Optional[str] = None  # the hub node's name
     camera_exposure_us: Optional[float] = None  # declared (us): refused where the pulse or the loop sets it
     camera_gain_db: Optional[float] = None  # declared (dB): the camera links locked at it
     sync: SyncSpec = field(default_factory=SyncSpec)
@@ -227,14 +237,40 @@ class Topology:
     # pairs: the address the kernel's per-frame controls for that channel
     # are written to. Empty when the tree is silent.
     node_addrs: Tuple[Tuple[int, int], ...] = ()
+    # The hub's outputs the declaration states, (port, lanes, streams,
+    # copy) by port name: a port B feeding a module. Empty for port A alone.
+    outputs: Tuple[Tuple[str, int, Tuple[str, ...], bool], ...] = ()
     # The line the delivery check found a pair's head needs on this rig,
     # (link, mode, HMAX in the head's clocks): the pair line law gives way
     # to it for that mode. Empty on a port at the datasheet's line.
     lines: Tuple[Tuple[str, str, int], ...] = ()
+    # The hub node's (row, served value) pairs, its declared values over the rows' defaults;
+    # empty for a port no declaration builds.
+    hub_values: Tuple[Tuple[str, int], ...] = ()
     # The declaration the port is built from, one digest of every field that
-    # shapes it (`schema_ports.port_signature`); None for a port no manifest
+    # shapes it (`schema_nodes.port_signature`); None for a port no manifest
     # declares, and for one `on` brings up by hand away from its declaration.
     declared: Optional[str] = None
+
+    @property
+    def name(self) -> str:
+        """The port's short name, the carrier's suffix: `pixelmate/cam1` is `cam1`."""
+        return self.carrier.split("/")[-1].lower()
+
+    def hub_param_path(self, key: str) -> str:
+        """Where the port's hub-wide parameter `key` is declared: the hub
+        node's parameters, on a connector its camera's, else the port's
+        view for a port built from no graph."""
+        source = self.hub_node or next((l.camera_node for l in self.links if l.camera_node), None)
+        return f"nodes.{source}.parameters.{key}" if source else f"ports.{self.name}.{key}"
+
+    def link_param_path(self, letter: str, key: str) -> str:
+        """Where a link's camera parameter `key` is declared: its camera
+        node's parameters, else the port's view."""
+        link = next((l for l in self.links if l.name == letter), None)
+        if link is not None and link.camera_node:
+            return f"nodes.{link.camera_node}.parameters.{key}"
+        return f"ports.{self.name}.links.{letter}.camera.{key}"
 
     @property
     def camera_links(self) -> Tuple[LinkSpec, ...]:
@@ -270,11 +306,8 @@ class Topology:
 
     @property
     def synced_fps(self) -> float:
-        """The rate the port runs under a declared frame sync: `camera.mode@fps`,
-        else `sync.fps`, else the one rate its links declare, else
-        FPS_DEFAULT."""
-        if self.camera_fps is not None:
-            return float(self.camera_fps)
+        """The rate the port runs under a declared frame sync: `sync.fps`,
+        else the one rate its links declare, else FPS_DEFAULT."""
         if self.sync.fps is not None:
             return float(self.sync.fps)
         rates = {float(l.fps) for l in self.camera_links if l.fps is not None}
@@ -304,17 +337,18 @@ class Topology:
 @dataclass(frozen=True)
 class FollowPlan:
     """What the follower copies each frame on a synced pair that follows its
-    leader: the two links, each head's host address, the gain register as
-    (address, width in bytes, byte order `le` or `be`), the register hold as
-    (address, value on, value off), and the gain one register step is, in dB."""
+    leader: the two links, each head's address on the port's bus, and the
+    gain one step is, in dB. `mapped` heads are pods: the addresses are
+    their camera maps and the gain is the GAIN row in millidecibels.
+    Otherwise they are bare heads' capture nodes, where the kernel driver's
+    gain control is written."""
 
     leader: str
     follower: str
     leader_addr: int
     follower_addr: int
-    register: Tuple[int, int, str]
-    hold: Tuple[int, int, int]
     db_per_step: float
+    mapped: bool = False
 
 
 @dataclass(frozen=True)

@@ -15,6 +15,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
+from nxs.firmware import SUPPORTED_PROTO_VERSION
+
 import yaml
 
 from nxs.client import PUSH_INTERVAL_S, SupportsTimeSync, estimate_and_push
@@ -56,6 +58,19 @@ __all__ = [
 ]
 
 log = logging.getLogger(__name__)
+
+
+def foreign_interface(client) -> Optional[int]:
+    """The interface version a unit serves when it is not this SDK's, None
+    when it is, when the transport serves none, or when the read fails."""
+    reader = getattr(client, "interface_version", None)
+    if reader is None:
+        return None
+    try:
+        version = reader()
+    except (OSError, RuntimeError, NotImplementedError):
+        return None
+    return None if version in (None, SUPPORTED_PROTO_VERSION) else int(version)
 
 
 def build_viz_rviz_config(units: List[Tuple[str, str]],
@@ -176,6 +191,65 @@ class _Channel:
     last_vals: Dict[str, object] = field(default_factory=dict)
 
 
+class _StreamHealth:
+    """One unit's sample continuity as the bridge publishes it: the samples
+    its sequence numbers say the stream lost, a device stamp that jumped
+    over one sample, and a synced stamp that moved against the device
+    clock. Each event is logged as it happens, and `summary()` counts them."""
+
+    def __init__(self, frame: str) -> None:
+        self._frame = frame
+        self._seq: Optional[int] = None
+        self._device_us: Optional[int] = None
+        self._stamp_ns: Optional[int] = None
+        self._period_us: Optional[float] = None
+        self._lost = 0
+        self._late = 0
+        self._steps = 0
+
+    def observe(self, sample, stamp: Tuple[int, int], synced: bool) -> None:
+        """Account for `sample`, published at `stamp`, `synced` when the stamp
+        is the device clock's projection rather than the arrival time."""
+        seq = int(sample.count)
+        device_us = sample.timestamp_us
+        stamp_ns = stamp[0] * 1_000_000_000 + stamp[1]
+        if self._seq is not None:
+            missing = (seq - self._seq - 1) & 0xFFFF
+            # A backward jump is the VM restarting its count, not a loss.
+            if 0 < missing < 0x8000:
+                self._lost += missing
+                log.warning("%s: %d samples lost (seq %d to %d)", self._frame, missing, self._seq, seq)
+            elif missing == 0 and device_us is not None and self._device_us is not None:
+                self._observe_step(device_us - self._device_us,
+                                   stamp_ns - self._stamp_ns if synced and self._stamp_ns is not None else None)
+        self._seq, self._device_us, self._stamp_ns = seq, device_us, stamp_ns
+
+    def _observe_step(self, device_step_us: int, stamp_step_ns: Optional[int]) -> None:
+        """One consecutive pair: the device's cadence learned from it, a jump
+        past two periods logged, and the projection's move against it."""
+        if device_step_us <= 0:
+            return
+        if self._period_us is None:
+            self._period_us = float(device_step_us)
+        elif device_step_us > 2 * self._period_us:
+            self._late += 1
+            log.warning("%s: the device stamp jumped %.1f ms over one sample (its period is %.2f ms)",
+                        self._frame, device_step_us / 1000, self._period_us / 1000)
+        else:
+            self._period_us += (device_step_us - self._period_us) / 64
+        if stamp_step_ns is not None and abs(stamp_step_ns / 1000 - device_step_us) > STAMP_STEP_US:
+            self._steps += 1
+            log.warning("%s: the synced stamp moved %.2f ms against the device clock",
+                        self._frame, (stamp_step_ns / 1000 - device_step_us) / 1000)
+
+    def summary(self) -> Optional[str]:
+        """The counts as one line, or None when the stream stayed whole."""
+        if not (self._lost or self._late or self._steps):
+            return None
+        return (f"{self._frame}: {self._lost} samples lost, {self._late} device stamps jumped, "
+                f"{self._steps} synced stamps moved")
+
+
 class Ros2Bridge:
     """Publishes decoded samples for a set of unit plans. `runtime` defaults to
     the rclpy wrapper (ImportError without ROS 2); `resolver` turns a message
@@ -194,6 +268,7 @@ class Ros2Bridge:
         self._runtime = runtime if runtime is not None else _RclpyRuntime()
         self._channels: List[List[_Channel]] = []
         self._frames = [sanitize_ros_name(u.frame_id) for u in units]
+        self._health = [_StreamHealth(u.frame_id) for u in units]
         self._epochs = [u.epoch for u in units]
         if stamp_mode == STAMP_ITOW:
             # Epoch-less units warn once here and never take the itow path.
@@ -239,7 +314,8 @@ class Ros2Bridge:
         """Map one decoded sample onto the unit's topics. Returns the
         number of messages published (fillers may suppress)."""
         frame = self._frames[unit_idx]
-        stamp = self._stamp(unit_idx, sample)
+        stamp, synced = self._stamp(unit_idx, sample)
+        self._health[unit_idx].observe(sample, stamp, synced)
         published = 0
         for ch in self._channels[unit_idx]:
             out = fill_publication(ch.publication, sample.values)
@@ -272,17 +348,23 @@ class Ros2Bridge:
         return published
 
     def shutdown(self):
+        for health in self._health:
+            if (line := health.summary()) is not None:
+                log.warning("%s", line)
         self._runtime.shutdown()
 
     def unit_frame(self, unit_idx: int) -> str:
         return self._units[unit_idx].frame_id
 
-    def _stamp(self, unit_idx: int, sample) -> Tuple[int, int]:
+    def _stamp(self, unit_idx: int, sample) -> Tuple[Tuple[int, int], bool]:
+        """The sample's stamp, and whether it follows the device clock (a
+        synced projection, the device time or a GNSS epoch) rather than the
+        arrival time."""
         if self._stamp_mode == STAMP_ITOW \
                 and (epoch := self._epochs[unit_idx]) is not None:
             stamp = self._stamp_from_itow(epoch, sample)
             if stamp is not None:
-                return stamp
+                return stamp, True
             self._warn_stamp_fallback(unit_idx, "no valid GNSS epoch in "
                                                 "the stream",
                                       "the synced projection")
@@ -291,15 +373,15 @@ class Ros2Bridge:
             if sync is not None:
                 stamp = sync.project_to_realtime(sample.timestamp_us)
                 if stamp is not None:
-                    return stamp
+                    return stamp, True
             self._warn_arrival(unit_idx, "no time-sync observation yet")
         elif self._stamp_mode == STAMP_DEVICE \
                 and sample.timestamp_us is not None:
-            return stamp_from_us(sample.timestamp_us)
+            return stamp_from_us(sample.timestamp_us), True
         elif self._stamp_mode != STAMP_ARRIVAL:
             self._warn_arrival(unit_idx, "transport carries no wire "
                                          "timestamp")
-        return self._runtime.now_stamp()
+        return self._runtime.now_stamp(), False
 
     def _stamp_from_itow(self, epoch: Tuple[str, str],
                          sample) -> Optional[Tuple[int, int]]:
@@ -336,35 +418,88 @@ class Ros2Bridge:
 
 
 SILENT_UNIT_WARN_S = 5.0
+#: A synced stamp that moves this far against the device clock between two consecutive samples
+#: is a re-anchor of the projection, not the sensor's cadence.
+STAMP_STEP_US = 1000
 _held_run_locks: Dict[str, int] = {}
 
 
-def acquire_run_lock(tokens):
-    """Take the single-instance lock for a streaming bridge run: an exclusive
-    `flock` on a file keyed by the resolved target set, released by the kernel
-    when the process ends. Returns the held fd; SystemExit names another holder."""
-    key = hashlib.sha1("\n".join(sorted(tokens)).encode()).hexdigest()[:12]
-    if key in _held_run_locks:
-        return _held_run_locks[key]
-    path = os.path.join(tempfile.gettempdir(), f"nxs-ros2-{key}.lock")
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+def acquire_run_lock(tokens, names=None):
+    """Take the single-instance locks for a streaming bridge run: one
+    exclusive `flock` file per bridged unit, keyed by its link, released by
+    the kernel when the process ends, so a suite bridge and a `--unit`
+    bridge of the same unit meet on one file. Returns the held fds, in
+    token order; SystemExit names the holder: nxsd, which serves the unit
+    from its data plane, or another bridge."""
+    names = list(names) if names is not None else [None] * len(tokens)
+    held, taken = [], []
+    for token, name in sorted(zip(tokens, names), key=lambda pair: pair[0]):
+        key = hashlib.sha1(token.encode()).hexdigest()[:12]
+        if key in _held_run_locks:
+            held.append(_held_run_locks[key])
+            continue
+        path = _run_lock_path(key)
         try:
-            holder = os.read(fd, 32).decode(errors="replace").strip()
+            fd = _open_run_lock(path)
+        except OSError as exc:
+            for key_taken in taken:
+                os.close(_held_run_locks.pop(key_taken))
+            raise SystemExit(f"nxs ros2: the bridge lock {path} does not open: "
+                             f"{exc.strerror or exc}\n  - ls -l {path}") from None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
-            holder = ""
-        os.close(fd)
-        who = f" (pid {holder})" if holder else ""
-        raise SystemExit(
-            f"nxs ros2: another instance{who} is already serving these "
-            f"units — stop it first; concurrent bridges duplicate every "
-            f"ROS node and contend on the device buses") from None
-    os.ftruncate(fd, 0)
-    os.write(fd, str(os.getpid()).encode())
-    _held_run_locks[key] = fd
+            try:
+                holder = os.read(fd, 32).decode(errors="replace").strip()
+            except OSError:
+                holder = ""
+            os.close(fd)
+            # The locks this call took go back: a refused run holds nothing.
+            for key_taken in taken:
+                os.close(_held_run_locks.pop(key_taken))
+            raise SystemExit(_lock_refusal(holder, name)) from None
+        os.ftruncate(fd, 0)
+        os.write(fd, str(os.getpid()).encode())
+        _held_run_locks[key] = fd
+        taken.append(key)
+        held.append(fd)
+    return held
+
+
+def _run_lock_path(key: str) -> str:
+    """A unit's run lock, in the state store the daemon and the operator
+    share: a world-writable sticky directory refuses root another user's
+    file (`fs.protected_regular`), and the store's group directory does not."""
+    from nxs.cam import port_state
+
+    locks = port_state.ensure_dir(port_state.state_dir() / "ros2")
+    return str(locks / f"{key}.lock")
+
+
+def _open_run_lock(path: str) -> int:
+    """The lock file's descriptor, created for the owner and the store's
+    group; a file another user made keeps its mode, since only its owner
+    may change it."""
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o660)
+    if os.fstat(fd).st_uid == os.getuid():
+        os.fchmod(fd, 0o660)
     return fd
+
+
+def _lock_refusal(holder: str, name) -> str:
+    """The refusal for a unit another process bridges: the daemon, named with
+    every unit its data plane serves, or another bridge."""
+    from nxs.daemon import data_plane
+
+    unit = name or "these units"
+    plane = data_plane()
+    if plane is not None and holder.isdigit() and int(holder) == plane["pid"]:
+        served = ", ".join(plane["units"]) or unit
+        return (f"nxs ros2: nxsd (pid {holder}) serves {served} on this host\n"
+                f"  - sudo systemctl stop nxsd, for a bridge of your own")
+    who = f" (pid {holder})" if holder else ""
+
+    return f"nxs ros2: another bridge{who} serves {unit}\n  - stop it first"
 
 
 READ_RETRY_BACKOFF_S = 2.0
@@ -383,6 +518,9 @@ def run_bridge(clients: list, bridge: Ros2Bridge,
     sys.setswitchinterval(0.0005)
     q: queue.Queue = queue.Queue(maxsize=queue_size)
     stop = threading.Event()
+    # A unit back on another interface (a firmware it rebooted into) is left alone from then on:
+    # its bytes are another map, and a time-sync push would write at an address of that map.
+    detached = [False] * len(clients)
 
     def read(idx: int, client):
         # A reader outlives transient transport faults: an error disarms the
@@ -401,6 +539,12 @@ def run_bridge(clients: list, bridge: Ros2Bridge,
                 if not stop.is_set():
                     return
             except Exception as e:
+                if (foreign := foreign_interface(client)) is not None:
+                    detached[idx] = True
+                    log.warning("%s: speaks interface version %d now, this nxs speaks %d: "
+                                "detached, nxs switch upgrades it", bridge.unit_frame(idx),
+                                foreign, SUPPORTED_PROTO_VERSION)
+                    return
                 log.warning("%s: sample stream error: %s — retrying in %g s",
                             bridge.unit_frame(idx), e, READ_RETRY_BACKOFF_S)
                 stop.wait(READ_RETRY_BACKOFF_S)
@@ -443,7 +587,7 @@ def run_bridge(clients: list, bridge: Ros2Bridge,
             if now - last_push >= PUSH_INTERVAL_S:
                 last_push = now
                 for i, client in enumerate(clients):
-                    if not isinstance(client, SupportsTimeSync):
+                    if not isinstance(client, SupportsTimeSync) or detached[i]:
                         continue
                     try:
                         estimate_and_push(client, pings=0)
@@ -482,7 +626,11 @@ def run_bridge(clients: list, bridge: Ros2Bridge,
     finally:
         sys.setswitchinterval(prev_switch)
         stop.set()
-        for client in clients:
+        for i, client in enumerate(clients):
+            # The unit overwrites what the host leaves unread past its queue.
+            if lost := getattr(client, "lost_samples", None):
+                log.warning("%s: the unit overwrote %d samples before the host read them",
+                            bridge.unit_frame(i), lost)
             try:
                 client.stop_stream()
             except Exception:

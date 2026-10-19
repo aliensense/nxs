@@ -13,6 +13,7 @@ from .models import (
     Meta,
     CmdStep,
     DeviceStep,
+    RawWriteStep,
     ReadStep,
     ExpectStep,
     RetryBlockStep,
@@ -132,6 +133,16 @@ class ConfigHandler:
                 )
                 continue
 
+            # Raw write: {raw: ADR_ALIAS, value: [bytes]}, no register framing.
+            if "raw" in item:
+                out.append(
+                    self._parse_raw(
+                        item, addresses, where=f"{seq_name}[{i}]",
+                        sleep_ms=sleep_ms, comment=comment,
+                    )
+                )
+                continue
+
             # Expect step: {expect|poll: ADR_ALIAS, reg, offset, value, mask?, op?,
             # timeout_ms?, poll_ms?}; poll requires timeout_ms.
             if "expect" in item or "poll" in item:
@@ -237,7 +248,7 @@ class ConfigHandler:
 
             raise ValueError(
                 f"Sequence '{seq_name}' step {i} must contain 'cmd', 'device', "
-                "'read', 'expect', 'poll' or 'retry'"
+                "'raw', 'read', 'expect', 'poll' or 'retry'"
             )
 
         return out
@@ -271,6 +282,28 @@ class ConfigHandler:
             offset=self._to_byte(item.get("offset", 0), f"{where}.offset"),
             length=self._to_int(item.get("length", 1), f"{where}.length"),
             store=str(store) if store is not None else None,
+            sleep_ms=sleep_ms,
+            comment=comment,
+        )
+
+    def _parse_raw(
+        self,
+        item: Dict[str, Any],
+        addresses: Dict[str, int],
+        where: str,
+        sleep_ms: int,
+        comment: Optional[str],
+    ) -> RawWriteStep:
+        """Normalize a raw write (``raw`` holds the device alias, ``value`` the
+        bytes sent); ValueError unless ``value`` is a non-empty list of bytes."""
+        device = self._resolve_device(item["raw"], addresses, where)
+        value = item.get("value")
+        if not isinstance(value, list) or not value:
+            raise ValueError(f"{where}: a raw write's value is a non-empty list of bytes")
+        return RawWriteStep(
+            kind="raw",
+            device=device,
+            data=[self._to_byte(v, f"{where}.value[{j}]") for j, v in enumerate(value)],
             sleep_ms=sleep_ms,
             comment=comment,
         )

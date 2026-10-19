@@ -3,38 +3,65 @@
 
 """The flows of a port that serves the sensor on its own bus: the sensor's
 lanes and its I2C reach the host as they are, and an NXS unit, when the link
-carries one, answers on the same bus at its own address. The bring-up is
-the unit's program, the ready gate, and the family's start. The sensor's
-own stream gate stands where a hub's CSI output gate does: a capture
-consumer sees the stream start because `stream` and `capture` stop the
-sensor, open the consumer, and start it again.
+carries one, answers on the same bus at its own address. The port's graph
+image composes against the connector's program (`program`) and walks its
+head alone: the pod's or the host's run of the personality, a smart
+camera's rows on its camera door. The head's own stream gate stands where a
+hub's CSI output gate does: a capture consumer sees the stream start
+because `stream` and `capture` stop the head, open the consumer, and start
+it again.
 
 The module answers the flows surface the verbs dispatch to and carries no
-chip knowledge: every write comes from the sensor's law family."""
+chip knowledge: its plans are the sensor's law family's, which judge a
+bring-up and a knob and state the port's CSI contract."""
 
 from __future__ import annotations
 
+import functools
 import inspect
 from fractions import Fraction
 from typing import Any, Dict, List, Optional, Tuple
 
 from .contracts import (FPS_DEFAULT, CsiContract, InfeasibleConfig, LinkSpec, RateRange,
                         Topology, VcGeometry)
-from .descriptors import FREERUN, resolve_mode
-from .hubs import sensor_address
-from .plan import RawConfig, scan_forbidden
+from . import laws
+from .descriptors import resolve_mode
+
+from .hubs import is_smart_camera, sensor_address
+from .map_knob import map_knob, rate as map_rate
+from .plan import RawConfig
 
 #: The transport the port's CSI contract records: the sensor's own lanes.
 TRANSPORT = "direct"
-#: The hard ready gate after a unit run: the head answers the host within
-#: this budget, so the bus token is back before the host writes.
-READY_GATE_MS = 1500
 #: Rates this close (relative) are the same rate: a declared rate is a
 #: decimal, a law's rate a float.
 _RATE_TOLERANCE = 1e-3
-#: Family attributes that start with `knob_` and are programs or hooks, not
-#: live knobs.
-_NOT_KNOBS = ("timing_start", "fast_trigger", "readback")
+@functools.lru_cache(maxsize=1)
+def program() -> bytes:
+    """The program a graph image of a port with no hub carries: one phase,
+    `idle`, that writes nothing. Such a port's walks run its head alone,
+    and an image composes against a program whose `phase` parameter its
+    walks' record names. The program is compiled here once, the same for
+    every port, and never sealed: no rig's fact rides it."""
+    from nxs import I2cProfile, Port, PortDirection, PortType
+    from nxs.compiler import HubDevice
+    from nxs.image import serialize
+
+    class Connector(HubDevice):
+        """The connector's program: the one phase, idle."""
+
+        I2C_PROFILE = I2cProfile(addr_bytes=2)
+        PHASES = {"idle": 0}
+        PORTS = (Port("csi.A", PortType.CSI, PortDirection.OUTPUT),)
+
+        def probe(self):
+            pass
+
+        def configure(self, config):
+            self.declare_param("phase", values=[0], default=0)
+            self.select("phase", {0: lambda: None})
+
+    return serialize(Connector().compile({}))
 
 
 def _call(fn, *args, **kwargs):
@@ -51,7 +78,7 @@ def sensor_module(hub, link, topology: Optional[Topology] = None):
     at the mode's own line, so the port adds nothing to it."""
     del topology
     compatible = str(getattr(link, "sensor_compatible", link))
-    module = hub.chip_module(compatible)
+    module = laws.laws(hub.descriptor(compatible))
     if module is None:
         raise InfeasibleConfig(f"sensor {compatible} binds no law family in hub {hub.name}")
     return module
@@ -71,7 +98,7 @@ def resolve_modes(hub, links, mode=None,
     for link in links:
         token = mode.get(link.name) if isinstance(mode, dict) else mode
         if token is None:
-            token = link.mode or (topology.camera_mode if topology is not None else None)
+            token = link.mode
         module = sensor_module(hub, link, topology)
         sen = module.descriptor()
         try:
@@ -91,9 +118,12 @@ def fps_range(hub, topology: Topology, link, mode: str,
     module = sensor_module(hub, link, topology)
     ceiling = float(_call(module.fps_ceiling, mode))
     floor = float(_call(module.fps_floor, mode=mode))
-    if not hasattr(module, "vmax_for_fps"):
-        return RateRange(floor=ceiling, ceiling=ceiling, binds="mode table")
-    return RateRange(floor=floor, ceiling=ceiling, binds="datasheet frame")
+    if hasattr(module, "vmax_for_fps"):
+        return RateRange(floor=floor, ceiling=ceiling, binds="datasheet frame")
+    if laws.family_for(module.descriptor()) == laws.NATIVE:
+        # A smart camera runs any rate its row spans, down to its longest frame's.
+        return RateRange(floor=floor, ceiling=ceiling, binds="rate row")
+    return RateRange(floor=ceiling, ceiling=ceiling, binds="mode table")
 
 
 def _rate(hub, module, mode: str, asked: Optional[float], spec: LinkSpec,
@@ -103,7 +133,7 @@ def _rate(hub, module, mode: str, asked: Optional[float], spec: LinkSpec,
     lawful range."""
     sen = module.descriptor()
     rates = fps_range(hub, topology, spec, mode)
-    declared = asked if asked is not None else (spec.fps or topology.camera_fps)
+    declared = asked if asked is not None else spec.fps
     if declared is None:
         return min(max(FPS_DEFAULT, rates.floor), rates.ceiling)
     declared = float(declared)
@@ -119,33 +149,29 @@ def _rate(hub, module, mode: str, asked: Optional[float], spec: LinkSpec,
         f"{rates.floor:g} to {rates.ceiling:g} fps", alternatives=[f"--fps {rates.whole()[1]}"])
 
 
-def _start_steps(module, spec: LinkSpec, mode: str, rate: float,
-                 vmax: Optional[int]) -> Tuple[List[Dict[str, Any]], float]:
-    """The host's writes after the unit's run, and the rate they set: the
-    family's timing program at the rate's frame length, else its stream
-    gate."""
+def _vmax_rate(module, mode: str, vmax: int) -> float:
+    """The rate a fixed frame length runs at by the family's timing law.
+
+    Raises:
+        InfeasibleConfig: A family without a frame-length law: its mode's
+            table sets the frame.
+    """
     sen = module.descriptor()
-    timing = getattr(module, "knob_timing_start", None)
-    if timing is None:
-        if vmax is not None:
-            raise InfeasibleConfig(f"{sen.compatible} has no frame-length law, and a "
-                                   f"frame length (vmax) was asked",
-                                   alternatives=["no vmax: the mode's table sets the frame"])
-        start, _stop = _stream_gate(module)
-        return list(start()), rate
+    if getattr(module, "knob_timing_start", None) is None:
+        raise InfeasibleConfig(f"{sen.compatible} has no frame-length law, and a "
+                               f"frame length (vmax) was asked",
+                               alternatives=["no vmax: the mode's table sets the frame"])
     hmax = int(sen.modes[mode]["timing"]["hmax"])
-    if vmax is None:
-        vmax = int(module.vmax_for_fps(float(rate), hmax))
-    else:
-        rate = int(sen.limits["inck_hz"]) / (hmax * int(vmax))
-    extra = {"inck_hz": int(spec.inck_hz)} if spec.inck_hz is not None else {}
-    return list(_call(timing, hmax, int(vmax), mode=mode, trigger=FREERUN, **extra)), rate
+    return int(sen.limits["inck_hz"]) / (hmax * int(vmax))
 
 
 def build_solo(hub, topology: Topology, link: str, mode=None,
                vmax: Optional[int] = None, fps=None) -> Tuple[RawConfig, CsiContract]:
-    """The bring-up of the port's link: the unit runs its personality at the
-    marker, the host gates on the head answering, then starts it."""
+    """The bring-up of the port's link judged by the sensor's laws, and the
+    CSI contract the capture takes: the mode, the rate the law runs it at,
+    the lanes the port receives, a table-only part's stream gate, a pod and
+    the sensor at addresses of their own on the port's bus. The port's
+    graph image runs the bring-up (`compose_walks`), so the plan is empty."""
     spec = topology.link(link)
     if isinstance(fps, dict):
         fps = fps.get(link)
@@ -160,34 +186,27 @@ def build_solo(hub, topology: Topology, link: str, mode=None,
     if int(mipi.lanes) != lanes:
         raise InfeasibleConfig(
             f"{sen.compatible} {mode} drives {mipi.lanes} lanes and the port "
-            f"receives {lanes}", alternatives=[f"csi_lanes: {int(mipi.lanes)}"])
-    steps, rate = _start_steps(module, spec, mode, rate, vmax)
-
-    cfg = RawConfig(f"direct-{link}-{mode}")
-    addr = sensor_address(hub, spec)
-    # Nothing translates on the port's own bus: a unit at the sensor's
-    # address would take every sensor write, and the sensor every unit write.
-    if any(int(u.alias_addr) == int(addr) for u in spec.nxs_units):
-        raise InfeasibleConfig(
-            f"link {link}: the unit and the sensor both answer at {int(addr):#04x} on "
-            f"the port's own bus",
-            alternatives=["unit.target: the address the unit straps",
-                          "sensor_addr: the address the sensor straps"])
-    cfg.set_address("ADR_SENSOR", addr)
-    cfg.add_unit_program(f"unit_program_{link}", link, mode, FREERUN)
-    alive = getattr(module, "expect_alive", None)
-    if alive is not None:
-        cfg.add(f"ready_{link}", alive(READY_GATE_MS))
-    if steps:
-        cfg.add(f"start_{link}", steps)
-    scan_forbidden(cfg, {addr: sen.runtime_forbidden})
+            f"receives {lanes}",
+            alternatives=[f"the host's {topology.carrier.split('/')[-1]}_lanes: {int(mipi.lanes)}"])
+    if not is_smart_camera(hub, spec):
+        if vmax is not None:
+            rate = _vmax_rate(module, mode, vmax)
+        addr = sensor_address(hub, spec)
+        # Nothing translates on the port's own bus: a unit at the sensor's
+        # address would take every sensor write, and the sensor every unit write.
+        if any(int(u.alias_addr) == int(addr) for u in spec.nxs_units):
+            raise InfeasibleConfig(
+                f"link {link}: the unit and the sensor both answer at {int(addr):#04x} on "
+                f"the port's own bus",
+                alternatives=["unit.target: the address the unit straps",
+                              "sensor_addr: the address the sensor straps"])
     csi = CsiContract(
         port=0, transport=TRANSPORT,
         virtual_channels=(VcGeometry(vc=int(spec.csi_vc), dt=mipi.data_type,
                                      width=mipi.width, height=mipi.height,
                                      bit_depth=mipi.bit_depth),),
         rates={link: float(rate)})
-    return cfg, csi
+    return RawConfig(f"direct-{link}-{mode}"), csi
 
 
 def build_dual(hub, topology: Topology, mode=None, vmax=None, **_) -> None:
@@ -218,38 +237,20 @@ def build_trigger_off(hub, topology: Topology) -> RawConfig:
 def _stream_gate(module):
     """The family's `start` and `stop`: the port has no hub to gate the
     lanes, so a sensor whose family has no stream gate cannot be brought
-    up, captured or parked here."""
+    up, captured or parked here. A head that gates its own stream through
+    its camera map (its law offers the gate and the host writes no sensor
+    register) has nothing for the host to write."""
     hooks = tuple(getattr(module, name, None) for name in ("start", "stop"))
     if any(hook is None for hook in hooks):
+        law = getattr(module, "apply_law", None)
+        if law is not None and getattr(law(), "stream_gate", False):
+            return (lambda: [], lambda: [])
         sen = module.descriptor()
         raise InfeasibleConfig(
             f"{sen.compatible}'s family has no stream gate, and the port has no hub "
             f"to gate the lanes", alternatives=["controls.standby (the stream gate) "
                                                  "in the personality"])
     return hooks
-
-
-def _gate(module, enable: bool) -> List[Dict[str, Any]]:
-    start, stop = _stream_gate(module)
-    return list((start if enable else stop)())
-
-
-def csi_gate_steps(hub, topology: Topology, enable: bool) -> List[Dict[str, Any]]:
-    """The capture-consumer start choreography's gate: the sensor's own
-    stream gate. The caller points `ADR_SENSOR` at the link's sensor."""
-    return _gate(sensor_module(hub, topology.links[0], topology), enable)
-
-
-def build_park(hub, topology: Topology) -> RawConfig:
-    """Park: the sensor in standby, by best effort (a head that never came
-    up is already off)."""
-    cfg = RawConfig("down")
-    for spec in topology.links:
-        cfg.set_address("ADR_SENSOR", sensor_address(hub, spec))
-        steps = _gate(sensor_module(hub, spec, topology), False)
-        if steps:
-            cfg.add(f"sensor_standby_{spec.name}", steps, best_effort=True)
-    return cfg
 
 
 def open_window(hub, i2c, topology: Topology, link=None) -> None:
@@ -316,45 +317,29 @@ def viewer_hints_by_link(hub, topology: Topology, links=None, modes=None,
             for spec in (links or topology.links)}
 
 
-def _sensor_knobs(module) -> List[str]:
-    return sorted(name[len("knob_"):] for name in dir(module)
-                  if name.startswith("knob_") and name[len("knob_"):] not in _NOT_KNOBS
-                  and callable(getattr(module, name)))
-
-
-def knob_names(hub, link=None) -> List[str]:
-    """The live knobs: a link's sensor's, or the union over the hub's sensors."""
-    if link is not None:
-        return _sensor_knobs(sensor_module(hub, link))
-    names: set = set()
-    for chip in hub.sensors():
-        module = hub.chip_module(chip)
-        if module is not None:
-            names.update(_sensor_knobs(module))
-    return sorted(names)
-
-
 def build_knob(hub, topology: Topology, knob: str, value: str, *,
                link: Optional[str] = None,
                readings: Optional[Dict[str, int]] = None,
                mode: Optional[str] = None) -> RawConfig:
-    """A live-knob plan: the knob's steps on the link's sensor. A knob whose
-    arithmetic rides the running timing takes it from ``readings``."""
+    """A live-knob plan: the knob's steps on the link's sensor, or the knob's
+    row committed on the camera map of a head that serves one, a pod's or a
+    smart camera's, as `caps` and `get` name it. A knob whose arithmetic
+    rides the running timing takes it from ``readings``."""
     spec = topology.link(link) if link else topology.links[0]
     module = sensor_module(hub, spec, topology)
     sen = module.descriptor()
-    have = _sensor_knobs(module)
-    if knob not in have:
-        raise KeyError(f"unknown knob {knob!r} for {sen.compatible}; have {have}")
-    live = {k: int(v) for k, v in (readings or {}).items() if k in ("hmax", "vmax") and v}
-    try:
-        number: Any = int(str(value), 0)
-    except ValueError:
-        number = value
-    steps = _call(getattr(module, f"knob_{knob}"), number, mode=mode, **live)
-    cfg = RawConfig(f"set-{knob}")
-    addr = sensor_address(hub, spec)
-    cfg.set_address("ADR_SENSOR", addr)
-    cfg.add(f"set_{knob}", list(steps))
-    scan_forbidden(cfg, {addr: sen.runtime_forbidden})
-    return cfg
+    if is_smart_camera(hub, spec) or spec.nxs_units:
+        from .pods import camera_map_knobs
+
+        # The rows an APPLY commit takes and their forms: a gate, a trigger or
+        # a mode row has its own verb, and a read-only row takes no value.
+        have = camera_map_knobs(hub, spec) or []
+        if knob not in have:
+            raise KeyError(f"unknown knob {knob!r} for {sen.compatible}; have {have}")
+        if knob == "fps":
+            _rate(hub, module, mode or default_mode(hub, spec, topology), map_rate(value), spec, topology)
+        return map_knob(spec.name, knob, value)
+    # A bare head's knob is its personality's apply on the host, which judges
+    # the value under the head's law (`compose_heads.bare_knob`): no plan here.
+    del readings
+    return RawConfig(f"set-{knob}")

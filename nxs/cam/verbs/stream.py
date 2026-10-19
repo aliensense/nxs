@@ -13,7 +13,8 @@ from nxs.cam import port_state
 from nxs.cam.port_state import port_capture_id
 from nxs.cam import capture, viewers
 from nxs.cam.identity import _require_nxs_hub
-from nxs.cam.select import _hub_for, _port_name, _refuse, _refuse_pod_only, _require_up, select_port_links
+from nxs.cam.select import (_hub_for, _port_name, _refuse, _refuse_pod_only, _require_up,
+                            require_no_daemon_run, select_port_links)
 from nxs.cam.verbs import verify
 
 
@@ -22,6 +23,9 @@ def _selected_up_links(args, verb):
     must be up; a bare invocation narrows to the links that are."""
     topology, selected = select_port_links(args, require_port=True)
     _require_nxs_hub(topology, verb)
+    # The port is the daemon's through its bring-up, whichever links the
+    # invocation names and whatever they read.
+    require_no_daemon_run(_port_name(topology), verb)
     if getattr(args, "_link_tokens", None):
         _require_up(topology, selected, verb)
     else:
@@ -71,6 +75,9 @@ def cmd_stream(args: argparse.Namespace) -> int:
 
 def cmd_capture(args: argparse.Namespace) -> int:
     topology, selected = _selected_up_links(args, "capture")
+    if not selected:
+        raise _refuse(f"nxs: no link is up on {_port_name(topology)}",
+                      f"nxs {_port_name(topology)} <link> on")
     if len(selected) != 1:
         return _capture_port(args, topology, selected)
     link = selected[0]

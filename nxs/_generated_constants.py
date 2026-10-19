@@ -4,6 +4,9 @@
 
 # ruff: noqa: E501
 
+# The product version: the wheel and the firmware of a release carry it.
+NXS_VERSION = "1.2.0"
+
 
 class NxsRegisters:
 
@@ -64,10 +67,10 @@ class NxsRegisters:
         PROGRAM_SIZE_LO = 17  # Bytecode image size, LE low byte. A 2-byte announce opens the upload session: it requires `XFER_TYPE = 0` and no live session, arms `CMD_ERR_PENDING`, and resolves 0 (session open) or EBUSY / EPROTO / EFBIG — the host reads that edge before streaming a single chunk.
         PROGRAM_SIZE_HI = 18
         PARAM_SELECT = 19  # Chooses which param descriptor is exposed. Under the peek view of a camera slot it selects the run parameter `PARAM_SET_VALUE` stages, and the view stays.
-        PARAM_SET_VALUE = 20  # 4 bytes (u32 LE): sets the selected parameter of the loaded driver. Under the peek view of a camera slot (`Cmd::PEEK_SLOT` on it, `DRIVER_SELECT` echoing `DRIVER_VIEW_PEEK`) it stages the value for that slot's next `Cmd::CAM_RUN` instead: nothing is patched, the stage holds one value per parameter (`MAX_PARAMS` entries), and reading the window returns the staged value, else the value the slot's last completed run ended with, else the slot's compiled default. The stage is dropped when a different slot is peeked and consumed by the run.
+        PARAM_SET_VALUE = 20  # 4 bytes (u32 LE): sets the selected parameter of the loaded driver. Under the peek view of a camera slot (`Cmd::PEEK_SLOT` on it, `DRIVER_SELECT` echoing `DRIVER_VIEW_PEEK`) it stages the value for that slot's next `Cmd::CAM_RUN` instead: nothing is patched, the stage holds one value per parameter (eight entries), and reading the window returns the staged value, else the value the slot's last completed run ended with, else the slot's compiled default. The stage is dropped when a different slot is peeked and consumed by the run.
         STORE_SELECT = 24  # Slot for SAVE / DELETE. Under `XFER_TYPE = CALIB` it doubles as the read-back page index: the `PROGRAM_DATA` window then serves calibration-record bytes [page*32 .. page*32+31] of the live record. Under `XFER_TYPE = PERSONALITY_INFO` it is `slot << 5 | page` of the descriptor trailer served (under `PERSONALITY_INFO_HI` the same select names page 32 + page), and the write is async like a command: `CMD_ERROR` reads `CMD_ERR_PENDING` until the page is staged, then 0, ENOENT (empty slot), ENOEXEC (a driver slot), or ENODEV (no camera backend). For `Cmd::CAM_RUN` it is the slot to run.
         PROTO_VERSION = 25  # Read-only. Version of the register-map contract (currently `PROTO_VERSION_VALUE`).
-        XFER_TYPE = 26  # Selects the consumer of `PROGRAM_DATA` writes: 0 = VM bytecode (default; NXS upload), 1 = DFU image bytes (forwarded to the DFU sink), 2 = config record (identity commissioning; `PROGRAM_DATA` carries a `CONFIG_RECORD_SIZE`-byte record and `Cmd::STORE_PERSIST` commits it), 3 = time-sync record (a `TIME_SYNC_RECORD_SIZE`-byte volatile record applied as its 20th byte lands; never persisted), 4 = calibration record (`Calibration.RECORD_SIZE` bytes staged in 32-byte chunks, applied by `Cmd::CALIB_APPLY`), 5 = build identity (read-only `git describe` string, `BUILD_INFO_SIZE` bytes), 6 = personality info (read-only: the descriptor trailer of the camera personality in slot `STORE_SELECT >> 5`, page `STORE_SELECT & 0x1F`, 32 bytes per page), 7 = personality info, second bank (the same select names page 32 + `STORE_SELECT & 0x1F`; the two banks cover a `MAX_TRAILER_SIZE` trailer). The `_regs[PROGRAM_DATA..]` window mirrors the current record for read-back in modes 2 and 3; modes 4 to 7 serve their record through the same window page-by-page via `STORE_SELECT`. A write during a live transfer session (an open upload or DFU push) is refused silently — the mode does not move, and the writer detects refusal by reading it back; sessions end at their terminator (`Cmd::LOAD`, `DFU_FINISH`), by `Cmd::XFER_ABORT`, or after `XFER_SESSION_STALE_MS` of holder silence.
+        XFER_TYPE = 26  # Selects the consumer of `PROGRAM_DATA` writes: 0 = VM bytecode (default; NXS upload), 1 = DFU image bytes (forwarded to the DFU sink), 2 = config record (identity commissioning; `PROGRAM_DATA` carries a `CONFIG_RECORD_SIZE`-byte record and `Cmd::STORE_PERSIST` commits it), 3 = time-sync record (a `TIME_SYNC_RECORD_SIZE`-byte volatile record applied as its 20th byte lands; never persisted), 4 = calibration record (168 bytes staged in 32-byte chunks, applied by `Cmd::CALIB_APPLY`), 5 = build identity (read-only `git describe` string, `BUILD_INFO_SIZE` bytes), 6 = personality info (read-only: the descriptor trailer of the camera personality in slot `STORE_SELECT >> 5`, page `STORE_SELECT & 0x1F`, 32 bytes per page), 7 = personality info, second bank (the same select names page 32 + `STORE_SELECT & 0x1F`; the two banks cover a 2048-byte trailer). The `_regs[PROGRAM_DATA..]` window mirrors the current record for read-back in modes 2 and 3; modes 4 to 7 serve their record through the same window page-by-page via `STORE_SELECT`. A write during a live transfer session (an open upload or DFU push) is refused silently — the mode does not move, and the writer detects refusal by reading it back; sessions end at their terminator (`Cmd::LOAD`, `DFU_FINISH`), by `Cmd::XFER_ABORT`, or after `XFER_SESSION_STALE_MS` of holder silence.
         XFER_PHASE = 27  # Read-only transfer phase. During a DFU it is a `DfuPhase` the master polls to pace `DFU_BEGIN`'s erase and detect a rejected write (detail in `CMD_ERROR`). While an on-device calibration procedure runs (started by `Cmd::CAL_GYRO`/`CAL_MAG_START`) it is the `Calibration.CalState` (0 idle, 1 gyro-wait-still, 2 gyro-averaging, 3 mag-collect); the procedure completes when it returns to idle, its verdict in `CMD_ERROR`. DFU and calibration never run at once — a procedure claims the transfer session when its start command is accepted (`Cmd::CAL_GYRO`/`CAL_MAG_START` and their Cyphal equivalents answer `EBUSY` when a contender holds it) and releases it on the edge back to idle, so the contender's gate refuses the overlap. While a camera run is live (`Cmd::CAM_RUN` claims the session the same way) it mirrors `CAM_STATE`: the `Personality.CamRunState` LOADING, PROBING, CONFIGURING, then the terminal DONE / PROBE_FAILED / FAULTED / ABORTED, on whose edge the session releases with the verdict in `CMD_ERROR`. IDLE when nothing is active.
         XFER_ACK = 28  # Read-only single-byte progress counter, untearable under an I²C poll. During a DFU it is the accepted-chunk counter (mod 256): 0 after `DFU_BEGIN`, +1 per committed `PROGRAM_DATA` chunk; the master paces its push on it. While a calibration procedure runs it is the detail: gyro percent averaged, or mag rotation coverage on a 0-14 scale, where 12 is the stopping point at which a host asks the solve (which can still answer EAGAIN and keep the collection open). While a camera run is live it is the low byte of the camera VM's program counter.
         CMD_ERROR = 29  # Read-only result of the most recent host command op: 0 = OK, otherwise the positive errno value. Owned by the command-dispatch path and, while it holds the transfer session, a completing calibration procedure — the `vm_status` heartbeat never writes it, the DFU data path never zeroes it, and a bystander's refused `XFER_TYPE` write is silent — so a pending result cannot be clobbered — with one narrow exception: a command *refused* EBUSY under a held calibration session latches here, and the procedure's verdict landing in the same ~100 ms comm pass overwrites it, reading as the procedure's outcome rather than the refusal (and `ERROR_CODE` stays with VM health). The async ops — `LOAD`, store SAVE / DELETE_SLOT / CLEAR_STORE / STORE_PERSIST / PEEK_SLOT, `DFU_BEGIN`, `XFER_ABORT`, the camera ops `CAM_RUN` / `CAM_ABORT`, a `STORE_SELECT` write under `XFER_TYPE = PERSONALITY_INFO`, and a `PROGRAM_SIZE` announce — read `CMD_ERR_PENDING` from enqueue until the deferred handler resolves them; a host polls its own edge. Refusals resolve here too: EBUSY (a transfer session is live), EPROTO (wrong mode for the op), EFBIG (announce exceeds staging), ENODATA (`LOAD` on a short stage), ENOEXEC (`LOAD` parse failure), EAGAIN (the command queue was full and the op was dropped before dispatch — retry).
@@ -77,7 +80,7 @@ class NxsRegisters:
         SAMPLE_DATA = 64  # 128-byte latest-sample record window (0x40..0xBF): `latch_time_us u64 | timestamp_us u64 | seq u16 | data[SAMPLE_SIZE]`, all little-endian (offsets `SAMPLE_RECORD_*`). One latched read returns a coherent record; `latch_time_us` is stamped by the I²C target at first byte, so every poll doubles as a two-way time-sync observation. A 2-byte cursor (u16 LE) written after the register pointer, in the transaction that then reads, serves a burst of queued records instead (`SAMPLE_BURST_*`): the records from that FIFO index on, everything before it released.
         SEL_NAME_LEN = 192
         SEL_NAME = 193  # 16 bytes. Driver view: the loaded driver's name.
-        SEL_TYPE = 209  # Param view: bits[3:0] param_type (0 = enum, 1 = range), bit[4] ParamKind (0 = reload, 1 = live). Output view: NXS field_type code. Peek view: the slot's `NxsDriverImage.ImageKind` (0 driver, 1 camera).
+        SEL_TYPE = 209  # Param view: bits[3:0] param_type (0 = enum, 1 = range), bit[4] set for a parameter of `ParamKind` APPLY, which takes effect in place, and clear for every other kind. Output view: NXS field_type code. Peek view: the slot's `NxsDriverImage.ImageKind` (0 driver, 1 camera).
         SEL_PARAM_DEFAULT = 210  # Param view: 4 bytes (u32 LE).
         SEL_DRIVER_NUM_PARAMS = 211  # Driver/peek view: declared parameter count.
         SEL_DRIVER_NUM_OUTPUTS = 212  # Driver/peek view: declared output count.
@@ -183,7 +186,7 @@ class NxsRegisters:
         PEEK_SLOT = 13  # Peek store[STORE_SELECT] without loading it (STORE_SELECT = 0xFF peeks the active driver). Async like SAVE: arms `CMD_ERR_PENDING`, then `CMD_ERROR` reads 0 (peek view valid) or +errno — ENOENT empty/out-of-range slot, EBADF corrupt image, ENOTSUP foreign image version. On success the SEL window switches to the peek view: name via `SEL_NAME_LEN`/`SEL_NAME`, counts via `SEL_DRIVER_NUM_PARAMS`/`SEL_DRIVER_NUM_OUTPUTS`, `SEL_DRIVER_SLOT` echoes the peeked slot, `SEL_TYPE` the image kind (driver or camera), `SEL_DRIVER_I2C_ADDR` the latched mikroBUS address (0 unless peeking the active driver), and `DRIVER_SELECT` echoes `DRIVER_VIEW_PEEK`. The view is a snapshot — re-issue after store mutations. Peeking a camera slot also arms its run-parameter stage (`PARAM_SELECT` / `PARAM_SET_VALUE`); peeking a different slot drops the stage.
         ENTER_RECOVERY = 14  # Arm the MCUboot serial-recovery flag and cold-reset into it. The device then holds in the bootloader until a host completes an mcumgr image upload — there is no timed window to catch. Arms `CMD_ERR_PENDING`: on success the sentinel stays pending until the reset drops the bus (the NACK is the acknowledgement); a failed flag write leaves the device in the application and resolves it to the positive errno. Dispatched independently of the VM handler, like `REBOOT`, so it works on a device whose driver never loaded. The Cyphal equivalent is the `ENTER_RECOVERY` (0xA008) ExecuteCommand.
         XFER_ABORT = 15  # Deliberately close the open transfer session (bytecode upload or DFU push) and cancel any calibration procedure in progress, whichever transport started it. A cancelled procedure applies nothing; the previous record stays, and the engine's verdict (ECANCELED, visible in the Cyphal progress register) is consumed on this bus by the abort's own acknowledgement. `Cmd::CAL_MAG_STOP` is the other way out of a collection and it solves and applies, so it cannot express a cancel. Arms `CMD_ERR_PENDING`; resolves 0 when something was released, ENOENT when there was nothing to do. The abort path for a host giving up mid-transfer — a crashed host needs nothing: an idle session is reclaimable by the next contender after `XFER_SESSION_STALE_MS`.
-        CALIB_APPLY = 16  # Validate the staged calibration record (`Calibration.RECORD_SIZE` bytes written to `PROGRAM_DATA` under `XFER_TYPE = CALIB`) and apply it to the running state; `Cmd::CALIB_PERSIST` persists it. Async like SAVE: arms `CMD_ERR_PENDING`, then `CMD_ERROR` reads 0 (applied), EBUSY while a DFU or a running procedure holds the status registers, or a positive errno (EINVAL for a malformed record).
+        CALIB_APPLY = 16  # Validate the staged calibration record (168 bytes written to `PROGRAM_DATA` under `XFER_TYPE = CALIB`) and apply it to the running state; `Cmd::CALIB_PERSIST` persists it. Async like SAVE: arms `CMD_ERR_PENDING`, then `CMD_ERROR` reads 0 (applied), EBUSY while a DFU or a running procedure holds the status registers, or a positive errno (EINVAL for a malformed record).
         CAL_GYRO = 17  # Start the on-device gyro still-average: the device waits for stillness, averages the rates, and applies the bias to the running state (Save persists). `CMD_ERROR` reports acceptance (0; EBUSY during a mag collection or while a transfer session is live; EOPNOTSUPP when the active driver has no gyro vector; ENODEV with no driver); progress reads from `XFER_PHASE`/`XFER_ACK` under `XFER_TYPE = CALIB`, and the completion verdict lands in `CMD_ERROR` when the phase returns to idle.
         CAL_MAG_START = 18  # Start the on-device mag collection: rotate the vehicle while the device accumulates the ellipsoid fit; coverage progress reads from `XFER_ACK` under `XFER_TYPE = CALIB`. `CMD_ERROR` reports acceptance (0; EBUSY during a gyro procedure or while a transfer session is live; EOPNOTSUPP when the active driver has no mag vector; ENODEV with no driver).
         CAL_MAG_STOP = 19  # Close the mag collection: coverage-gate, solve, self-check, and apply on success. `CMD_ERROR` carries the verdict — 0 applied, EAGAIN insufficient coverage/points (the collection stays open and its give-up window restarts), ERANGE degenerate (non-ellipsoid) fit, EBADMSG failed the sphere self-check, EBUSY while a DFU holds the status registers; every failure keeps the previous calibration.
@@ -373,7 +376,7 @@ class NxsRegisters:
 
     BUILD_INFO_SIZE = 64  # Bytes in the build-identity record served through the `PROGRAM_DATA` window under `XFER_TYPE = BUILD_INFO` (two 32-byte pages).
 
-    XFER_TYPE_PERSONALITY_INFO_HI = 7  # `Reg::XFER_TYPE` value: the second page bank of `PERSONALITY_INFO` — `STORE_SELECT`'s five page bits name trailer page 32 + page, so the two banks serve a `MAX_TRAILER_SIZE` trailer.
+    XFER_TYPE_PERSONALITY_INFO_HI = 7  # `Reg::XFER_TYPE` value: the second page bank of `PERSONALITY_INFO` — `STORE_SELECT`'s five page bits name trailer page 32 + page, so the two banks serve a 2048-byte trailer.
 
     XFER_TYPE_PERSONALITY_INFO = 6  # `Reg::XFER_TYPE` value: read-only paged access to the descriptor trailer of the camera personality in slot `STORE_SELECT` — the modes, controls, laws and capture facts the host needs to generate a device tree, never the bytecode.
 
@@ -399,13 +402,13 @@ class NxsRegisters:
 
     SEL_TYPE_PARAM_TYPE_MASK = 15  # Param view: mask isolating `param_type` (0 = enum, 1 = range) in the low nibble of `Reg::SEL_TYPE`.
 
-    SEL_TYPE_KIND_SHIFT = 4  # Param view: bit position of `ParamKind` (0 = reload, 1 = live) within `Reg::SEL_TYPE`; the descriptor window is full, so kind rides a spare bit of `SEL_TYPE` rather than its own register.
+    SEL_TYPE_KIND_SHIFT = 4  # Param view: bit position within `Reg::SEL_TYPE` of the kind bit, set for a parameter of `ParamKind` APPLY (applied in place) and clear for every other kind; the descriptor window is full, so kind rides a spare bit of `SEL_TYPE` rather than its own register.
 
 class Calibration:
 
     class Rotation:
         """
-        Mounting-orientation codes for the calibration record.
+        The mount rotation codes, the values of a sampling personality's `MOUNT_ORIENTATION` row, composed onto the calibration.
 
         Names the physical rotation of the module relative to the vehicle
         body, as the composition R = Rz(yaw) * Ry(pitch) * Rx(roll) with
@@ -502,10 +505,10 @@ class Calibration:
         """
         On-device calibration procedure state.
 
-        The procedure state exposed to hosts: the I2C `XFER_PHASE` register
-        under `XFER_TYPE = CALIB`, and the first byte of the Cyphal
-        `calibration.progress` register. The companion detail (I2C
-        `XFER_ACK`) carries the gyro percent averaged or the mag rotation
+        The procedure state exposed to hosts: the I2C `PROC_STATE` cell
+        and the first byte of the Cyphal `calibration.progress` register.
+        The companion detail (I2C `PROC_DETAIL`) carries the gyro percent
+        averaged or the mag rotation
         coverage on the `MAG_COVERAGE_FULL` scale, `MAG_COVERAGE_ENOUGH`
         being the stopping point; a completed procedure's verdict rides
         `CMD_ERROR` on I2C and the progress record's third byte on Cyphal.
@@ -547,13 +550,25 @@ class Calibration:
 
     MAG_COVERAGE_ENOUGH = 12  # Mag coverage at which a host stops the collection and asks.
 
-    MAG_COVERAGE_FULL = 14  # Top of the mag coverage scale reported in `XFER_ACK`.
+    MAG_COVERAGE_FULL = 14  # Top of the mag coverage scale reported in `PROC_DETAIL`.
 
-    RECORD_VERSION = 1  # Layout version of the calibration record (flash and wire).
+    RECORD_VERSION = 2  # Layout version of the calibration record (flash and wire).
 
     NUM_VECTORS = 3  # Vector buckets carrying a full affine (accel, gyro, mag).
 
-    RECORD_SIZE = 168  # Packed size in bytes of the calibration record.
+    RECORD_SIZE = 256  # Bytes of the calibration record on the wire.
+
+    RECORD_BLOCK_SIZE = 64  # Bytes of one block of the record, the header block then one per vector bucket.
+
+    RECORD_ENCODER_ZERO_OFF = 4  # float32 LE radians inside the header block.
+
+    RECORD_ENCODER_TAG_OFF = 8  # u32 LE personality guard of the encoder zero inside the header block.
+
+    BUCKET_M_OFF = 0  # float32[9] LE row-major M inside a bucket's block.
+
+    BUCKET_B_OFF = 36  # float32[3] LE b inside a bucket's block.
+
+    BUCKET_TAG_OFF = 48  # u32 LE personality guard inside a bucket's block.
 
 class CyphalDefaults:
 
@@ -638,19 +653,20 @@ class NxsDevices:
         System-wide device address registry.
 
         Device addresses in a pocket clear of common camera /
-        GPIO-expander / serializer / EEPROM I²C addresses. One address per
-        board, used on every host link (I²C target and frame address).
+        GPIO-expander / serializer / EEPROM I²C addresses, used on every
+        host link (I²C target and frame address). The NXS unit owns two:
+        the unit door at `NXS` and the camera door at `NXS_CAM`
+        (`constants/nxs_map.yaml`). Both are strapped on the pod bus
+        and never spoken behind a hub, where each link's serializer
+        presents them at link aliases: 0x32 and 0x33 for link A, 0x34 and
+        0x35 for link B. The pocket 0x30..0x35 is therefore the unit's.
         """
-        NXS = 48
-        COMPUTE = 49
-        RESERVED_0X32 = 50
-        RESERVED_0X33 = 51
+        NXS = 48  # The unit door: the whole map.
+        NXS_CAM = 49  # The camera door: the map's capture cells (`constants/nxs_map.yaml`).
 
         _NAMES = {
             48: 'NXS',
-            49: 'COMPUTE',
-            50: 'RESERVED_0X32',
-            51: 'RESERVED_0X33',
+            49: 'NXS_CAM',
         }
 
     DEVICE_ADDRESS_BROADCAST = 255  # Wildcard destination — frames addressed to BROADCAST are accepted by every device on the bus.
@@ -659,20 +675,30 @@ class NxsDriverImage:
 
     class ParamKind:
         """
-        How a parameter set is applied at runtime.
+        How a commit of a parameter runs; the masked rows of one commit share one kind.
 
-        `RELOAD` patches the bytecode operand and restarts the VM
-        (re-running probe + configure — a sensor re-init); the value is
-        baked into the bytecode. `LIVE` applies without a reload: the
-        value lives in `Param::current_value` (no bytecode patch), and a
-        consumer re-reads it when the param-change counter advances.
+        Every image's metadata block and every `PARAMS` row name one of
+        these four. `APPLY` takes effect in the running state: a click
+        parameter's value lives in `Param::current_value` (no bytecode
+        patch), and a consumer re-reads it when the param-change counter
+        advances; a camera parameter applies within the frame under the
+        sensor's group hold. `RUN` re-runs the configure program with the
+        new value: a click patches the bytecode operand and restarts the
+        VM (probe + configure, a sensor re-init), so the value is baked
+        into the bytecode; a camera's run is the mode switch. `GATE` parks
+        or starts the stream, and `TRIGGER` converts the trigger of a
+        running sensor.
         """
-        RELOAD = 0
-        LIVE = 1
+        APPLY = 0  # A parameter applied in the running state: from `Param::current_value` on a click, within the frame under the sensor's group hold on a camera (the apply window of the camera door).
+        RUN = 1  # A parameter applied by a run of the configure program: a click's value patched into the bytecode and a VM restart, a camera's mode switch, for which the device reads BUSY for the whole run.
+        GATE = 2  # The stream gate: a run that parks or starts the sensor.
+        TRIGGER = 3  # A trigger conversion on a running sensor.
 
         _NAMES = {
-            0: 'RELOAD',
-            1: 'LIVE',
+            0: 'APPLY',
+            1: 'RUN',
+            2: 'GATE',
+            3: 'TRIGGER',
         }
 
     class BusKind:
@@ -737,8 +763,8 @@ class NxsDriverImage:
         """
         What a personality image is for; the header byte after the required minor.
 
-        `DRIVER` runs on the sensor VM against the mikroBUS bus and measures.
-        `CAMERA` runs once, under the host's token, on a second VM instance
+        `CLICK` runs on the sensor VM against the mikroBUS bus and measures.
+        `CAMERA` runs on a commit at the camera door, on a second VM instance
         bound to the pod-side bus: probe is the alive check, configure is the
         init program plus the mode and trigger blocks selected by the enum
         params, and there is no measure loop. The runner never auto-loads a
@@ -746,16 +772,27 @@ class NxsDriverImage:
         `HUB` is a CAMERA-shaped program for a device on the host's own bus
         (a deserializer, a serializer behind its window): the host executor
         runs it, one phase per run selected by its params, and a unit refuses
-        it at upload.
+        it at upload. `GRAPH` is a hub program's sealed section under the
+        records of one rig, which the host library's walk runs. A unit refuses
+        `HUB`, `MODULE` and `GRAPH` at upload and at save. `HOST` is a
+        host's description, its ports and its rows with no program, which
+        the tool compiles from the host plugin's data; a unit refuses it
+        too.
         """
-        DRIVER = 0
+        CLICK = 0  # A click personality, the main VM's sampling program.
         CAMERA = 1
         HUB = 2
+        MODULE = 3  # A compute module's personality.
+        GRAPH = 4  # The compiled bring-up of a graph: a hub program's sealed section and the GRAPH records, which the host library's walk runs.
+        HOST = 5  # A host's description: its ports and its rows, no program.
 
         _NAMES = {
-            0: 'DRIVER',
+            0: 'CLICK',
             1: 'CAMERA',
             2: 'HUB',
+            3: 'MODULE',
+            4: 'GRAPH',
+            5: 'HOST',
         }
 
     class TrailerRecord:
@@ -763,21 +800,35 @@ class NxsDriverImage:
         Record types of the descriptor trailer that follows the bus profiles.
 
         The trailer is host-owned data the firmware stores opaquely and
-        serves back through `XFER_TYPE = PERSONALITY_INFO`: a count byte,
+        serves back at `PERSONALITY_INFO`: a count byte,
         then records of `type u8, len u16, bytes`. Unknown types are kept
-        and skipped. `IDENTITY` names the part and its bus profile, `MODES`
+        and skipped. `IDENTITY` names the block in the head every image kind
+        carries, and a cam personality's tail its head's bus profile, `MODES`
         carries the index of the `mode` param and each mode's value,
         `TRIGGERS` the same for the `trigger` param, `PROGRAM` the family's
         program settings, `STATUS` the status probes a host reads back from
         the sensor (register, format, decode table), `RUN_PARAMS` the run
         parameters a host stages in physical units (index, range, default,
-        name, unit); `INSTANCE_CAL` is reserved for per-pod calibration;
+        name, unit), `CAMERA_MAP` the camera law a pod converts a commit's
+        physical units with and stages a run by (the run-value indices, the
+        gain, frame and exposure law, a line time and frame floor per mode),
+        then the mode table the camera door serves; `PARAMS` the parameter
+        rows, which the camera door serves verbatim for a cam personality
+        (`constants/nxs_map.yaml`); `OUTPUTS` the output descriptor rows;
+        `PORTS` the typed ports the personality's device offers;
+        `GRAPH_SOURCE`, `GRAPH_LINKS`, `GRAPH_OUTPUTS` and `GRAPH_WALKS` the
+        rig's facts and the walks of a graph image, beside the hub program it
+        composes against; `HUB_PHASES` the phases a hub program names;
+        `PRESENTATION` how the rows read: a display unit and a decimal
+        exponent per `PARAMS` row, then a name per value of the rows that
+        carry names; `INSTANCE_CAL` is reserved for per-pod calibration;
         `VENDOR_BASE`..`VENDOR_BASE + 15` are never interpreted. A new record
         type, or a field retired from a record, moves the format's minor. A
         retired record type (`retired: true`: `SHIPPED`) is written by no
         compiler and skipped by every decoder, and its number stays reserved;
-        the firmware reads no record, so retiring one moves neither
-        `NXS_MAJOR` nor `NXS_MINOR`.
+        the firmware reads no record but `PARAMS`, `OUTPUTS` and
+        `CAMERA_MAP`, so retiring another moves neither `NXS_MAJOR` nor
+        `NXS_MINOR`.
         """
         MODES = 1
         CONTROLS = 2
@@ -789,7 +840,17 @@ class NxsDriverImage:
         TRIGGERS = 8
         SHIPPED = 9  # retired: written by no compiler, skipped by every decoder; the number stays reserved
         STATUS = 10
-        RUN_PARAMS = 11
+        RUN_PARAMS = 11  # the VM's run values a host stages for a camera run, in the sensor's units: index, range, default, name, unit. The tool's door; the camera owner converts from the `PARAMS` rows instead
+        CAMERA_MAP = 12  # the camera law a pod converts the `PARAMS` rows with: the mode count and the gain factor, the indices of the VM run values a commit stages, the gain range in capture units, the frame-length capacity, the exposure minimum and margin, each mode's line time and frame-length floor, then the mode table the camera door serves (constants/nxs_map.yaml)
+        PARAMS = 13  # the parameters a personality declares, one `ROW_SIZE` row each in the `RowField` layout of constants/nxs_map.yaml: name, unit, id, type, kind, flags, default, values. The unit door serves every running personality's rows and the camera door the cam personality's, as the record holds them
+        OUTPUTS = 14  # the output descriptor rows, 64 bytes each, the `OutputField` layout of `constants/nxs_map.yaml`
+        PORTS = 15  # the typed ports a personality's device offers, one 32-byte row each, the `PortField` layout of `constants/nxs_map.yaml`
+        GRAPH_SOURCE = 16  # a graph image's source, `GRAPH_SOURCE_SIZE` bytes in the `GraphSourceField` layout of `constants/nxs_map.yaml`: the CRC-32 and the name of the sealed program the trailer composes against, the declaration's digest, the hub's address, the owner and the flags
+        GRAPH_LINKS = 17  # a graph image's links, one `GRAPH_LINK_ROW_SIZE` row each in the `GraphLinkField` layout: the addresses, the lanes, the address map, the pod, the personality and its build, the parameter indices and every value a walk stages
+        GRAPH_OUTPUTS = 18  # a graph image's hub outputs, one `GRAPH_OUTPUT_ROW_SIZE` row each in the `GraphOutputField` layout: the lanes, the rate, the pipes, the mode, the consumer and each link's virtual channel
+        GRAPH_WALKS = 19  # a graph image's walks: the `GraphWalksField` head, the base staging of the program's run parameters in `GraphStageField` rows, then each walk, a `GraphWalkField` head and its steps in the `GraphStepField` layout
+        HUB_PHASES = 20  # the phases a hub program names, one `HUB_PHASE_ROW_SIZE` row each in the `HubPhaseField` layout: the value of `phase` and the phase's name; a hub program that offers ports carries it, and a graph image carries its program's
+        PRESENTATION = 21  # how the rows read: one `PRESENT_ROW_SIZE` entry per `PARAMS` row in the `PresentField` layout of constants/nxs_map.yaml, then the names of the rows flagged `PRESENT_FLAG_LABELS` in row order, each a count byte and a length-prefixed ASCII name per value of at most `LABEL_CHARS_MAX` characters; the tool prints a row's value from it and knows no device
         VENDOR_BASE = 224
 
         _NAMES = {
@@ -804,6 +865,16 @@ class NxsDriverImage:
             9: 'SHIPPED',
             10: 'STATUS',
             11: 'RUN_PARAMS',
+            12: 'CAMERA_MAP',
+            13: 'PARAMS',
+            14: 'OUTPUTS',
+            15: 'PORTS',
+            16: 'GRAPH_SOURCE',
+            17: 'GRAPH_LINKS',
+            18: 'GRAPH_OUTPUTS',
+            19: 'GRAPH_WALKS',
+            20: 'HUB_PHASES',
+            21: 'PRESENTATION',
             224: 'VENDOR_BASE',
         }
 
@@ -814,7 +885,7 @@ class NxsDriverImage:
 
     IMAGE_FLAG_AUTO = 2  # Header flag bit reserved for a camera personality that configures its sensor at power-on without a host token; not implemented.
 
-    MAX_TRAILER_SIZE = 2048  # Max bytes of the descriptor trailer (count byte included); sixty-four 32-byte info pages over the two banks of `XFER_TYPE_PERSONALITY_INFO`.
+    MAX_TRAILER_SIZE = 4096  # Max bytes of the descriptor trailer (count byte included), the `PERSONALITY_INFO` region a slot serves.
 
     SEAL_NONCE_SIZE = 16  # Bytes of the CTR nonce stored before a sealed bytecode section.
 
@@ -822,9 +893,11 @@ class NxsDriverImage:
 
     POLL_FLAG_SOFT = 2  # `OP_POLL_REG` flags bit: a timeout raises the run's soft-miss flag and continues instead of faulting.
 
-    NXS_MAJOR = 2  # NXS format major version (incompatible-change counter).
+    NXS_MAJOR = 1  # NXS image format major, the product version's major.
 
-    NXS_MINOR = 3  # NXS format minor version (highest backward-compatible minor firmware implements).
+    NXS_MINOR = 2  # NXS image format minor, the product version's minor.
+
+    NXS_MINOR_FIRST = 1  # The first minor of `NXS_MAJOR` whose header layout this firmware reads.
 
     VM_MAX_PROGRAM_SIZE = 4096  # Max bytecode bytes one driver program may carry.
 
@@ -836,13 +909,15 @@ class NxsDriverImage:
 
     MAX_BUS_PROFILES = 3  # Max per-bus communication profiles in one image (i2c + spi, or uart).
 
-    MAX_PARAMS = 8  # Max configurable parameters one driver image can declare.
+    MAX_PARAMS = 16  # Max parameters one driver image can declare, the rows the camera map serves.
 
     MAX_PATCH_SITES = 2  # Max bytecode sites one parameter may patch on a runtime set.
 
     MAX_PARAM_VALUES = 16  # Max enum values (or the [min, max] pair) a single parameter declares.
 
     MAX_OUTPUTS = 16  # Max output fields one driver image can declare.
+
+    MAX_OUTPUT_ROWS = 16  # Output rows an image declares at most.
 
 class FieldSemantics:
 
@@ -1128,6 +1203,1222 @@ class NxsMcuboot:
 
     UPDATE_IMAGE_MAX_SIZE = 221184  # Largest update image the bootloader will swap in, in bytes.
 
+class NxsMap:
+
+    class MapReg:
+        """
+        The NXS map, one layout at the unit door and the camera door, 16-bit register pointer.
+
+        A unit answers at two I²C addresses on one peripheral, and both serve
+        this map. The unit door at `RBDevice::NXS` is the tool's and the
+        daemon's door: it serves every cell. The camera door at
+        `RBDevice::NXS_CAM` is the capture stack's door at frame rate: it
+        serves the capture cells, the header's capture fields, the parameter
+        rows of the camera personality re-indexed from 0, their cell arrays,
+        the commit block and the mode table, and every other cell reads 0
+        there and ignores writes. A smart camera serves the capture cells
+        alone, from its own logic. A host kernel driver that knows no sensor
+        builds a control from each row at probe and asks for changes in the
+        row's unit. The device converts each request to its sensor's
+        registers with the law it holds.
+
+        The map is flat and stateless: a 2-byte register pointer, high byte
+        first, no selector, so two hosts, a kernel driver and the tool never
+        disturb each other. A transaction that writes one pointer byte
+        addresses `0x00NN`, so a tool of the first host interface reads the
+        ID at 0 and `PROTO_VERSION` at 0x19 and refuses cleanly. Multi-byte
+        cells are little-endian. Written bytes auto-increment. Row i's cells
+        sit at `LIVE + 4 i`, `MIN + 4 i`, `MAX + 4 i` and `STEP + 4 i`, its
+        staged cell at `MASK - 4 (i + 1)` and its descriptor at
+        `ROWS + ROW_SIZE i`, so a commit is one write from the cell of the
+        highest row staged through `MASK` and `COMMIT`. A read latches the
+        first `MAP_LATCH_SIZE` bytes at its first byte; the regions past the
+        mode table serve without a latch. A session, an upload or a
+        firmware update, is a sequence of chunk writes that each carry their
+        own cursor, so nothing survives between two transactions. Reserved
+        cells read 0 and ignore writes.
+
+        The cells the camera door serves carry `door: camera`, and the
+        generators derive the door's predicate, its spans and the kernel
+        drivers' header from that flag alone.
+
+        The parameter rows are every running personality's rows, the owning
+        slot in `ROW_FLAG_OWNER`, with the device's own knobs as rows of
+        `OWNER_DEVICE`. A commit names rows of one owner and one kind. The
+        layout holds `MAX_ROWS` rows, `MAX_OUTPUT_ROWS` output rows and
+        `MODE_TABLE_MAX` modes; a device serves its own counts and every
+        cell past them reads 0.
+        """
+        MAP_ID = 0  # `MAP_ID_UNIT` at the unit door, `MAP_ID_CAMERA` at the camera door and on a smart camera.
+        MAP_VERSION = 1  # Layout version of this map, `MAP_VERSION_VALUE`.
+        STATE = 2  # `MapState`: INERT, READY, BUSY or FAULT, the state of the commit engine both doors share. Live single-byte state, untearable under an I²C poll.
+        ERROR = 3  # Positive errno of the commit that last ended FAULT, in the device's numbering, 0 otherwise. The next accepted `COMMIT` clears it.
+        FW_VERSION_MAJOR = 4  # The running firmware's major version; 0 on a smart camera.
+        FW_VERSION_MINOR = 5
+        PARAM_COUNT = 6  # Rows served at `ROWS` through this door, at most `MAX_ROWS`. The camera door counts the camera personality's rows alone.
+        MODE_COUNT = 7  # Rows in the mode table, at most `MODE_TABLE_MAX`; 0 on a unit that runs no camera personality.
+        CURRENT_MODE = 8  # The mode-table value in effect, 0xFF before the first run.
+        STREAM = 9  # 0 standby, 1 streaming or sampling: the `STREAM` row of the camera personality at the camera door, and of the camera personality when one runs, else the sampling personality, at the unit door.
+        APPLY_COUNT = 10  # Wrapping count of commits that ended READY with a row applied, at either door. A driver reads it to confirm a `COMMIT` landed.
+        FAULT_COUNT = 11  # Wrapping count of commits that ended FAULT.
+        OUTPUT_COUNT = 12  # Rows served at `OUTPUT_ROWS`, at most `MAX_OUTPUT_ROWS`; 0 at the camera door.
+        SAMPLE_SIZE = 13  # Bytes of one sample record's data, at most `SAMPLE_RECORD_DATA_MAX`; 0 while no sampling personality runs.
+        SAMPLE_COUNT = 14  # u16 LE wrapping count of samples the running personality produced.
+        MODE_RUN_MS = 16  # u16 LE milliseconds: how long the last RUN commit through this door took, 0 before the device completed one. The host waits this long after a RUN commit before its first `STATE` read.
+        GATE_RUN_MS = 18  # u16 LE milliseconds: how long the last run of kind GATE took.
+        TRIGGER_RUN_MS = 20  # u16 LE milliseconds: how long the last run of kind TRIGGER took.
+        APPLY_RUN_MS = 22  # u16 LE milliseconds: how long the last APPLY commit took from the `COMMIT` byte to READY, `APPLY_RUN_MS_FLOOR` before the device completed one. The host keeps the bus and sends nothing for this long after an APPLY commit, then reads `STATE`.
+        MODULE_KIND = 24  # `ModuleKind`: what the device is, so a tool tells a pod from a hat.
+        PROTO_VERSION = 25  # `PROTO_VERSION_VALUE`, the version of this host interface. At 0x19 so a tool of the first interface reads it through a 1-byte pointer.
+        VM_STATE = 26  # `VmState` of the main VM; 0 at the camera door.
+        RUNNER_STATE = 27  # `RunnerState` of the sample runner.
+        STORE_COUNT = 28  # Populated slots of the personality store.
+        ACTIVE_SLOT = 29  # The slot the main VM runs, 0xFF for a transient image.
+        DESCRIPTOR_EPOCH = 30  # Generation of the row set: 0 until the first load, then +1 on every load, so a host re-reads the rows when it moved.
+        FW_VERSION_PATCH = 31
+        CLICK_ADDR = 32  # The latched mikroBUS I²C address of the running sampling personality, 0 while none runs on I²C.
+        VM_ERROR = 33  # The VM error byte of the main VM: 0 while healthy, else the code the faulting personality raised.
+        PROBE_RETRIES = 34  # The sample runner's current probe-retry count.
+        STATUS = 35  # `STATUS_*` bits, one byte for a cheap poll: a sample is ready, the VM is in error, the runner is running.
+        CALIBRATION_EPOCH = 36  # The calibration record's change counter, +1 on every apply: a host reads it, `CALIBRATION`, then it again, the `DESCRIPTOR_EPOCH` idiom. The Cyphal `calibration.epoch` register serves the same value.
+        CMD_ARG = 64  # The argument of the next `CMD`: a slot for the store commands, else 0. Written in the same transaction as `CMD`.
+        CMD = 65  # `Cmd` dispatch, taken at the transaction's stop. Bit `CMD_DOORBELL_BIT` is optional.
+        CMD_ERROR = 66  # Result of the last command: 0, a positive errno, or `CMD_ERR_PENDING` while it runs.
+        CMD_COUNT = 67  # Wrapping count of commands taken, so a host tells its command's result from the previous one's.
+        UPLOAD_SIZE = 68  # u16 LE: the size of the image an upload session delivers. Writing it opens the session; `Cmd::LOAD` closes it.
+        DFU_PHASE = 70  # `DfuPhase` of the firmware-update session.
+        DFU_ACK = 71  # Wrapping count of DFU chunks taken, untearable under a poll.
+        PROC_STATE = 72  # `ProcState` of the on-device calibration procedure: idle, gyro waiting for stillness, gyro averaging, magnetometer collecting.
+        PROC_DETAIL = 73  # The procedure's progress: the percent averaged, or the rotation coverage of 14.
+        SESSION = 74  # `Session`: which session the device holds, so a host knows before it writes: none, an upload, a firmware update, a procedure.
+        LIVE = 256  # `MAX_ROWS` u32 LE cells: the value of row i in effect, in the row's unit, repainted after every commit and run.
+        MIN = 512  # `MAX_ROWS` u32 LE cells: the lowest value row i takes in effect; 0 for an enum row.
+        MAX = 768  # `MAX_ROWS` u32 LE cells: the highest value row i takes in effect; the count minus one for an enum row.
+        STEP = 1024  # `MAX_ROWS` u32 LE cells: the increment of row i in effect; 1 for an enum row.
+        STAGED = 1280  # `MAX_ROWS` u32 LE cells, read-write, row i at `MASK - 4 (i + 1)`: the host's request for the next `COMMIT`.
+        MASK = 1536  # u64 LE, read-write: bit i names row i as staged for the next `COMMIT`. Every masked row shares one owner and one `ParamKind`, else the commit ends `EINVAL`, as does a masked read-only row or a row the device cannot apply.
+        COMMIT = 1544  # Write 1 to apply the masked rows. Accepted in READY or FAULT: the write takes `STAGED` and `MASK` as they stand and `STATE` turns BUSY at once. Reads back 0.
+        MODE_TABLE = 1792  # `MODE_TABLE_MAX` rows of `MODE_ENTRY_SIZE` bytes, `ModeEntry` fields; `MODE_COUNT` of them served.
+        ROWS = 2048  # `PARAM_COUNT` descriptor rows of `ROW_SIZE` bytes, `RowField` fields, the `PARAMS` record's bytes verbatim; static, served without a latch.
+        OUTPUT_ROWS = 6144  # `OUTPUT_COUNT` output descriptor rows of `ROW_SIZE` bytes, `OutputField` fields, the `OUTPUTS` record's bytes verbatim: what one sample record carries.
+        SERIAL = 7168  # The chip's UID96, MSB first.
+        BUILD_INFO = 7184  # `BUILD_INFO_SIZE` bytes: the firmware's build record.
+        TIME_SYNC = 7360  # `TIME_SYNC_RECORD_SIZE` bytes, read-write: the host's clock relation. The device applies the push fields of a written record at the transaction's stop and serves the live state, its source and validity included.
+        CALIBRATION = 7424  # `Calibration.RECORD_SIZE` bytes, read-write: the calibration record in effect, four 64-byte blocks. A write patches the staged copy at its offset; `Cmd::CALIB_APPLY` validates and applies it, and `CALIBRATION_EPOCH` counts the applies.
+        DIAG = 7680  # `DIAG_COUNTER_COUNT` u16 LE cells, `DiagCounter` order, read-only; the cells past the named ones read 0.
+        STORE_DIRECTORY = 7936  # `STORE_SLOTS` entries of `STORE_ENTRY_SIZE` bytes, `StoreEntry` fields: what each slot holds.
+        SAMPLE_RECORD = 24576  # The latest sample record: `SAMPLE_RECORD_*` offsets. A read latches it at its first byte.
+        SAMPLE_BURST = 24832  # The sample queue: a read that writes a u16 LE cursor after the pointer serves `SAMPLE_BURST_*` from that record on and releases the records before it; `SAMPLE_BURST_MAX` bytes at most.
+        UPLOAD_CHUNK = 25088  # One chunk of an image upload: `TRANSFER_CURSOR_OFF` u32 LE byte offset, a multiple of `TRANSFER_CHUNK_MAX`, then `TRANSFER_CHUNK_MAX` bytes, the image's last chunk its remainder, in one write. The session is open between `UPLOAD_SIZE` and `Cmd::LOAD`.
+        DFU_CHUNK = 25344  # One chunk of a firmware image, the same shape. The session is open between `Cmd::DFU_BEGIN` and `Cmd::DFU_FINISH`.
+        PERSONALITY_INFO = 32768  # `STORE_SLOTS` regions of `PERSONALITY_INFO_SIZE` bytes, slot k at `PERSONALITY_INFO + PERSONALITY_INFO_SIZE k`: the stored image's trailer records, served from flash.
+
+        _NAMES = {
+            0: 'MAP_ID',
+            1: 'MAP_VERSION',
+            2: 'STATE',
+            3: 'ERROR',
+            4: 'FW_VERSION_MAJOR',
+            5: 'FW_VERSION_MINOR',
+            6: 'PARAM_COUNT',
+            7: 'MODE_COUNT',
+            8: 'CURRENT_MODE',
+            9: 'STREAM',
+            10: 'APPLY_COUNT',
+            11: 'FAULT_COUNT',
+            12: 'OUTPUT_COUNT',
+            13: 'SAMPLE_SIZE',
+            14: 'SAMPLE_COUNT',
+            16: 'MODE_RUN_MS',
+            18: 'GATE_RUN_MS',
+            20: 'TRIGGER_RUN_MS',
+            22: 'APPLY_RUN_MS',
+            24: 'MODULE_KIND',
+            25: 'PROTO_VERSION',
+            26: 'VM_STATE',
+            27: 'RUNNER_STATE',
+            28: 'STORE_COUNT',
+            29: 'ACTIVE_SLOT',
+            30: 'DESCRIPTOR_EPOCH',
+            31: 'FW_VERSION_PATCH',
+            32: 'CLICK_ADDR',
+            33: 'VM_ERROR',
+            34: 'PROBE_RETRIES',
+            35: 'STATUS',
+            36: 'CALIBRATION_EPOCH',
+            64: 'CMD_ARG',
+            65: 'CMD',
+            66: 'CMD_ERROR',
+            67: 'CMD_COUNT',
+            68: 'UPLOAD_SIZE',
+            70: 'DFU_PHASE',
+            71: 'DFU_ACK',
+            72: 'PROC_STATE',
+            73: 'PROC_DETAIL',
+            74: 'SESSION',
+            256: 'LIVE',
+            512: 'MIN',
+            768: 'MAX',
+            1024: 'STEP',
+            1280: 'STAGED',
+            1536: 'MASK',
+            1544: 'COMMIT',
+            1792: 'MODE_TABLE',
+            2048: 'ROWS',
+            6144: 'OUTPUT_ROWS',
+            7168: 'SERIAL',
+            7184: 'BUILD_INFO',
+            7360: 'TIME_SYNC',
+            7424: 'CALIBRATION',
+            7680: 'DIAG',
+            7936: 'STORE_DIRECTORY',
+            24576: 'SAMPLE_RECORD',
+            24832: 'SAMPLE_BURST',
+            25088: 'UPLOAD_CHUNK',
+            25344: 'DFU_CHUNK',
+            32768: 'PERSONALITY_INFO',
+        }
+
+        # (start, width) of each cell the camera door serves.
+        CAMERA_DOOR_SPANS = (
+            (0, 1),  # MAP_ID
+            (1, 1),  # MAP_VERSION
+            (2, 1),  # STATE
+            (3, 1),  # ERROR
+            (4, 1),  # FW_VERSION_MAJOR
+            (5, 1),  # FW_VERSION_MINOR
+            (6, 1),  # PARAM_COUNT
+            (7, 1),  # MODE_COUNT
+            (8, 1),  # CURRENT_MODE
+            (9, 1),  # STREAM
+            (10, 1),  # APPLY_COUNT
+            (11, 1),  # FAULT_COUNT
+            (16, 2),  # MODE_RUN_MS
+            (18, 2),  # GATE_RUN_MS
+            (20, 2),  # TRIGGER_RUN_MS
+            (22, 2),  # APPLY_RUN_MS
+            (24, 1),  # MODULE_KIND
+            (25, 1),  # PROTO_VERSION
+            (256, 256),  # LIVE
+            (512, 256),  # MIN
+            (768, 256),  # MAX
+            (1024, 256),  # STEP
+            (1280, 256),  # STAGED
+            (1536, 8),  # MASK
+            (1544, 1),  # COMMIT
+            (1792, 256),  # MODE_TABLE
+            (2048, 4096),  # ROWS
+        )
+
+    class MapState:
+        """
+        `MapReg::STATE` values.
+        """
+        INERT = 0  # No personality runs, or no configure of the served personality has ended DONE yet. A `COMMIT` is ignored.
+        READY = 1  # Configured and no commit in flight.
+        BUSY = 2  # A commit runs and the device masters its own bus. A transaction that lands inside it reads a NAK, which a host reads as BUSY.
+        FAULT = 3  # The last commit failed, `MapReg::ERROR` says why. The next accepted `COMMIT` clears it.
+
+        _NAMES = {
+            0: 'INERT',
+            1: 'READY',
+            2: 'BUSY',
+            3: 'FAULT',
+        }
+
+    class ModuleKind:
+        """
+        `MapReg::MODULE_KIND` values: what the device is, with the ports a device of that kind has as (name, PortType, PortDirection).
+        """
+        UNIT = 1  # An NXS unit with a mikroBUS socket and no camera head.
+        POD = 2  # An NXS unit in a camera pod: a head on its pod bus and a mikroBUS socket.
+        SMART_CAMERA = 3  # A camera that serves the capture cells from its own logic, an FPGA head.
+        SMART_MODULE = 4  # A compute module that serves this map and consumes the hub's streams, the N6 hat.
+
+        _NAMES = {
+            1: 'UNIT',
+            2: 'POD',
+            3: 'SMART_CAMERA',
+            4: 'SMART_MODULE',
+        }
+
+        # The ports of a device of each value: (name, PortType name, PortDirection name).
+        PORTS = {
+            1: (("head", "HEAD", "INPUT"), ("click", "CLICK", "BUS"), ("out", "HEAD", "OUTPUT"), ("i2c", "I2C", "INPUT"), ("can", "CYPHAL_CAN", "BUS"), ("serial", "CYPHAL_SERIAL", "INPUT"),),  # UNIT
+            2: (("head", "HEAD", "INPUT"), ("click", "CLICK", "BUS"), ("out", "HEAD", "OUTPUT"), ("i2c", "I2C", "INPUT"), ("can", "CYPHAL_CAN", "BUS"), ("serial", "CYPHAL_SERIAL", "INPUT"),),  # POD
+            3: (("out", "HEAD", "OUTPUT"), ("i2c", "I2C", "INPUT"),),  # SMART_CAMERA
+            4: (("csi", "CSI", "INPUT"), ("i2c1", "I2C", "OUTPUT"), ("serial", "CYPHAL_SERIAL", "INPUT"),),  # SMART_MODULE
+        }
+
+    class RowField:
+        """
+        Byte offsets inside one parameter row at `MapReg::ROWS`, `ROW_SIZE` bytes; the same bytes as one row of the `PARAMS` record.
+        """
+        NAME = 0  # ASCII, NUL-padded: the parameter's name, what `nxs set` takes and a custom control carries.
+        UNIT = 16  # ASCII, NUL-padded: the unit of every value of the row; fixed per `ParamId` for a standard row, empty for an enum.
+        ID = 22  # u16 LE `ParamId`: the standard meaning the host maps to its control, `ParamId::CUSTOM` for a row the host offers by name.
+        TYPE = 24  # `ROW_TYPE_*` bits: enum or range, unsigned or signed, an enum's values 16 or 32 bits wide.
+        KIND = 25  # `ParamKind`: how a commit of this row runs.
+        FLAGS = 26  # `ROW_FLAG_*` bits and the owning slot in `ROW_FLAG_OWNER`.
+        COUNT = 27  # An enum row's value count, at most `ROW_VALUES_MAX`, or `ROW_WIDE_VALUES_MAX` under `ROW_TYPE_WIDE`; 3 for a range row.
+        DEFAULT = 28  # u32 LE: the value the row takes when the device configures its sensor.
+        VALUES = 32  # An enum row: `COUNT` u16 LE values in the device's order, or u32 LE values under `ROW_TYPE_WIDE`. A range row: min, max and step as u32 LE, the rest 0.
+
+        _NAMES = {
+            0: 'NAME',
+            16: 'UNIT',
+            22: 'ID',
+            24: 'TYPE',
+            25: 'KIND',
+            26: 'FLAGS',
+            27: 'COUNT',
+            28: 'DEFAULT',
+            32: 'VALUES',
+        }
+
+    class OutputField:
+        """
+        Byte offsets inside one output row at `MapReg::OUTPUT_ROWS`, `ROW_SIZE` bytes; the same bytes as one row of the `OUTPUTS` record.
+        """
+        NAME = 0  # ASCII, NUL-padded: the field's name.
+        UNIT = 16  # ASCII, NUL-padded: the unit after scale and offset.
+        SEMANTIC = 22  # u16 LE `OutputId`: the standard meaning a bridge promotes to a typed subject, `OutputId::CUSTOM` otherwise.
+        TYPE = 24  # `FieldType`: the field's wire type and width.
+        FLAGS = 25  # `OUTPUT_FLAG_*` bits: big-endian, a string payload.
+        COUNT = 26  # u16 LE: elements of the field, or the width of a string payload.
+        AT = 28  # u16 LE: the field's byte position in the sample record's data.
+        SCALE = 32  # f64 LE: the factor from the wire value to the unit.
+        OFFSET = 40  # f64 LE: the offset after the scale.
+
+        _NAMES = {
+            0: 'NAME',
+            16: 'UNIT',
+            22: 'SEMANTIC',
+            24: 'TYPE',
+            25: 'FLAGS',
+            26: 'COUNT',
+            28: 'AT',
+            32: 'SCALE',
+            40: 'OFFSET',
+        }
+
+    class PortField:
+        """
+        Byte offsets inside one row of the `PORTS` record, `PORT_ROW_SIZE` bytes: a port the personality's device offers.
+        """
+        NAME = 0  # ASCII, NUL-padded: the port's name, unique in the personality, the name a graph wires (`links.A`).
+        TYPE = 16  # `PortType`: a graph connects the port only to a port of its type.
+        DIRECTION = 17  # `PortDirection`.
+        FLAGS = 19  # Reserved, 0.
+
+        _NAMES = {
+            0: 'NAME',
+            16: 'TYPE',
+            17: 'DIRECTION',
+            19: 'FLAGS',
+        }
+
+    class PortType:
+        """
+        `PortField::TYPE` values: what a port connects to.
+        """
+        CSI = 0  # A MIPI CSI-2 stream; its lanes are a row of the block, named for the port (`csi_a_lanes`).
+        GMSL = 1  # A GMSL serializer link.
+        I2C = 2  # An I²C bus; the one source wired into a control input masters it.
+        CYPHAL_CAN = 3  # A Cyphal/CAN bus.
+        CYPHAL_SERIAL = 4  # A Cyphal/serial link.
+        USB = 5  # A USB port.
+        UART = 6  # A UART.
+        HEAD = 7  # The bus a camera head answers on, behind its pod's unit; a head's output feeds a pod's head, a serializer link or a CSI port.
+        CLICK = 8  # A mikroBUS socket.
+
+        _NAMES = {
+            0: 'CSI',
+            1: 'GMSL',
+            2: 'I2C',
+            3: 'CYPHAL_CAN',
+            4: 'CYPHAL_SERIAL',
+            5: 'USB',
+            6: 'UART',
+            7: 'HEAD',
+            8: 'CLICK',
+        }
+
+        # The values a port of each value feeds; itself alone when unnamed.
+        FEEDS = {
+            0: (0,),  # CSI
+            1: (1,),  # GMSL
+            2: (2,),  # I2C
+            3: (3,),  # CYPHAL_CAN
+            4: (4,),  # CYPHAL_SERIAL
+            5: (5,),  # USB
+            6: (6,),  # UART
+            7: (7, 1, 0,),  # HEAD
+            8: (8,),  # CLICK
+        }
+
+    class PortDirection:
+        """
+        `PortField::DIRECTION` values.
+        """
+        INPUT = 0  # Takes one source.
+        OUTPUT = 1  # Feeds the inputs a graph wires to it; a bus output fans out.
+        BUS = 2  # A shared bus whose ports are peers, a Cyphal/CAN bus for one.
+
+        _NAMES = {
+            0: 'INPUT',
+            1: 'OUTPUT',
+            2: 'BUS',
+        }
+
+    class PresentField:
+        """
+        Byte offsets inside one entry of the `PRESENTATION` record, `PRESENT_ROW_SIZE` bytes, one per `PARAMS` row in row order: how the row's values read.
+        """
+        UNIT = 0  # ASCII, NUL-padded: the unit a value is shown in, `dB` for a row served in `mdB`.
+        EXPONENT = 6  # i8: a shown value is the served value times ten to this power, -3 for a row served in thousandths.
+        FLAGS = 7  # `PRESENT_FLAG_*` bits: whether the record's tail names this row's values.
+
+        _NAMES = {
+            0: 'UNIT',
+            6: 'EXPONENT',
+            7: 'FLAGS',
+        }
+
+    class IdentityField:
+        """
+        Byte offsets inside the head of the `IDENTITY` record, `IDENTITY_SIZE` bytes, which every image kind carries: what the block is.
+        """
+        ADDRESS = 0  # The block's bus address, 0 where it has none.
+        FLAGS = 1  # `IDENTITY_FLAG_*` bits.
+        FW_MAJOR = 2  # The firmware version the block runs or was built against, 0 where it has none.
+        FW_MINOR = 3
+        FW_PATCH = 4
+        SERIAL_LEN = 5  # Bytes of `SERIAL` in use, 0 for a block without one.
+        SERIAL = 8  # The block's serial, raw bytes MSB first.
+        COMPATIBLE = 24  # ASCII, NUL-padded: the block's compatible, `acme,des1`.
+        PRODUCT = 56  # ASCII, NUL-padded: the product name the tool prints, `NXS Hub`.
+
+        _NAMES = {
+            0: 'ADDRESS',
+            1: 'FLAGS',
+            2: 'FW_MAJOR',
+            3: 'FW_MINOR',
+            4: 'FW_PATCH',
+            5: 'SERIAL_LEN',
+            8: 'SERIAL',
+            24: 'COMPATIBLE',
+            56: 'PRODUCT',
+        }
+
+    class IdentityCamField:
+        """
+        Byte offsets inside the `IDENTITY_CAM_SIZE` bytes a CAMERA image appends to the head: how the head answers.
+        """
+        REG_BITS = 0  # The register address width in bits.
+        VAL_BITS = 1  # The register value width in bits.
+        DEVICE_ID_REG = 2  # u16 LE: the identity register, 0xFFFF for a head without one.
+        DEVICE_ID_WIDTH = 4  # Bytes of the identity value.
+        DEVICE_ID = 5  # u16 LE: the identity value.
+        ALIVE_REG = 7  # u16 LE: the register a liveness read takes, 0xFFFF for none.
+        DEFAULT_MODE = 9  # The `MODE_VALUE` the head runs when the declaration names none.
+
+        _NAMES = {
+            0: 'REG_BITS',
+            1: 'VAL_BITS',
+            2: 'DEVICE_ID_REG',
+            4: 'DEVICE_ID_WIDTH',
+            5: 'DEVICE_ID',
+            7: 'ALIVE_REG',
+            9: 'DEFAULT_MODE',
+        }
+
+    class GraphOwner:
+        """
+        `GraphSourceField::OWNER` values: who masters the hub's bus and runs a graph image.
+        """
+        HOST = 0  # The daemon on the host that receives the hub's first output.
+        MODULE = 1  # A smart module on the hub's bus, through the same library.
+
+        _NAMES = {
+            0: 'HOST',
+            1: 'MODULE',
+        }
+
+    class GraphSourceField:
+        """
+        Byte offsets inside the `GRAPH_SOURCE` record, `GRAPH_SOURCE_SIZE` bytes: the program a graph image composes against and the declaration it compiles.
+        """
+        PROGRAM_CRC = 0  # u32 LE: the CRC-32 of the program section the trailer composes against, as the image stores it: a sealed section's nonce, then its ciphertext.
+        PROGRAM = 4  # ASCII, NUL-padded: the hub program's name.
+        DIGEST = 20  # The first 16 bytes of the SHA-256 of the declaration the graph compiles.
+        DES_ADDR = 36  # The hub's address on its bus, where every HUB step runs the program.
+        OWNER = 37  # `GraphOwner`: who runs the image.
+        FLAGS = 38  # `GRAPH_FLAG_*` bits: a homogeneous pair, a declared frame sync, a declared gain.
+
+        _NAMES = {
+            0: 'PROGRAM_CRC',
+            4: 'PROGRAM',
+            20: 'DIGEST',
+            36: 'DES_ADDR',
+            37: 'OWNER',
+            38: 'FLAGS',
+        }
+
+    class GraphLinkField:
+        """
+        Byte offsets inside one row of the `GRAPH_LINKS` record, `GRAPH_LINK_ROW_SIZE` bytes: a link's facts, the values a walk stages for it.
+        """
+        NAME = 0  # The link's name, one ASCII letter: `A` or `B`.
+        FLAGS = 1  # `GRAPH_LINK_*` bits.
+        SER_ADDR = 2  # The serializer's address through the hub's window, `GRAPH_SER_ADDR` on the Hub.
+        HEAD_ADDR = 3  # Where the host reaches the sensor.
+        TCA_ADDR = 4  # The carrier's port expander, `GRAPH_TCA_ADDR` on the Hub.
+        LANES = 5  # The sensor's CSI-2 lanes, 2 or 4.
+        DATA_TYPE = 6  # The RAW depth of the link's stream: 0 RAW10, 1 RAW12.
+        MAP_COUNT = 7  # The translations the serializer performs, 0 to `GRAPH_MAP_MAX`.
+        MAP = 8  # `GRAPH_MAP_MAX` pairs of an alias and the address it reaches behind the serializer.
+        POD_ALIAS = 12  # Where the host reaches the pod's unit door.
+        POD_TARGET = 13  # The unit's own address on the pod's bus.
+        POD_MAP = 14  # Where the host reaches the pod's camera door.
+        MODE = 15  # The value the personality's `mode` parameter takes.
+        PERSONALITY = 16  # ASCII, NUL-padded: the personality a pod's slot holds.
+        PERSONALITY_CRC = 32  # u32 LE: the CRC-32 of that personality's trailer, the build the slot holds.
+        HEAD_IMAGE = 36  # ASCII, NUL-padded: the image the owner runs at a head without a pod.
+        HEAD_IMAGE_CRC = 52  # u32 LE: the CRC-32 of that image's trailer.
+        PARAMS = 56  # The personality's parameter indices in `GraphParam` order, `GRAPH_NONE` for one it does not declare.
+        TRIGGER_FREE = 64  # The trigger value of the free run.
+        TRIGGER_FAST = 65  # The trigger value of the fast trigger, `GRAPH_NONE` when the personality offers none.
+        LINE_TIME_NS = 68  # u32 LE: the line a run stages, 0 when the personality takes none.
+        FRAME_PERIOD_NS = 72  # u32 LE: the frame a run stages, 0 when the personality takes none.
+        GAIN_MDB = 76  # u32 LE: the declared gain in millidecibels, which the gain walk commits under `GRAPH_FLAG_GAIN`.
+        EXPOSURE_US = 80  # u32 LE: the declared exposure in microseconds, 0 when the declaration states none.
+
+        _NAMES = {
+            0: 'NAME',
+            1: 'FLAGS',
+            2: 'SER_ADDR',
+            3: 'HEAD_ADDR',
+            4: 'TCA_ADDR',
+            5: 'LANES',
+            6: 'DATA_TYPE',
+            7: 'MAP_COUNT',
+            8: 'MAP',
+            12: 'POD_ALIAS',
+            13: 'POD_TARGET',
+            14: 'POD_MAP',
+            15: 'MODE',
+            16: 'PERSONALITY',
+            32: 'PERSONALITY_CRC',
+            36: 'HEAD_IMAGE',
+            52: 'HEAD_IMAGE_CRC',
+            56: 'PARAMS',
+            64: 'TRIGGER_FREE',
+            65: 'TRIGGER_FAST',
+            68: 'LINE_TIME_NS',
+            72: 'FRAME_PERIOD_NS',
+            76: 'GAIN_MDB',
+            80: 'EXPOSURE_US',
+        }
+
+    class GraphParam:
+        """
+        The order of the parameter indices at `GraphLinkField::PARAMS`.
+        """
+        MODE = 0
+        TRIGGER = 1
+        ACTION = 2  # What a run does, `CamAction`.
+        LINE_TIME = 3  # The line a run stages, in nanoseconds.
+        FRAME_PERIOD = 4  # The frame a run stages, in nanoseconds.
+        EXPOSURE = 5  # The exposure an apply stages, in lines.
+        GAIN = 6  # The gain an apply stages, in the capture stack's units.
+        FRAME_LENGTH = 7  # The frame length in lines a run records.
+
+        _NAMES = {
+            0: 'MODE',
+            1: 'TRIGGER',
+            2: 'ACTION',
+            3: 'LINE_TIME',
+            4: 'FRAME_PERIOD',
+            5: 'EXPOSURE',
+            6: 'GAIN',
+            7: 'FRAME_LENGTH',
+        }
+
+    class GraphOutputField:
+        """
+        Byte offsets inside one row of the `GRAPH_OUTPUTS` record, `GRAPH_OUTPUT_ROW_SIZE` bytes: one CSI output of the hub.
+        """
+        OUTPUT = 0  # The output: 0 `csi.A`, 1 `csi.B`.
+        LANES = 1  # The output's CSI-2 lanes.
+        RATE_MBPS = 2  # u16 LE: megabits per second per lane.
+        STREAMS = 4  # `GRAPH_STREAM_*` bits: which pipe reaches which output.
+        MODE = 5  # `GraphOutputMode`.
+        CONSUMER = 6  # `GraphConsumer`: who receives the output.
+        VC = 7  # The virtual channel of each link's stream on the output: link A's in bits 0..3, link B's in bits 4..7.
+
+        _NAMES = {
+            0: 'OUTPUT',
+            1: 'LANES',
+            2: 'RATE_MBPS',
+            4: 'STREAMS',
+            5: 'MODE',
+            6: 'CONSUMER',
+            7: 'VC',
+        }
+
+    class GraphOutputMode:
+        """
+        `GraphOutputField::MODE` values: how an output shares the pipes with the other output.
+        """
+        OFF = 0  # The output carries no stream.
+        REPLICA = 1  # The output repeats the other output's streams.
+        DUPLICATE = 2  # The output carries the pipes its mask names, which the other output carries too.
+        SPLIT = 3  # The output carries the pipes its mask names, and the other output the rest.
+        EXCLUSIVE = 4  # The output carries every pipe, and the other output carries none.
+
+        _NAMES = {
+            0: 'OFF',
+            1: 'REPLICA',
+            2: 'DUPLICATE',
+            3: 'SPLIT',
+            4: 'EXCLUSIVE',
+        }
+
+    class GraphConsumer:
+        """
+        `GraphOutputField::CONSUMER` values.
+        """
+        NONE = 0  # No one receives the output.
+        HOST = 1  # The host's capture stack.
+        MODULE = 2  # A smart module.
+
+        _NAMES = {
+            0: 'NONE',
+            1: 'HOST',
+            2: 'MODULE',
+        }
+
+    class GraphWalksField:
+        """
+        Byte offsets inside the head of the `GRAPH_WALKS` record, `GRAPH_WALKS_HEAD_SIZE` bytes. The base staging follows it, then the walks.
+        """
+        PHASE_PARAM = 0  # The program's parameter a HUB step stages its phase into.
+        LOCK_PARAM = 1  # The program's parameter the last phase of a status, construct or train walk stores the lock bits in, a bit per link row, `GRAPH_NONE` for none.
+        TRAIN_ROUNDS = 2  # Passes of the `TRAIN` walk before the policy stops training a link.
+        STAGE_COUNT = 3  # Rows of the base staging that follow the head, `MAX_PARAMS` at most.
+        VLOCK = 4  # Two u16 LE hub registers whose failed poll is a video-lock failure, `GRAPH_REG_NONE` for none.
+
+        _NAMES = {
+            0: 'PHASE_PARAM',
+            1: 'LOCK_PARAM',
+            2: 'TRAIN_ROUNDS',
+            3: 'STAGE_COUNT',
+            4: 'VLOCK',
+        }
+
+    class GraphStageField:
+        """
+        Byte offsets inside one row of the base staging, `GRAPH_STAGE_SIZE` bytes: a run parameter every HUB step stages.
+        """
+        INDEX = 0  # The program's parameter.
+        VALUE = 1  # u32 LE: its value.
+
+        _NAMES = {
+            0: 'INDEX',
+            1: 'VALUE',
+        }
+
+    class GraphWalkField:
+        """
+        Byte offsets inside the head of one walk, `GRAPH_WALK_HEAD_SIZE` bytes. Its steps follow it.
+        """
+        WALK = 0  # `GraphWalk`: which walk the steps are.
+        COUNT = 1  # The steps that follow, `GRAPH_STEPS_MAX` at most.
+
+        _NAMES = {
+            0: 'WALK',
+            1: 'COUNT',
+        }
+
+    class GraphStepField:
+        """
+        Byte offsets inside one step of a walk, `GRAPH_STEP_SIZE` bytes.
+        """
+        KIND = 0  # `GraphStepKind`.
+        LINK = 1  # The link row the step acts on, `GRAPH_NONE` for none.
+        OP = 2  # HUB: the phase. POD: the `CamAction`. MAP: the row at the camera door. HOST: the `GraphHostOp`. CONVERGE: 0.
+        FLAGS = 3  # `GRAPH_STEP_*` bits, and in `GRAPH_STEP_INDEX` the parameter an override stages or a MAP step's `ParamKind`.
+        VALUE = 4  # u32 LE: the override's value, a MAP step's row value, a HOST step's argument.
+
+        _NAMES = {
+            0: 'KIND',
+            1: 'LINK',
+            2: 'OP',
+            3: 'FLAGS',
+            4: 'VALUE',
+        }
+
+    class GraphWalk:
+        """
+        The walks a graph image names. The library's policy runs them in its order, and an owner runs one by its number.
+        """
+        UP = 0  # The bring-up of the declared links.
+        CONSTRUCT = 1  # A cold port's construction: a pristine serializer's link program first.
+        TRAIN = 2  # One pass of link training.
+        RECOVER = 3  # The escalation before a second bring-up: the heads' power dip and the hub's reset.
+        STATUS = 4  # A read of the links' lock on a warm port.
+        SYNC = 5  # The declared frame sync: the generator and each head's trigger conversion.
+        FREE = 6  # The return to free run.
+        GAIN = 7  # The declared gain and exposure, committed on each camera door.
+        PARK = 8  # Every head in standby and the outputs gated.
+        GATE_ON = 9  # The streams started.
+        GATE_OFF = 10  # The streams parked.
+        TIMING = 11  # Each head's timing at the line the port runs, and the video lock.
+
+        _NAMES = {
+            0: 'UP',
+            1: 'CONSTRUCT',
+            2: 'TRAIN',
+            3: 'RECOVER',
+            4: 'STATUS',
+            5: 'SYNC',
+            6: 'FREE',
+            7: 'GAIN',
+            8: 'PARK',
+            9: 'GATE_ON',
+            10: 'GATE_OFF',
+            11: 'TIMING',
+        }
+
+    class GraphStepKind:
+        """
+        `GraphStepField::KIND` values: what runs a step.
+        """
+        HUB = 0  # A phase of the program at the hub's address, with the base staging and the step's override.
+        POD = 1  # A camera run on the link's pod, or on the owner at a head without a pod.
+        HOST = 2  # A call back to the owner: the frames, the overlay.
+        MAP = 3  # One row committed on the link's camera door.
+        CONVERGE = 4  # The pod's store brought to the link's personality and build, from the owner's store.
+
+        _NAMES = {
+            0: 'HUB',
+            1: 'POD',
+            2: 'HOST',
+            3: 'MAP',
+            4: 'CONVERGE',
+        }
+
+    class GraphHostOp:
+        """
+        `GraphStepField::OP` values of a HOST step.
+        """
+        FRAMES = 0  # The owner checks that the link's frames arrive.
+        OVERLAY = 1  # The owner applies the port's capture overlay.
+
+        _NAMES = {
+            0: 'FRAMES',
+            1: 'OVERLAY',
+        }
+
+    class HubPhaseField:
+        """
+        Byte offsets inside one row of the `HUB_PHASES` record, `HUB_PHASE_ROW_SIZE` bytes: a phase of a hub program.
+        """
+        PHASE = 0  # The value of the program's `phase` parameter that selects the phase.
+        NAME = 1  # ASCII, NUL-padded: the phase's name.
+
+        _NAMES = {
+            0: 'PHASE',
+            1: 'NAME',
+        }
+
+    class StoreEntry:
+        """
+        Byte offsets inside one entry of `MapReg::STORE_DIRECTORY`, `STORE_ENTRY_SIZE` bytes.
+        """
+        STATE = 0  # `SlotState`: empty, populated or active.
+        KIND = 1  # The image's `ImageKind`.
+        SIZE = 2  # u16 LE: the image's size in bytes.
+        FORMAT = 4  # The image format's major and minor.
+        PARAMS = 6  # The image's parameter row count.
+        OUTPUTS = 7  # The image's output row count.
+        NAME = 8  # ASCII, NUL-padded: the first 8 bytes of the personality's name; the full name is in `PERSONALITY_INFO`.
+
+        _NAMES = {
+            0: 'STATE',
+            1: 'KIND',
+            2: 'SIZE',
+            4: 'FORMAT',
+            6: 'PARAMS',
+            7: 'OUTPUTS',
+            8: 'NAME',
+        }
+
+    class SlotState:
+        """
+        `StoreEntry::STATE` values.
+        """
+        EMPTY = 0
+        POPULATED = 1
+        ACTIVE = 2  # The slot a VM runs: the main VM's or the camera run's.
+
+        _NAMES = {
+            0: 'EMPTY',
+            1: 'POPULATED',
+            2: 'ACTIVE',
+        }
+
+    class ParamId:
+        """
+        The standard meanings a parameter row may carry; the unit is fixed per id and the compiler checks it.
+        """
+        CUSTOM = 0  # No standard meaning: the host offers the row by its name.
+        EXPOSURE_US = 1  # The exposure in microseconds; unit `us`; kind APPLY.
+        FRAME_RATE_MFPS = 2  # The frame rate in milli-frames per second, shown in frames per second; unit `mfps`; kind APPLY. The device converts it to the frame period it stages.
+        GAIN_MDB = 3  # The gain in millidecibels; unit `mdB`; kind APPLY.
+        BLACK_LEVEL_DN = 4  # The black level in digital numbers at the mode's bit depth; unit `DN`; kind APPLY.
+        FLIPS = 5  # `FLIP_X` and `FLIP_Y` bits; an enum of 0..3; kind APPLY.
+        TEST_PATTERN = 6  # The device's test-pattern codes, 0 first for off; an enum; kind APPLY.
+        TRIGGER = 7  # The device's trigger conversions, `TriggerCode` values; an enum; kind TRIGGER.
+        STREAM = 8  # 0 standby, 1 streaming or sampling; an enum; kind GATE. Every personality that streams or samples carries one.
+        MODE = 9  # A `MODE_VALUE` of the mode table; an enum; kind RUN, accepted in standby only.
+        TEMPERATURE_DC = 10  # The device temperature in deci-degrees Celsius; signed; unit `dC`; read-only; `TEMPERATURE_NONE` while unread.
+        FOCUS_POSITION = 11  # A lens's focus in steps; unit `step`; kind APPLY. Reserved.
+        APERTURE = 12  # A lens's f-number times 100; unit `f*100`; kind APPLY. Reserved.
+        ZOOM = 13  # A lens's magnification times 100; unit `x*100`; kind APPLY. Reserved.
+        SAMPLE_RATE_HZ = 14  # A sampling personality's rate in hertz; unit `Hz`; kind RUN.
+        FIFO_DEPTH = 15  # The device's row: records the sample queue keeps before it overwrites the oldest; unit `rec`; kind APPLY.
+        DECIMATION = 16  # The device's rows: `decimation`, the device-wide gate on the sample window and every subject, then one per Cyphal SI subject, `decim.accel`, `decim.gyro`, `decim.mag`, `decim.temp`, `decim.press`, `decim.gnss` and `decim.scalar`; publish every Nth sample, 0 off; kind APPLY.
+        CAN_TERMINATION = 17  # The device's row: the CAN split termination, an enum of off, on; kind APPLY.
+        MOUNT_ORIENTATION = 18  # A click personality's row: the mount rotation of the sensor's frame, a `Rotation` code 0..23; kind APPLY.
+        CAN_NODE_ID = 19  # A device row: the unit's Cyphal node id, 0..125 static or 255 anonymous. A commit stages it, `Cmd::STORE_PERSIST` keeps it and the next boot runs it; kind APPLY.
+        CAN_BITRATE = 20  # A device row: the CAN arbitration bitrate in bit/s, one of the profiles' nominal rates, judged with `CAN_DATA_BITRATE` as a pair at the commit; kind APPLY, the next boot runs it.
+        CAN_DATA_BITRATE = 21  # A device row: the CAN data-phase bitrate in bit/s, the nominal rate for Classic CAN and above it for CAN FD; kind APPLY, the next boot runs it.
+
+        _NAMES = {
+            0: 'CUSTOM',
+            1: 'EXPOSURE_US',
+            2: 'FRAME_RATE_MFPS',
+            3: 'GAIN_MDB',
+            4: 'BLACK_LEVEL_DN',
+            5: 'FLIPS',
+            6: 'TEST_PATTERN',
+            7: 'TRIGGER',
+            8: 'STREAM',
+            9: 'MODE',
+            10: 'TEMPERATURE_DC',
+            11: 'FOCUS_POSITION',
+            12: 'APERTURE',
+            13: 'ZOOM',
+            14: 'SAMPLE_RATE_HZ',
+            15: 'FIFO_DEPTH',
+            16: 'DECIMATION',
+            17: 'CAN_TERMINATION',
+            18: 'MOUNT_ORIENTATION',
+            19: 'CAN_NODE_ID',
+            20: 'CAN_BITRATE',
+            21: 'CAN_DATA_BITRATE',
+        }
+
+    class TriggerCode:
+        """
+        The values of a `TRIGGER` row: the trigger conversions a head serves, by their meaning, so a driver names them without the trailer.
+        """
+        FREERUN = 0  # No trigger: the sensor runs at its frame period.
+        FAST = 1  # The trigger pulse's width is the exposure: one frame per pulse, the exposure row set by the pulse.
+        SEQUENTIAL = 2  # One frame per trigger pulse at the exposure the row holds.
+
+        _NAMES = {
+            0: 'FREERUN',
+            1: 'FAST',
+            2: 'SEQUENTIAL',
+        }
+
+    class ModeEntry:
+        """
+        Byte offsets inside one row of `MapReg::MODE_TABLE`, `MODE_ENTRY_SIZE` bytes.
+        """
+        WIDTH = 0  # u16 LE active pixels per line.
+        HEIGHT = 2  # u16 LE active lines.
+        BIT_DEPTH = 4  # Bits per pixel on the wire: 8, 10 or 12.
+        LANES = 5  # CSI-2 lanes the mode drives.
+        RATE_MBPS = 6  # u16 LE megabits per second per lane.
+        DATA_TYPE = 8  # The RAW sample depth of the stream's CSI-2 data type: 10 for RAW10, 12 for RAW12.
+        FLAGS = 9  # `MODE_FLAG_*` bits.
+        FPS_MAX_MILLI = 10  # u32 LE: the fastest frame rate of the mode in thousandths of a frame per second.
+        MODE_VALUE = 14  # The value a RUN commit of the `MODE` row names, what `CURRENT_MODE` reports.
+        PIXEL_PHASE = 15  # The Bayer order of the mode before any flip: 0 RGGB, 1 GRBG, 2 GBRG, 3 BGGR; 0xFF when the capture table names none.
+
+        _NAMES = {
+            0: 'WIDTH',
+            2: 'HEIGHT',
+            4: 'BIT_DEPTH',
+            5: 'LANES',
+            6: 'RATE_MBPS',
+            8: 'DATA_TYPE',
+            9: 'FLAGS',
+            10: 'FPS_MAX_MILLI',
+            14: 'MODE_VALUE',
+            15: 'PIXEL_PHASE',
+        }
+
+    class Cmd:
+        """
+        `MapReg::CMD` values: what a commit cannot say. The argument is `MapReg::CMD_ARG`, written in the same transaction.
+        """
+        LOAD = 0  # Close the upload session and run the delivered image as the main VM's personality; a transient image until `SAVE`.
+        SAVE = 1  # Keep the running image in slot `CMD_ARG`.
+        DELETE_SLOT = 2  # Empty slot `CMD_ARG`.
+        CLEAR_STORE = 3  # Empty every slot.
+        ACTIVATE_SLOT = 4  # Run slot `CMD_ARG`: a sampling image on the main VM, a camera image on the camera run, which then takes its configure from a RUN commit of the `MODE` row.
+        ABORT = 5  # Stop a commit in flight within 50 ms; `CMD_ERROR` pends until it stopped.
+        DFU_BEGIN = 6  # Erase the secondary slot and open the firmware-update session.
+        DFU_FINISH = 7  # Close the session, mark the swap pending and reboot to apply.
+        REBOOT = 8
+        CONFIRM_FW = 9  # Confirm the running firmware so the bootloader keeps it.
+        ENTER_RECOVERY = 10  # Arm the bootloader's serial recovery and reset into it.
+        STORE_PERSIST = 11  # Keep the identity and the CAN profile the device rows committed, with the running decimation rows and the calibration in effect.
+        CALIB_APPLY = 12  # Validate the staged `CALIBRATION` record and apply it.
+        CALIB_PERSIST = 13  # Keep the calibration in effect.
+        CAL_GYRO = 14  # Start the on-device gyro still average.
+        CAL_MAG_START = 15  # Start the on-device magnetometer collection.
+        CAL_MAG_STOP = 16  # Close the magnetometer collection, solve and apply.
+        IDENTIFY = 17  # Strobe the status LED for about 10 s.
+        SESSION_ABORT = 18  # Close an open upload or firmware-update session.
+
+        _NAMES = {
+            0: 'LOAD',
+            1: 'SAVE',
+            2: 'DELETE_SLOT',
+            3: 'CLEAR_STORE',
+            4: 'ACTIVATE_SLOT',
+            5: 'ABORT',
+            6: 'DFU_BEGIN',
+            7: 'DFU_FINISH',
+            8: 'REBOOT',
+            9: 'CONFIRM_FW',
+            10: 'ENTER_RECOVERY',
+            11: 'STORE_PERSIST',
+            12: 'CALIB_APPLY',
+            13: 'CALIB_PERSIST',
+            14: 'CAL_GYRO',
+            15: 'CAL_MAG_START',
+            16: 'CAL_MAG_STOP',
+            17: 'IDENTIFY',
+            18: 'SESSION_ABORT',
+        }
+
+    class ProcState:
+        """
+        `MapReg::PROC_STATE` values.
+        """
+        IDLE = 0
+        GYRO_WAIT_STILL = 1
+        GYRO_AVERAGING = 2
+        MAG_COLLECT = 3
+
+        _NAMES = {
+            0: 'IDLE',
+            1: 'GYRO_WAIT_STILL',
+            2: 'GYRO_AVERAGING',
+            3: 'MAG_COLLECT',
+        }
+
+    class Session:
+        """
+        `MapReg::SESSION` values.
+        """
+        NONE = 0
+        UPLOAD = 1
+        DFU = 2
+        PROCEDURE = 3
+
+        _NAMES = {
+            0: 'NONE',
+            1: 'UPLOAD',
+            2: 'DFU',
+            3: 'PROCEDURE',
+        }
+
+    class DfuPhase:
+        """
+        `MapReg::DFU_PHASE` values.
+        """
+        IDLE = 0
+        ERASING = 1
+        READY = 2
+        WRITING = 3
+        FINISHING = 4
+        ERROR = 5
+
+        _NAMES = {
+            0: 'IDLE',
+            1: 'ERASING',
+            2: 'READY',
+            3: 'WRITING',
+            4: 'FINISHING',
+            5: 'ERROR',
+        }
+
+    class DiagCounter:
+        """
+        The order of the u16 counters at `MapReg::DIAG`.
+        """
+        DRDY_COALESCED = 0  # Data-ready edges that arrived while the previous wake was pending.
+        INGRESS_REJECTS = 1  # Host commands the transport arbiter rejected because a session was open elsewhere.
+        QUEUE_OVERFLOWS = 2  # Host writes dropped because the command queue was full.
+        VM_IO_ERRORS = 3  # Measure-loop I/O errors the VM absorbed.
+        PROBE_FAILURES = 4  # Probe give-ups.
+        RUNS = 5  # Commits of kind RUN accepted since boot.
+        RESET_CAUSE = 6  # The reset cause of this boot as the hardware's flags.
+        BUS_HEALS = 7  # Resets of the host-bus peripheral after a transfer the bus cut.
+        VM_IO_ERRNO = 8  # The positive errno of the latest measure-loop I/O error the VM absorbed, 0 before the first.
+        BUS_HEAL_ERRNO = 9  # The positive errno of the failed transfer that preceded the latest heal, 0 before the first.
+
+        _NAMES = {
+            0: 'DRDY_COALESCED',
+            1: 'INGRESS_REJECTS',
+            2: 'QUEUE_OVERFLOWS',
+            3: 'VM_IO_ERRORS',
+            4: 'PROBE_FAILURES',
+            5: 'RUNS',
+            6: 'RESET_CAUSE',
+            7: 'BUS_HEALS',
+            8: 'VM_IO_ERRNO',
+            9: 'BUS_HEAL_ERRNO',
+        }
+
+    MAP_ID_UNIT = 171  # `MapReg::MAP_ID` at the unit door.
+
+    MAP_ID_CAMERA = 196  # `MapReg::MAP_ID` at the camera door and on a smart camera.
+
+    MAP_VERSION_VALUE = 1  # The layout version this file describes.
+
+    PROTO_VERSION_VALUE = 2  # The host interface version; 1 was the first interface with its 8-bit map.
+
+    MAP_SIZE = 65536  # Bytes the map spans.
+
+    MAP_LATCH_SIZE = 2048  # Bytes a read latches at its first byte, the header through the mode table.
+
+    ROW_SIZE = 64  # Bytes of one parameter or output row.
+
+    MAX_ROWS = 64  # Parameter rows the layout holds.
+
+    MAX_OUTPUT_ROWS = 16  # Output rows the layout holds.
+
+    PORT_ROW_SIZE = 32  # Bytes of one row of the `PORTS` record.
+
+    MAX_PORT_ROWS = 16  # Port rows an image declares at most: a host's eight camera connectors, each a CSI input and its I²C output.
+
+    PRESENT_ROW_SIZE = 8  # Bytes of one entry of the `PRESENTATION` record, the `PresentField` layout.
+
+    PRESENT_FLAG_LABELS = 1  # `PresentField::FLAGS` bit: the record's tail names this row's values.
+
+    LABEL_CHARS_MAX = 31  # Characters of a value's name in the `PRESENTATION` record at most.
+
+    IDENTITY_SIZE = 64  # Bytes of the `IDENTITY` record's head, the `IdentityField` layout, which every image kind carries.
+
+    IDENTITY_CAM_SIZE = 16  # Bytes a CAMERA image appends to the `IDENTITY` head, the `IdentityCamField` layout.
+
+    IDENTITY_FLAG_TAKES_TRIGGER = 1  # `IdentityField::FLAGS` bit: the head takes the hub's trigger.
+
+    IDENTITY_FLAG_PULSE_EXPOSURE = 2  # `IdentityField::FLAGS` bit: the trigger pulse's width is the exposure.
+
+    GRAPH_SOURCE_SIZE = 40  # Bytes of the `GRAPH_SOURCE` record.
+
+    GRAPH_DIGEST_SIZE = 16  # Bytes of a declaration's digest in the `GRAPH_SOURCE` record.
+
+    GRAPH_LINK_ROW_SIZE = 88  # Bytes of one row of the `GRAPH_LINKS` record.
+
+    GRAPH_OUTPUT_ROW_SIZE = 8  # Bytes of one row of the `GRAPH_OUTPUTS` record.
+
+    GRAPH_WALKS_HEAD_SIZE = 8  # Bytes of the head of the `GRAPH_WALKS` record.
+
+    GRAPH_STAGE_SIZE = 5  # Bytes of one row of the base staging.
+
+    GRAPH_WALK_HEAD_SIZE = 2  # Bytes of the head of one walk.
+
+    GRAPH_STEP_SIZE = 8  # Bytes of one step of a walk.
+
+    HUB_PHASE_ROW_SIZE = 17  # Bytes of one row of the `HUB_PHASES` record.
+
+    GRAPH_LINKS_MAX = 2  # Link rows a graph image carries at most, the Hub's two links.
+
+    GRAPH_OUTPUTS_MAX = 2  # Output rows a graph image carries at most, the Hub's two CSI outputs.
+
+    GRAPH_MAP_MAX = 2  # Translations a link's serializer performs at most.
+
+    GRAPH_STEPS_MAX = 32  # Steps one walk holds at most.
+
+    HUB_PHASES_MAX = 32  # Phases a hub program names at most.
+
+    GRAPH_NONE = 255  # A link, a parameter or a trigger value a graph record names as absent.
+
+    GRAPH_REG_NONE = 65535  # A register `GraphWalksField::VLOCK` names as absent.
+
+    GRAPH_SER_ADDR = 66  # The serializer's address behind the Hub's window. The hub's program is compiled with it, so a graph whose declaration names another is refused.
+
+    GRAPH_TCA_ADDR = 32  # The address of the Hub carrier's port expander. The hub's program is compiled with it, so a graph whose declaration names another is refused.
+
+    GRAPH_FLAG_HOMOGENEOUS = 1  # `GraphSourceField::FLAGS`: both links run one sensor kind in one mode at one address.
+
+    GRAPH_FLAG_SYNC = 2  # `GraphSourceField::FLAGS`: the declaration asks for frame sync, so the policy runs the `SYNC` walk after the bring-up.
+
+    GRAPH_FLAG_GAIN = 4  # `GraphSourceField::FLAGS`: the declaration states a gain, so the policy runs the `GAIN` walk after the bring-up.
+
+    GRAPH_LINK_PRESENT = 1  # `GraphLinkField::FLAGS`: the walks bring the link up. A link without it is declared and left alone.
+
+    GRAPH_LINK_CAMERA = 2  # `GraphLinkField::FLAGS`: the link carries a camera head.
+
+    GRAPH_LINK_HOST_CSI = 4  # `GraphLinkField::FLAGS`: the hub's program writes the serializer's CSI block.
+
+    GRAPH_LINK_FRAME_FIXED = 8  # `GraphLinkField::FLAGS`: a rate law fixed the frame the timing action writes.
+
+    GRAPH_LINK_POD = 16  # `GraphLinkField::FLAGS`: a pod's unit runs the link's personality.
+
+    GRAPH_STREAM_Y_TO_A = 1
+
+    GRAPH_STREAM_Z_TO_A = 2
+
+    GRAPH_STREAM_Y_TO_B = 4
+
+    GRAPH_STREAM_Z_TO_B = 8
+
+    GRAPH_STEP_OVERRIDE = 1  # `GraphStepField::FLAGS`: a HUB or POD step stages its value into the parameter `GRAPH_STEP_INDEX` names.
+
+    GRAPH_STEP_SOFT = 2  # `GraphStepField::FLAGS`: a failure of the step is reported and the walk goes on.
+
+    GRAPH_STEP_AGAIN = 4  # `GraphStepField::FLAGS`: the step runs on every pass of its walk but the first, as the power dip between training passes.
+
+    GRAPH_STEP_INDEX = 240  # `GraphStepField::FLAGS` bits 4..7: the parameter an override stages, or a MAP step's `ParamKind`.
+
+    ROW_NAME_LEN = 16
+
+    ROW_UNIT_LEN = 6
+
+    ROW_VALUES_MAX = 16  # Enum values a row holds as u16.
+
+    ROW_TYPE_RANGE = 1
+
+    ROW_TYPE_SIGNED = 2
+
+    ROW_TYPE_WIDE = 4
+
+    ROW_WIDE_VALUES_MAX = 8
+
+    ROW_FLAG_READ_ONLY = 1
+
+    ROW_FLAG_SET_BY_TRIGGER = 2
+
+    ROW_FLAG_GRAPH = 4  # The graph's owner sets the row from the rig's facts, a line time for one; a kernel driver offers it read-only.
+
+    ROW_FLAG_OWNER = 224  # The owner tag in `RowField::FLAGS` bits 5..7: `OWNER_DEVICE` the device's own rows, a personality's slot below it, else a tag no other owner carries.
+
+    OWNER_DEVICE = 7
+
+    OUTPUT_FLAG_BIG_ENDIAN = 1
+
+    OUTPUT_FLAG_STRING = 2
+
+    MODE_TABLE_MAX = 16
+
+    MODE_ENTRY_SIZE = 16
+
+    MODE_FLAG_DEFAULT = 1
+
+    MODE_FLAG_TRIGGERABLE = 2
+
+    FLIP_X = 1
+
+    FLIP_Y = 2
+
+    TEMPERATURE_NONE = 2147483648
+
+    STORE_SLOTS = 8
+
+    STORE_ENTRY_SIZE = 16
+
+    PERSONALITY_INFO_SIZE = 4096
+
+    BUILD_INFO_SIZE = 64
+
+    TIME_SYNC_RECORD_SIZE = 32  # The clock relation, written whole; the device applies the bytes before `TIME_SYNC_RECORD_SOURCE_OFF`.
+
+    TIME_SYNC_RECORD_OFFSET_OFF = 0  # i64 LE host minus device offset, microseconds.
+
+    TIME_SYNC_RECORD_BOUND_OFF = 8  # u32 LE error bound, microseconds.
+
+    TIME_SYNC_RECORD_RATE_OFF = 12  # i32 LE clock rate, parts per billion.
+
+    TIME_SYNC_RECORD_VALID_FOR_OFF = 16  # u32 LE validity window, microseconds.
+
+    TIME_SYNC_RECORD_SOURCE_OFF = 20  # u8 served on a read, 0 none or stale, 1 host.
+
+    TIME_SYNC_RECORD_VALID_OFF = 21  # u8 served on a read, 1 while the discipline is fresh.
+
+    DIAG_COUNTER_COUNT = 16
+
+    SAMPLE_RECORD_LATCH_TIME_OFF = 0  # u64 LE microseconds of the device clock when the read latched.
+
+    SAMPLE_RECORD_TIMESTAMP_OFF = 8
+
+    SAMPLE_RECORD_SEQ_OFF = 16
+
+    SAMPLE_RECORD_DATA_OFF = 18
+
+    SAMPLE_RECORD_DATA_MAX = 110
+
+    SAMPLE_BURST_MAX = 256
+
+    SAMPLE_BURST_NEXT_INDEX_OFF = 8
+
+    SAMPLE_BURST_COUNT_OFF = 10
+
+    SAMPLE_BURST_RECORD_SIZE_OFF = 11
+
+    SAMPLE_BURST_PENDING_OFF = 12
+
+    SAMPLE_BURST_RECORDS_OFF = 14
+
+    SAMPLE_FIFO_CAPACITY = 2048  # Bytes of records the sample queue holds.
+
+    TRANSFER_CURSOR_OFF = 0  # u32 LE byte offset of the chunk inside the image, the first cells of a chunk write.
+
+    TRANSFER_DATA_OFF = 4
+
+    TRANSFER_CHUNK_MAX = 128  # Bytes of image data one chunk write carries at most.
+
+    SESSION_STALE_MS = 5000  # An open session with no chunk for this long closes by itself.
+
+    DFU_IMAGE_MAX = 221184  # Bytes the secondary slot holds.
+
+    CMD_DOORBELL_BIT = 128
+
+    CMD_OPCODE_MASK = 127
+
+    CMD_ERR_PENDING = 255
+
+    STATUS_SAMPLE_READY = 1
+
+    STATUS_ERROR = 2
+
+    STATUS_RUNNING = 128
+
+    APPLY_RUN_MS_FLOOR = 4  # `MapReg::APPLY_RUN_MS` before the device completed an apply: the longest a pod's apply takes under no contention.
+
+    APPLY_POLL_MS = 1  # Interval of the host's `STATE` reads after the painted apply time, the host bus held, a NAK read as busy.
+
+    APPLY_POLL_MAX_MS = 20  # Longest the host polls past the painted apply time before it reports the device busy and releases the host bus.
+
+    MODE_POLL_MS = 10  # Interval of the host's `STATE` reads after a RUN, GATE or TRIGGER commit, once the painted run time has passed, the host bus held, a NAK read as busy.
+
+    MODE_SWITCH_TIMEOUT_MS = 6000  # Longest the host polls after a RUN, GATE or TRIGGER commit before it reports the device busy.
+
+    BUSY_RETRY_MS = 1  # Wait before a host repeats a transaction the device did not acknowledge outside a commit window.
+
+    BUSY_RETRIES = 8  # Repeats of such a transaction before the host reports the device busy.
+
 class OpErrors:
 
     class OpErrorCode:
@@ -1159,14 +2450,15 @@ class Personality:
 
     class CamRunState:
         """
-        State of the camera run reported in `Reg::CAM_STATE` and mirrored into `XFER_PHASE` while the run holds the session.
+        State of the camera run the camera door reports through `MapReg::STATE` and `CURRENT_MODE`.
 
         A run is one pass of the personality's probe and configure programs
         on the second VM instance. IDLE before the first run; a terminal
-        state stands until the next `CAM_RUN`. Terminal states carry the
-        verdict in `CMD_ERROR` and `CAM_ERROR`: DONE 0, PROBE_FAILED the
-        probe errno, FAULTED the VM fault errno (ETIMEDOUT for a hard poll,
-        EIO for a register op past its retries), ABORTED ECANCELED.
+        state stands until the next commit that runs. A terminal state ends
+        the run's commit with its verdict in `MapReg::ERROR`: DONE 0,
+        PROBE_FAILED the probe errno, FAULTED the VM fault errno (ETIMEDOUT
+        for a hard poll, EIO for a register op past its retries), ABORTED
+        ECANCELED.
         """
         IDLE = 0
         LOADING = 1
@@ -1192,7 +2484,11 @@ class Personality:
 
     CAM_REG_RETRY_DELAY_MS = 50  # Delay between camera register-op retries.
 
-    CAM_ABORT_LATENCY_MS = 50  # Upper bound on the time from `Cmd::CAM_ABORT` to the ABORTED state.
+    MAP_REG_RETRIES = 2  # Register-op retries of a camera door apply before a fault.
+
+    MAP_REG_RETRY_DELAY_MS = 1  # Delay between a camera door apply's register-op retries.
+
+    CAM_ABORT_LATENCY_MS = 50  # Upper bound on the time from `Cmd::ABORT` to the ABORTED state.
 
 class RunnerStates:
 

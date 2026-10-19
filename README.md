@@ -58,7 +58,7 @@ docker run --rm --device /dev/ttyUSB0 nxs:cyphal --transport cyphal-serial \
 
 `nxs switch` installs the platform's udev bus aliases and the tab completion
 at `/etc/bash_completion.d/nxs` (the writes under `/etc` go through sudo);
-zsh sources the same file after `autoload -U bashcompinit && bashcompinit`.
+zsh sources the same file after `autoload -U compinit && compinit`.
 
 ## Deploy to a Jetson
 

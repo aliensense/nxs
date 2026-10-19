@@ -8,6 +8,14 @@ from typing import Optional, Tuple
 from nxs._generated_constants import RunnerStates
 
 
+#: A realtime-skew bracket this narrow places the reading within the jitter the estimator holds.
+SKEW_BRACKET_NS = 50_000
+#: Tries at a narrow bracket; the narrowest stands when none closes.
+SKEW_TRIES = 4
+#: How long one skew reading serves: the clocks drift apart only under an NTP slew, at ppm.
+SKEW_REFRESH_NS = 1_000_000_000
+
+
 class TimeSyncEstimator:
     """Device-clock to host-clock offset estimator: the RFC 5905 clock filter
     over two-way observations (minimum-RTT exchange in a sliding window wins)."""
@@ -31,6 +39,9 @@ class TimeSyncEstimator:
         # Best (minimum-RTT) exchange within WINDOW_S of the newest observation,
         # maintained on observe() so a projection never rescans the deque.
         self._recent_best = None
+        # Host CLOCK_REALTIME less CLOCK_MONOTONIC, and the monotonic time it was read at.
+        self._skew_ns: Optional[int] = None
+        self._skew_at_ns = 0
 
     def observe(self, t0_ns: int, t1_ns: int, device_us: int):
         """Record one two-way exchange: request sent at `t0_ns`, device clock
@@ -65,12 +76,31 @@ class TimeSyncEstimator:
 
     def project_to_realtime(self, device_us: int) -> Optional[Tuple[int, int]]:
         """`(sec, nanosec)` of host CLOCK_REALTIME for a device timestamp, or
-        None before the first observation. The realtime skew is sampled per call."""
+        None before the first observation."""
         mono = self.project_mono_ns(device_us)
         if mono is None:
             return None
-        skew = time.time_ns() - time.monotonic_ns()
-        return divmod(mono + skew, 1_000_000_000)
+        return divmod(mono + self._realtime_skew_ns(), 1_000_000_000)
+
+    def _realtime_skew_ns(self) -> int:
+        """Host CLOCK_REALTIME less CLOCK_MONOTONIC. The realtime clock is
+        read between two monotonic reads, so a preemption between them widens
+        the bracket instead of moving the skew; the narrowest of a few tries
+        stands, and a reading is kept for `SKEW_REFRESH_NS`."""
+        if self._skew_ns is not None and time.monotonic_ns() - self._skew_at_ns < SKEW_REFRESH_NS:
+            return self._skew_ns
+        width = None
+        for _ in range(SKEW_TRIES):
+            m0 = time.monotonic_ns()
+            realtime = time.time_ns()
+            m1 = time.monotonic_ns()
+            if width is None or m1 - m0 < width:
+                width = m1 - m0
+                self._skew_ns = realtime - (m0 + m1) // 2
+                self._skew_at_ns = m1
+            if width <= SKEW_BRACKET_NS:
+                break
+        return self._skew_ns
 
     def ready(self) -> bool:
         with self._lock:
@@ -186,8 +216,8 @@ def estimate_and_push(client, pings: int = 8,
     library's client runs the round on its own estimator."""
     round_ = getattr(client, "time_sync_round", None)
     if round_ is not None:
-        # A round the unit did not answer raises: the caller decides whether
-        # a deaf link ends it or is ridden out.
+        # A round the unit did not answer raises: the caller decides whether a deaf link ends it or is
+        # ridden out.
         return int(round_(pings, interval_s).bound_us)
     for _ in range(pings):
         if not client.time_sync_ping():

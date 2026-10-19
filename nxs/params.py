@@ -3,15 +3,14 @@
 
 """The device parameters a unit carries beside its personality's: the
 sample FIFO depth, the output decimation, the CAN bit timing and
-termination, the mounting orientation. `nxs get <name>` and `nxs set
-<name> <value>` reach them after the personality's parameters."""
+termination. `nxs get <name>` and `nxs set <name> <value>` reach them
+before the personality's parameters."""
 
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
 
-from nxs.client import (SUBJECT_BUCKETS, SupportsBitTiming, SupportsCalibration,
-                        SupportsCanTermination, SupportsSampleFifo, rotation_code,
-                        rotation_name, ROTATION_NAMES)
+from nxs.client import (SUBJECT_BUCKETS, SupportsBitTiming, SupportsCanTermination,
+                        SupportsSampleFifo)
 
 SUBJECTS = sorted(SUBJECT_BUCKETS, key=SUBJECT_BUCKETS.get)
 
@@ -98,18 +97,6 @@ def _term_write(t, value, _subject):
     t.write_can_term(parse_can_term(value))
 
 
-def _orientation_read(t, _subject):
-    return rotation_name(t.read_calibration().orientation)
-
-
-def _orientation_write(t, value, _subject):
-    try:
-        code = rotation_code(value.upper())
-    except ValueError as e:
-        raise ParamError(f"orientation: {e}")
-    t.set_orientation(code, persist=True)
-
-
 PARAMS: List[DeviceParam] = [
     DeviceParam("fifo-depth", SupportsSampleFifo, _fifo_read, _fifo_write,
                 "records (0 = all the storage holds)",
@@ -124,9 +111,6 @@ PARAMS: List[DeviceParam] = [
     DeviceParam("can-term", SupportsCanTermination, _term_read, _term_write,
                 "on | off | default",
                 "applies live; persists on nxs commission --save"),
-    DeviceParam("orientation", SupportsCalibration, _orientation_read,
-                _orientation_write, " ".join(ROTATION_NAMES),
-                "applied and persisted"),
 ]
 
 

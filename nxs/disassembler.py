@@ -1,7 +1,7 @@
 """Bytecode disassembler for NXS VM programs: prints a readable listing."""
 
 import struct
-from nxs.opcodes import Op, INSTRUCTION_SIZE
+from nxs.opcodes import Op, INSTRUCTION_SIZE, instruction_length
 
 
 def disassemble(bytecode: bytes, *, print_fn=print) -> list[str]:
@@ -21,10 +21,9 @@ def disassemble(bytecode: bytes, *, print_fn=print) -> list[str]:
             pc += 1
             continue
 
-        # MEMCPY_IMM is variable-length: `len` inline bytes follow the 3-byte
-        # header, so byte[pc+2] gives the full instruction size.
-        if opcode == Op.MEMCPY_IMM and pc + 3 <= len(bytecode):
-            size = 3 + bytecode[pc + 2]
+        # A variable-length instruction carries `len` inline bytes after its
+        # header.
+        size = instruction_length(bytecode, pc)
 
         instr = bytecode[pc:pc + size]
         text = _format_instruction(addr, opcode, instr)
@@ -54,6 +53,11 @@ def _fmt_alu(addr, instr):
         return f"r{dst} = r{reg} & 0x{imm:X}"
     else:
         return f"r{dst} = r{reg} | 0x{imm:X}"
+
+def _fmt_select(addr, instr):
+    reg, length = instr[1], instr[2]
+    targets = [addr + struct.unpack_from("<h", instr, 3 + 2 * i)[0] for i in range(length // 2)]
+    return f"r{reg} -> [" + ", ".join(f"0x{t:04X}" for t in targets) + "]"
 
 def _fmt_crc8(addr, instr):
     src_off, length, poly, init, xor_out, dst, style = instr[1:8]
@@ -105,6 +109,11 @@ _FORMATTERS = {
     Op.ACQ_BIAS: lambda a, i: f"acq_bias = {struct.unpack_from('<L', i, 1)[0]} us",
     Op.SET_SAMPLE_SIZE: lambda a, i: f"size={i[1]}",
     Op.REG_WRITE_BURST: lambda a, i: f"[0x{i[1] | (i[2] << 8):02X}] = buf[{i[3]}..+{i[4]}]",
+    Op.REG_WRITE_BURST_IMM: lambda a, i: (
+        f"[0x{i[1] | (i[2] << 8):02X}..+{i[3]}] = "
+        + " ".join(f"{b:02X}" for b in i[4:4 + i[3]])
+    ),
+    Op.SELECT: _fmt_select,
     Op.CVT64: lambda a, i: f"work[{i[2]}] = (i64) r{i[1]}",
     Op.MUL64: lambda a, i: f"work[{i[3]}] = work[{i[1]}] * work[{i[2]}]",
     Op.ADD64: lambda a, i: f"work[{i[3]}] = work[{i[1]}] + work[{i[2]}]",

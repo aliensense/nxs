@@ -9,7 +9,7 @@ bench tool: no verb calls it, and the wheel does not carry it.
 It samples what the follower copies: the heads and the gain register of the
 pack's `build_follow` for the port, the leader and the follower the port
 record names, or the port's first two camera links on a pair a declared
-`camera.gain_db` locks. `--leader`, `--follower` and `--reg` replace the
+gain locks. `--leader`, `--follower` and `--reg` replace the
 addresses and the register; `--bus` replaces the port's bus. Each sample takes
 the bus lock every tool run shares in one attempt, so a frame another run holds
 the bus in is skipped, and the tool writes nothing.

@@ -3,7 +3,7 @@ IAM-20680 personality for NXS VM.
 
 TDK InvenSense IAM-20680 3-axis gyroscope, 3-axis accelerometer; datasheet DS-000196 rev 1.1.
 Bus: I2C 0x68/0x69 (SA0 strap, JP5 ADD), default; SPI modes 0 and 3, 8 MHz max.
-Config: sample_rate 10|25|50|100|200|250 Hz (100); accel_fs 2|4|8|16 g (8);
+Config: sample_rate 10|25|50|100|200|250|500 Hz (100); accel_fs 2|4|8|16 g (8);
     gyro_fs 250|500|1000|2000 dps (2000); accel_bw 5|10|21|45|99|218|420 Hz (420);
     gyro_bw 5|10|20|41|92|176 Hz (176); trigger drdy|poll (drdy); bus i2c|spi (i2c).
 Outputs: accel_x/y/z (m/s^2), temp (K), gyro_x/y/z (rad/s).

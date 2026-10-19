@@ -49,17 +49,17 @@ def booted_lanes(bus: str, sysfs_i2c: str = SYSFS_I2C) -> Optional[int]:
     return None
 
 
-def lane_mismatch(bus: str, declared: int,
-                  sysfs_i2c: str = SYSFS_I2C) -> Optional[str]:
+def lane_mismatch(bus: str, declared: int, sysfs_i2c: str = SYSFS_I2C,
+                  port: Optional[str] = None) -> Optional[str]:
     """One sentence when the booted overlay's lanes differ from the
-    declared count, else None (also None when the tree is silent)."""
+    declared count, else None (also None when the tree is silent). `port`
+    names the connector whose lanes row the sentence offers."""
     booted = booted_lanes(bus, sysfs_i2c)
     if booted is None or booted == int(declared):
         return None
-    return (f"the booted overlay declares {booted} CSI lanes for this port "
-            f"but the port says csi_lanes: {declared} — boot the "
-            f"{declared}-lane overlay for this camera, "
-            f"or declare csi_lanes: {booted}")
+    return (f"the booted overlay declares {booted} CSI lanes for this port, and the "
+            f"declaration says {declared}: boot the {declared}-lane overlay for this "
+            f"camera, or declare the host's {port or '<connector>'}_lanes: {booted}")
 
 
 DT_MODULES = "/proc/device-tree/tegra-camera-platform/modules"

@@ -10,13 +10,14 @@ from __future__ import annotations
 import ctypes
 import dataclasses
 import errno
+import json
 import os
 import threading
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
-from nxs._libnxs import EREFUSED, MAX_PARAMS, Bus, _Param, _Refusal, _SlotInfo, _CamState, _load
+from nxs._libnxs import EREFUSED, Bus, _Refusal, _SlotInfo, _load
 from nxs._libnxs_abi import (
     _CalProgress, _Commission, _Diag, _Identity, _OutputInfo, _ParamInfo, _PROGRESS_FN,
     _Sample, _State, _StreamOpts, _TimeSync, _TimeSyncFit, _XferState)
@@ -26,10 +27,11 @@ from nxs.capabilities import (
     SupportsFaultCounters, SupportsIdentify, SupportsRecovery, SupportsSampleFifo,
     SupportsSlotPeek, SupportsTimeSync, validate_can_bitrate, validate_can_term,
     validate_commission, validate_sample_fifo_depth)
+from nxs._generated_constants import CyphalDefaults, NxsDriverImage
 from nxs.client import COMMISSION_TOPICS, LINK_DROP_ADVICE, NxsClient
 from nxs.device_errors import DeviceRefused
 
-_TRAILER_MAX = 2048
+_TRAILER_MAX = NxsDriverImage.MAX_TRAILER_SIZE
 _CALIBRATION_RECORD_MAX = 256
 #: The default unit address on a port's bus and behind a hub before the aliases.
 DEFAULT_I2C_ADDRESS = 0x30
@@ -41,8 +43,18 @@ DEFAULT_CAN_MTU = 64
 DECIMATION_SUBJECTS = ("acceleration", "angular_velocity", "magnetic_field", "temperature",
                        "pressure", "scalar")
 _RESET_SETTLE_MS = 2000
-_CAM_RUN_TIMEOUT_MS = 30000
-_CAM_ABORT_TIMEOUT_MS = 5000
+#: The store file of the transient images I²C units run, by serial: the
+#: map names a stored image alone, so the host keeps the name it loaded.
+TRANSIENT_NAMES = "transient-images.json"
+_NO_SLOT = 0xFF
+
+
+def _transient_names() -> dict:
+    from nxs.cam import port_state
+    try:
+        return json.loads((port_state.state_dir() / TRANSIENT_NAMES).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
 
 
 @dataclass(frozen=True)
@@ -65,11 +77,15 @@ def _text(raw: bytes) -> str:
     return raw.decode("ascii", "replace")
 
 
+#: A parameter's kind by `ParamKind`, as the tool names it; a transport that serves none reads None.
+_KIND_NAMES = {0: "apply", 1: "run", 2: "gate", 3: "trigger"}
+
+
 def _param_dict(index: int, info: "_ParamInfo") -> dict:
     """One parameter descriptor as the tool reads it."""
     return {"idx": index, "name": _text(info.name),
             "type": "enum" if info.param_type == 0 else "range",
-            "kind": "reload" if info.reload else "live",
+            "kind": _KIND_NAMES.get(int(info.kind)),
             "default": int(info.default_value), "current": int(info.current),
             "values": [int(v) for v in info.values[:info.num_values]], "unit": _text(info.unit)}
 
@@ -108,13 +124,16 @@ class Unit(NxsClient, SupportsRecovery, SupportsTimeSync, SupportsIdentify, Supp
     TimeoutError."""
 
     def __init__(self, handle: int, bus: Optional[Bus] = None, owned: bool = True,
-                 describe: str = ""):
+                 describe: str = "", address: Optional[int] = None, on: Optional[Bus] = None):
         super().__init__()
         self._handle = handle
         self._bus = bus
+        self._on = on or bus
+        self._address = address
         self._owned = owned
         self._describe = describe
         self._last_failure: Optional[str] = None
+        self._recalled = 0
         self._poll_hz = 0
         self._stream = 0
         # A reader polls the stream from its own thread while the owner may
@@ -133,7 +152,7 @@ class Unit(NxsClient, SupportsRecovery, SupportsTimeSync, SupportsIdentify, Supp
         if not handle:
             handle_bus.close()
             raise OSError(err.value, os.strerror(err.value), f"unit at {address:#04x} on {path}")
-        return cls(handle, bus=handle_bus, describe=f"i2c {path}@{address:#04x}")
+        return cls(handle, bus=handle_bus, describe=f"i2c {path}@{address:#04x}", address=address)
 
     @classmethod
     def on_bus(cls, bus: Bus, address: int) -> "Unit":
@@ -142,7 +161,7 @@ class Unit(NxsClient, SupportsRecovery, SupportsTimeSync, SupportsIdentify, Supp
         handle = _load().nxs_unit_open_i2c(bus._live(), address, ctypes.byref(err))
         if not handle:
             raise OSError(err.value, os.strerror(err.value), f"unit at {address:#04x}")
-        return cls(handle, describe=f"i2c @{address:#04x}")
+        return cls(handle, describe=f"i2c @{address:#04x}", address=address, on=bus)
 
     @classmethod
     def open_can(cls, can_iface: str = "can0", can_mtu: int = DEFAULT_CAN_MTU,
@@ -180,6 +199,8 @@ class Unit(NxsClient, SupportsRecovery, SupportsTimeSync, SupportsIdentify, Supp
         if self._bus is not None and self._bus._failure is not None:
             raise self._bus._failure
         text = os.strerror(-rc) + (f" ({what})" if what else "")
+        if rc == -errno.EILSEQ:
+            raise OSError(-rc, f"a row read torn mid-transaction ({what}): the unit was busy on its own bus, run again")
         if rc == -errno.ETIMEDOUT:
             raise TimeoutError(f"the unit did not answer: {text}")
         raise OSError(-rc, text)
@@ -187,6 +208,11 @@ class Unit(NxsClient, SupportsRecovery, SupportsTimeSync, SupportsIdentify, Supp
     @property
     def caps(self) -> int:
         return _load().nxs_unit_caps(self._live())
+
+    @property
+    def address(self) -> Optional[int]:
+        """The unit door's I²C address, None on Cyphal."""
+        return self._address
 
     def describe(self) -> str:
         return self._describe
@@ -250,13 +276,44 @@ class Unit(NxsClient, SupportsRecovery, SupportsTimeSync, SupportsIdentify, Supp
         self._check(_load().nxs_unit_identify(self._live()), "identify")
 
     # ── the personality VM ─────────────────────────────────────
-    def _state(self) -> _State:
+    def _read_state(self) -> _State:
         out = _State()
         self._check(_load().nxs_unit_read_state(self._live(), ctypes.byref(out)), "state")
         return out
 
+    def _state(self) -> _State:
+        """The state, a transient image named: the I²C map names a stored
+        image alone, so the host keeps the name of a transient one it loaded
+        by the unit's serial and the epoch of that load, and names it to the
+        next client while the epoch stands."""
+        state = self._read_state()
+        epoch = int(state.descriptor_epoch)
+        if state.active_slot != _NO_SLOT or state.personality_name or not epoch or self._recalled == epoch:
+            return state
+        self._recalled = epoch
+        serial = self.read_serial()
+        kept = _transient_names().get(serial.hex()) if serial else None
+        if not kept or kept.get("epoch") != epoch:
+            return state
+        if _load().nxs_unit_name_transient(self._live(), epoch, str(kept["name"]).encode()) != 0:
+            return state
+        return self._read_state()
+
     def upload_image(self, image: bytes) -> None:
         self._check(_load().nxs_unit_upload(self._live(), bytes(image), len(image)), "upload")
+        if self._address is None:
+            return                  # Cyphal serves the running image's name itself
+        state = self._read_state()
+        serial = self.read_serial() if state.active_slot == _NO_SLOT and state.personality_name else None
+        if not serial:
+            return
+        from nxs.cam import port_state
+        names = _transient_names()
+        names[serial.hex()] = {"epoch": int(state.descriptor_epoch), "name": state.personality_name.decode()}
+        try:
+            port_state.write_store_file(port_state.state_dir() / TRANSIENT_NAMES, json.dumps(names))
+        except OSError:
+            pass                    # the next client names no transient image
 
     def vm_run(self) -> None:
         self._check(_load().nxs_unit_vm_run(self._live()), "run")
@@ -328,7 +385,7 @@ class Unit(NxsClient, SupportsRecovery, SupportsTimeSync, SupportsIdentify, Supp
         self._check(rc, f"peek slot {slot}")
         return SimpleNamespace(name=info.name.decode(), num_params=info.num_params,
                                num_outputs=info.num_outputs, i2c_addr=info.i2c_addr,
-                               kind=IMAGE_KIND_NAMES.get(info.kind, info.kind))
+                               kind=IMAGE_KIND_NAMES.get(info.kind))
 
     def read_personality_info(self, slot: int) -> bytes:
         out = (ctypes.c_uint8 * _TRAILER_MAX)()
@@ -392,44 +449,6 @@ class Unit(NxsClient, SupportsRecovery, SupportsTimeSync, SupportsIdentify, Supp
 
     def _descriptor_token(self) -> int:
         return self.read_descriptor_epoch()
-
-    # ── cam personalities ──────────────────────────────
-    def cam_stage_params(self, slot: int, values) -> None:
-        staged = dict(values)
-        if len(staged) > MAX_PARAMS:
-            raise ValueError(f"at most {MAX_PARAMS} parameters, got {len(staged)}")
-        params = (_Param * max(1, len(staged)))()
-        for i, (index, value) in enumerate(staged.items()):
-            params[i].index = int(index)
-            params[i].value = int(value)
-        self._check(_load().nxs_unit_cam_stage(self._live(), slot, params, len(staged)),
-                    "camera stage")
-
-    def cam_read_params(self, slot: int, indices) -> Dict[int, int]:
-        out: Dict[int, int] = {}
-        for index in indices:
-            value = ctypes.c_uint32(0)
-            self._check(_load().nxs_unit_cam_param(self._live(), slot, int(index),
-                                                   ctypes.byref(value)), "camera param")
-            out[int(index)] = value.value
-        return out
-
-    def cam_run(self, slot: int, timeout_s: Optional[float] = None) -> None:
-        """Run the personality in `slot` and wait for its terminal state; a
-        verdict other than DONE is the unit's refusal."""
-        state = _CamState()
-        timeout_ms = int((timeout_s or _CAM_RUN_TIMEOUT_MS / 1000) * 1000)
-        self._check(_load().nxs_unit_cam_run(self._live(), slot, timeout_ms, ctypes.byref(state)),
-                    "camera run")
-
-    def cam_abort(self, timeout_s: Optional[float] = None) -> None:
-        timeout_ms = int((timeout_s or _CAM_ABORT_TIMEOUT_MS / 1000) * 1000)
-        self._check(_load().nxs_unit_cam_abort(self._live(), timeout_ms), "camera abort")
-
-    def read_cam_state(self) -> Tuple[int, int]:
-        state = _CamState()
-        self._check(_load().nxs_unit_cam_state(self._live(), ctypes.byref(state)), "camera state")
-        return int(state.state), int(state.error)
 
     # ── the stream ────────────────────────────────────────
     @staticmethod
@@ -561,8 +580,16 @@ class Unit(NxsClient, SupportsRecovery, SupportsTimeSync, SupportsIdentify, Supp
         return bytes(out[:length.value]), epoch.value
 
     def read_calibration(self) -> CalibrationRecord:
+        """The record in effect, with the mount rotation the running
+        personality's `orientation` row holds (0 without one): the record's
+        own byte is reserved."""
         record, _epoch = self._calibration()
-        return CalibrationRecord.unpack(record)
+        unpacked = CalibrationRecord.unpack(record)
+        try:
+            code = int(self.get_param("orientation")["current"])
+        except (KeyError, RuntimeError):
+            return unpacked
+        return dataclasses.replace(unpacked, orientation=code)
 
     def read_cal_epoch(self) -> int:
         return self._calibration()[1]
@@ -573,9 +600,8 @@ class Unit(NxsClient, SupportsRecovery, SupportsTimeSync, SupportsIdentify, Supp
         self._check(_load().nxs_unit_set_calibration(self._live(), buf, len(packed),
                                                      1 if persist else 0), "calibration")
 
-    def set_orientation(self, rotation: int, persist: bool = True) -> None:
-        record = dataclasses.replace(self.read_calibration(), orientation=rotation)
-        self.write_calibration(record, persist)
+    def set_orientation(self, rotation: int) -> None:
+        self.set_param("orientation", int(rotation))
 
     def cal_gyro(self) -> None:
         self._check(_load().nxs_unit_cal_gyro(self._live()), "gyro calibration")
@@ -619,7 +645,9 @@ class Unit(NxsClient, SupportsRecovery, SupportsTimeSync, SupportsIdentify, Supp
         # What is not given keeps the unit's value: the record persists whole.
         record = self._commission_record()
         if node_addr is not None:
-            record.node_id = int(node_addr)
+            # 0xFFFF reverts to the compiled default: the device keeps what it is given.
+            record.node_id = (CyphalDefaults.DEFAULT_NODE_ID if int(node_addr) == 0xFFFF
+                              else int(node_addr))
         for i, name in enumerate(COMMISSION_TOPICS):
             if topics and name in topics:
                 record.topic_ids[i] = int(topics[name])
@@ -641,7 +669,6 @@ class Unit(NxsClient, SupportsRecovery, SupportsTimeSync, SupportsIdentify, Supp
     def read_can_bitrate(self) -> tuple:
         record = self._commission_record()
         if record.can_bitrate == 0:
-            from nxs._generated_constants import CyphalDefaults
             return CyphalDefaults.CAN_BITRATE_DEFAULT, CyphalDefaults.CAN_BITRATE_DATA_DEFAULT
         return int(record.can_bitrate), int(record.can_data_bitrate)
 
@@ -669,6 +696,10 @@ class Unit(NxsClient, SupportsRecovery, SupportsTimeSync, SupportsIdentify, Supp
         out = _XferState()
         self._check(_load().nxs_unit_xfer_state(self._live(), ctypes.byref(out)), "transfer state")
         return int(out.phase), int(out.type), int(out.error)
+
+    def read_session(self) -> Optional[int]:
+        """The session an I²C unit holds, `NxsMap.Session`; None over Cyphal."""
+        return self.read_xfer_state()[1] if self._address is not None else None
 
     def xfer_abort(self) -> None:
         self._check(_load().nxs_unit_xfer_abort(self._live()), "transfer abort")
@@ -701,6 +732,39 @@ class Unit(NxsClient, SupportsRecovery, SupportsTimeSync, SupportsIdentify, Supp
     def read_cmd_queue_overflow_count(self) -> int:
         return int(self._diag().cmd_queue_overflows)
 
+    def _diag_cell(self, counter: str, absent: Optional[int] = None) -> int:
+        """One `DIAG` cell by its `DiagCounter` name; `absent` where the
+        transport serves no such cell (a unit without a pod bus heals none)."""
+        from nxs._generated_constants import NxsMap
+
+        out = ctypes.c_uint32()
+        rc = _load().nxs_unit_read_diag_counter(self._live(), int(getattr(NxsMap.DiagCounter, counter)),
+                                                ctypes.byref(out))
+        if rc == -errno.ENOTSUP and absent is not None:
+            return absent
+        self._check(rc, "diagnostics")
+        return int(out.value)
+
+    def read_io_errno(self) -> int:
+        return self._diag_cell("VM_IO_ERRNO")
+
+    def read_bus_heal_count(self) -> int:
+        return self._diag_cell("BUS_HEALS", absent=0)
+
+    def read_bus_heal_errno(self) -> int:
+        return self._diag_cell("BUS_HEAL_ERRNO", absent=0)
+
+    # ── the map's doors ───────────────────────────────────
+    def door(self, address: int):
+        """The door of the NXS map at `address` on this client's bus: the
+        unit's camera door, or its unit door at the client's own address. A
+        client the walk handed over has none."""
+        from nxs._libnxs_map import Door
+
+        if self._on is None:
+            raise RuntimeError("a door is reached over the bus this client runs on")
+        return Door(self._on, address)
+
     # ── lifetime ──────────────────────────────────────────
     def close(self) -> None:
         """Close the unit; one the walk handed over is the walk's to close."""
@@ -708,6 +772,7 @@ class Unit(NxsClient, SupportsRecovery, SupportsTimeSync, SupportsIdentify, Supp
         if self._handle and self._owned:
             _load().nxs_unit_close(self._handle)
         self._handle = 0
+        self._on = None
         if self._bus is not None:
             self._bus.close()
             self._bus = None
@@ -720,7 +785,7 @@ class Unit(NxsClient, SupportsRecovery, SupportsTimeSync, SupportsIdentify, Supp
 
 
 class I2cUnit(Unit, SupportsCameraRun):
-    """The unit over I²C: the register map, which also runs cam personalities."""
+    """The unit over I²C: the NXS map at its unit door, which also runs cam personalities."""
 
 
 class CyphalUnit(Unit, SupportsEgressDecimation):

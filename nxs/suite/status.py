@@ -1,6 +1,6 @@
 """The unit rows of a bare `nxs status`, read on demand: `up`, `degraded`
-(another declared link is silent), or `down`; the drift kinds (`config`,
-`personality`, `shape`, `fw`), `-` for none, `?` when unknown; the sync,
+(another declared link is silent), or `down`; the drift kinds (`personality`,
+`shape`, `config`, `rows`, `fw`), `-` for none, `?` when unknown; the sync,
 serial and calibration verdicts; the personality and its outputs."""
 import sys
 from dataclasses import dataclass, field
@@ -33,6 +33,8 @@ class UnitStatus:
     samples: Optional[int] = None
     serial: str = ""
     outputs: List[str] = field(default_factory=list)
+    #: The unit serves the first host interface: no read past its version means anything.
+    first_interface: bool = False
 
 
 def collect_status(cfg: SuiteConfig, state: SuiteState,
@@ -74,7 +76,8 @@ def collect_status(cfg: SuiteConfig, state: SuiteState,
                     pass
         row.up = transport is not None
         row.degraded = row.degraded and row.up
-        if row.up:
+        row.first_interface = row.up and _try(lambda: _first_interface(transport), False)
+        if row.up and not row.first_interface:
             # Each field is read independently: one failing read leaves that
             # column blank without blanking the others.
             row.personality = _try(transport.read_personality_name, "") or "-"
@@ -95,6 +98,15 @@ def collect_status(cfg: SuiteConfig, state: SuiteState,
                 pass
         rows.append(row)
     return rows
+
+
+def _first_interface(transport) -> bool:
+    """Whether the unit serves the first host interface, which `nxs switch`
+    upgrades and no other read of this tool decodes."""
+    from nxs.firmware import FIRST_PROTO_VERSION
+
+    reader = getattr(transport, "interface_version", None)
+    return reader is not None and reader() == FIRST_PROTO_VERSION
 
 
 def _try(fn, default):
@@ -172,9 +184,9 @@ def _drift_verdict(unit, state: SuiteState, transport, personalities_dir) -> str
 
     try:
         panel = [(spec, load_click_personality(spec.personality, personalities_dir)().compile(spec.config))
-                 for spec in (unit.sensors or [])]
+                 for spec in unit.sensors]
         drift = detect_unit_drift(unit, panel, transport, state,
-                                  panel_hash(unit))
+                                  panel_hash(panel))
     except Exception:
         return "?"
     return "+".join(drift.kinds()) if drift.any() else "-"

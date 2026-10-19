@@ -87,7 +87,10 @@ def _port_key(ports: Dict[int, Topology], token: str) -> int:
             if _port_name(topo) == t:
                 return index
     have = ", ".join(f"{_port_name(t)} ({i})" for i, t in sorted(ports.items()))
-    raise SystemExit(f"no port {token!r}; have {have}")
+    line = f"no port {token!r}; declared: {have}"
+    if not t.lstrip("-").isdigit():
+        line += f"\n  - nxs tune --set {t}:HUB=<hub> (declare the port)"
+    raise SystemExit(line)
 
 
 def select_port_links(
@@ -179,8 +182,11 @@ def _named(port: str, reason: str) -> str:
 
 def _require_up(topology: Topology, links: List[LinkSpec],
                 verb: str) -> None:
-    """Refuse a running-stream verb on links the port record says are not up."""
+    """Refuse a running-stream verb on links the port record says are not
+    up, and while nxsd is bringing the port up: its delivery check opens
+    the capture sessions, and a session beside it fails both."""
     port = _port_name(topology)
+    require_no_daemon_run(port, verb)
     down = [(l, port_state.link_state(topology, l)) for l in links]
     down = [(l, s) for l, s in down if s != port_state.STATE_UP]
     if down:
@@ -188,6 +194,18 @@ def _require_up(topology: Topology, links: List[LinkSpec],
         need = " ".join(l.name for l, _ in down)
         raise _refuse(f"nxs: {verb} needs the link up: {detail} on {port}",
                       f"nxs {port} {need} on")
+
+
+def require_no_daemon_run(port: str, verb: str) -> None:
+    """Refuse a verb on a port nxsd is bringing up, from its `bringing up`
+    to its end: the port is the daemon's until then."""
+    from nxs.daemon import BRINGING_UP, port_verdict
+
+    seen = port_verdict(port)
+    if (seen is not None and seen["verdict"] == BRINGING_UP
+            and seen["boot"] == port_state.boot_id()):
+        raise _refuse(f"nxs: nxsd is bringing {port} up, and {verb} is refused until its run ends",
+                      f"nxs {port} status")
 
 
 def _hub_for(topology: Topology):

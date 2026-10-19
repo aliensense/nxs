@@ -43,6 +43,7 @@ class Op(IntEnum):
     JMP = 0x30  # Unconditional relative jump: PC = instruction_start + offset.
     JNZ = 0x31  # Jump if r[reg] != 0.
     JZ = 0x32  # Jump if r[reg] == 0.
+    SELECT = 0x33  # Jump table: `len` inline bytes follow the header, twice the count of 16-bit little-endian offsets relative to the op's start. Jumps to offsets[r[reg]]; r[reg] at or past the count faults MISMATCH. Compiled from select().
     REG_WRITE = 0x40  # Write a byte to a sensor register.
     REG_READ = 0x41  # Read a byte from a sensor register into r[dst].
     REG_READ_BURST = 0x42  # Burst-read count bytes from reg into sample_buf[buf_off..].
@@ -63,6 +64,7 @@ class Op(IntEnum):
     SLEEP_US = 0x51  # Sleep for us microseconds.
     ACQ_FRAME = 0x52  # Set the pass's acquisition bound to the RX backlog's first-byte arrival; now when the stream serves no stamp. Compiled from self.stamp_frame().
     ACQ_BIAS = 0x53  # Declare the driver's acquisition latency: every committed stamp is biased this many microseconds earlier. Held for a driver that declares its latency; no driver verb emits it.
+    REG_WRITE_BURST_IMM = 0x55  # Register-prefixed burst write of the `len` inline bytes that follow the header: HAL write_regs(reg, program[pc..+len]), the inline mirror of REG_WRITE_BURST for a table run known at compile time, with no copy through sample_buf.
     POLL_REG = 0x54  # Read register `reg` every `poll_ms` ms until `(value & mask) == val` (flags bit0: != instead) or `timeout_ms` has passed; a NAK counts as not yet. On timeout, flags bit1 (soft) continues and raises the soft-miss status flag, else the VM faults with ERR_VM_POLL_TIMEOUT. The value width follows the bus profile's data width. Compiled from self.poll(); a camera personality's alive gate.
     STORE_SAMPLE = 0x60  # Commit sample_buf to the ring slot; bump the sample counter.
     SET_SAMPLE_SIZE = 0x61  # Set the published sample size in bytes.
@@ -112,6 +114,7 @@ INSTRUCTION_SIZE: Dict[int, int] = {
     Op.JMP: 3,
     Op.JNZ: 4,
     Op.JZ: 4,
+    Op.SELECT: 3,  # header only; + len inline bytes
     Op.REG_WRITE: 4,
     Op.REG_READ: 4,
     Op.REG_READ_BURST: 5,
@@ -132,6 +135,7 @@ INSTRUCTION_SIZE: Dict[int, int] = {
     Op.SLEEP_US: 3,
     Op.ACQ_FRAME: 1,
     Op.ACQ_BIAS: 5,
+    Op.REG_WRITE_BURST_IMM: 4,  # header only; + len inline bytes
     Op.POLL_REG: 16,
     Op.STORE_SAMPLE: 1,
     Op.SET_SAMPLE_SIZE: 2,
@@ -149,73 +153,20 @@ INSTRUCTION_SIZE: Dict[int, int] = {
     Op.TRUNC64: 3,
 }
 
-# NXS minor version that introduced each opcode; the compiler
-# stamps an image's required-minor as the max over emitted opcodes.
-OPCODE_SINCE_MINOR: Dict[int, int] = {
-    Op.NOP: 0,
-    Op.HALT: 0,
-    Op.YIELD: 0,
-    Op.ERROR: 0,
-    Op.LOAD_IMM: 0,
-    Op.MOV: 0,
-    Op.LOAD_U16_BE: 0,
-    Op.LOAD_U8: 0,
-    Op.LOAD_U16_LE: 0,
-    Op.LOAD_U8_REG: 0,
-    Op.LOAD: 0,
-    Op.PARAM_LOAD: 2,
-    Op.PARAM_STORE: 2,
-    Op.CMP_EQ: 0,
-    Op.AND: 0,
-    Op.OR: 0,
-    Op.CRC8: 0,
-    Op.ADD: 0,
-    Op.SUB: 0,
-    Op.XOR: 0,
-    Op.SHL: 0,
-    Op.SHR: 0,
-    Op.ADD_REG: 0,
-    Op.SUB_REG: 0,
-    Op.XOR_REG: 0,
-    Op.CMP_LT: 0,
-    Op.MUL_REG: 2,
-    Op.DIVU_REG: 2,
-    Op.JMP: 0,
-    Op.JNZ: 0,
-    Op.JZ: 0,
-    Op.REG_WRITE: 0,
-    Op.REG_READ: 0,
-    Op.REG_READ_BURST: 0,
-    Op.REG_XFER: 0,
-    Op.UART_WRITE: 0,
-    Op.UART_CONFIGURE: 0,
-    Op.UART_READ: 0,
-    Op.UART_AVAIL: 0,
-    Op.BUS_WRITE_RAW: 0,
-    Op.BUS_READ_RAW: 0,
-    Op.UART_READ_REG: 0,
-    Op.UART_WRITE_RAW: 0,
-    Op.REG_WRITE_BURST: 0,
-    Op.ADC_READ: 0,
-    Op.I2C_TARGET: 0,
-    Op.EVENT_DIV: 0,
-    Op.SLEEP_MS: 0,
-    Op.SLEEP_US: 0,
-    Op.ACQ_FRAME: 0,
-    Op.ACQ_BIAS: 0,
-    Op.POLL_REG: 0,
-    Op.STORE_SAMPLE: 0,
-    Op.SET_SAMPLE_SIZE: 0,
-    Op.MEMCPY_IMM: 0,
-    Op.MEMCPY: 0,
-    Op.STORE_SAMPLE_N: 0,
-    Op.STORE_U8: 0,
-    Op.STORE_U8_REG: 0,
-    Op.CVT64: 0,
-    Op.MUL64: 0,
-    Op.ADD64: 0,
-    Op.SUB64: 0,
-    Op.SHR64: 0,
-    Op.SHL64: 0,
-    Op.TRUNC64: 0,
-}
+# Opcodes whose header ends in a `len` byte followed by that many
+# inline bytes; INSTRUCTION_SIZE holds the header alone.
+VARIABLE_LENGTH = frozenset({
+    Op.SELECT,
+    Op.REG_WRITE_BURST_IMM,
+    Op.MEMCPY_IMM,
+})
+
+
+def instruction_length(bytecode: bytes, pc: int) -> int:
+    """Bytes the instruction at `pc` occupies, inline data included;
+    0 for an opcode the table does not know."""
+    op = bytecode[pc]
+    size = INSTRUCTION_SIZE.get(op, 0)
+    if size and op in VARIABLE_LENGTH and pc + size <= len(bytecode):
+        size += bytecode[pc + size - 1]
+    return size

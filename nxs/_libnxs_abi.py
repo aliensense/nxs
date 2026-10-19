@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import ctypes
 
-from nxs._libnxs import _CamState, _Param, _SlotInfo
+from nxs._libnxs import _SlotInfo
 
 _NAME_LEN = 32
 _UNIT_LEN = 16
@@ -20,8 +20,10 @@ _SAMPLE_DATA_MAX = 128
 
 class _Identity(ctypes.Structure):
     _fields_ = [("serial", ctypes.c_char * _SERIAL_LEN), ("fw_major", ctypes.c_uint8),
-                ("fw_minor", ctypes.c_uint8), ("fw_describe", ctypes.c_char * _VERSION_LEN),
-                ("fw_confirmed", ctypes.c_int8), ("proto_version", ctypes.c_uint8)]
+                ("fw_minor", ctypes.c_uint8), ("fw_patch", ctypes.c_uint8),
+                ("fw_describe", ctypes.c_char * _VERSION_LEN),
+                ("fw_confirmed", ctypes.c_int8), ("proto_version", ctypes.c_uint8),
+                ("module_kind", ctypes.c_uint8)]
 
 
 class _State(ctypes.Structure):
@@ -35,7 +37,7 @@ class _State(ctypes.Structure):
 
 class _ParamInfo(ctypes.Structure):
     _fields_ = [("name", ctypes.c_char * _NAME_LEN), ("param_type", ctypes.c_uint8),
-                ("reload", ctypes.c_uint8), ("default_value", ctypes.c_uint32),
+                ("kind", ctypes.c_uint8), ("default_value", ctypes.c_uint32),
                 ("current", ctypes.c_uint32), ("num_values", ctypes.c_uint8),
                 ("values", ctypes.c_uint32 * _MAX_PARAM_VALUES), ("unit", ctypes.c_char * _UNIT_LEN)]
 
@@ -88,7 +90,6 @@ class _Diag(ctypes.Structure):
                 ("probe_failures", ctypes.c_uint32)]
 
 
-
 _PROGRESS_FN = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t)
 
 
@@ -117,6 +118,7 @@ def _declare_unit(lib: ctypes.CDLL) -> None:
                        ("nxs_unit_read_identity", [unit, ctypes.POINTER(_Identity)]),
                        ("nxs_unit_identify", [unit]),
                        ("nxs_unit_read_state", [unit, ctypes.POINTER(_State)]),
+                       ("nxs_unit_name_transient", [unit, ctypes.c_uint8, ctypes.c_char_p]),
                        ("nxs_unit_vm_run", [unit]),
                        ("nxs_unit_vm_stop", [unit]),
                        ("nxs_unit_vm_reset", [unit, ctypes.c_uint32]),
@@ -161,20 +163,14 @@ def _declare_unit(lib: ctypes.CDLL) -> None:
                        ("nxs_unit_reboot", [unit]),
                        ("nxs_unit_read_diag", [unit, ctypes.POINTER(_Diag)]),
                        ("nxs_unit_read_cam_runs", [unit, ctypes.POINTER(ctypes.c_uint32)]),
+                       ("nxs_unit_read_diag_counter",
+                        [unit, ctypes.c_uint8, ctypes.POINTER(ctypes.c_uint32)]),
                        ("nxs_unit_upload", [unit, ctypes.c_char_p, ctypes.c_size_t]),
                        ("nxs_unit_save_slot", [unit, ctypes.c_uint8]),
                        ("nxs_unit_delete_slot", [unit, ctypes.c_uint8]),
                        ("nxs_unit_slot_info", [unit, ctypes.c_uint8, ctypes.POINTER(_SlotInfo)]),
                        ("nxs_unit_personality_info", [unit, ctypes.c_uint8, u8p, ctypes.c_size_t,
-                                                      ctypes.POINTER(ctypes.c_size_t)]),
-                       ("nxs_unit_cam_stage", [unit, ctypes.c_uint8, ctypes.POINTER(_Param),
-                                               ctypes.c_size_t]),
-                       ("nxs_unit_cam_param", [unit, ctypes.c_uint8, ctypes.c_uint8,
-                                               ctypes.POINTER(ctypes.c_uint32)]),
-                       ("nxs_unit_cam_run", [unit, ctypes.c_uint8, ctypes.c_uint32,
-                                             ctypes.POINTER(_CamState)]),
-                       ("nxs_unit_cam_abort", [unit, ctypes.c_uint32]),
-                       ("nxs_unit_cam_state", [unit, ctypes.POINTER(_CamState)])):
+                                                      ctypes.POINTER(ctypes.c_size_t)])):
         fn = getattr(lib, name)
         fn.restype = ctypes.c_int
         fn.argtypes = args

@@ -136,7 +136,9 @@ def _resolve_default_link(args, opener=None):
                          f"({found}) — pass -b/--bus and -a/--addr, or "
                          f"declare them in suite.yaml and use --unit")
     if swept:
-        hint += f"; nothing answered at 0x30/0x31 on {', '.join(swept)}"
+        from nxs.suite.scan import I2C_ADDRESSES
+        asked = "/".join(f"{a:#04x}" for a in I2C_ADDRESSES)
+        hint += f"; nothing answered at {asked} on {', '.join(swept)}"
     raise SystemExit(f"nxs: {hint}")
 
 def _units_on_camera_buses(opener=None):
@@ -212,6 +214,34 @@ def _manifest_nodes():
         return {}, set()
     return cfg.ports, {u.name for u in cfg.units}
 
+def _manifest_refusal():
+    """The refusal of a declaration that does not load, None for one that
+    loads or is absent."""
+    import os
+
+    from nxs.suite import default_config_path
+    from nxs.suite.schema import ManifestError, load_suite_config
+    path = default_config_path()
+    if not os.path.exists(path):
+        return None
+    try:
+        load_suite_config(path)
+    except ManifestError as exc:
+        return str(exc)
+    except OSError:
+        return None
+    return None
+
+
+def _commands() -> set:
+    """The tool's commands, as its parser names them."""
+    import argparse
+
+    from nxs.cli import build_parser
+    return {name for action in build_parser()._actions
+            if isinstance(action, argparse._SubParsersAction) for name in action.choices}
+
+
 def _unit_behind(port, link):
     """`(link name, unit name)` of the unit riding a port link; refuses
     ambiguity by listing."""
@@ -259,6 +289,12 @@ def _node_rewrite(argv):
     if not declared:
         plat_ports = _platform_ports()
         if port_token not in plat_ports:
+            if token not in _commands():
+                # A node of a declaration that does not load: its refusal,
+                # not the parser's usage.
+                refused = _manifest_refusal()
+                if refused is not None:
+                    raise SystemExit(f"nxs: {refused}")
             if token in _CAM_ONLY_VERBS:
                 # A bare camera verb lets the port-required refusal name the
                 # ports; verbs shared with units keep their top-level meaning.
@@ -279,11 +315,12 @@ def _node_rewrite(argv):
         # add, not the parser's usage.
         from nxs.suite import default_config_path
         wanted = rest[0].upper()
+        hub = ports[port_token].hub_node or "<hub>"
         raise SystemExit(
             f"{port_token}: no link {wanted} in the declaration "
             f"(declared: {', '.join(sorted(link_names)) or 'none'})\n"
-            f"  - ports.{port_token}.links.{wanted} in {default_config_path()}, "
-            f"then nxs switch")
+            f"  - connections.<camera or pod>.out: [{hub}.links.{wanted}] in "
+            f"{default_config_path()}, then nxs switch")
     if not rest:
         rest = ["status"]
     verb, vargs = rest[0], rest[1:]
@@ -310,10 +347,11 @@ def _node_rewrite(argv):
     # Manifest-less unit verbs ride the bare transport: the port's bus reaches
     # the link-A unit at its native address. A second link needs a declaration.
     if link is not None and link != "A":
+        from nxs.generate_seed import pod_alias
+        alias = pod_alias(link)
         raise SystemExit(
             f"nxs {port_token} {link}: the unit behind link {link} answers "
-            f"at its declared alias — declare it (ports.{port_token}.links."
-            f"{link}.unit: {{name, alias: 0x31}}) or pass "
-            f"-b {plat_ports[port_token]} -a 0x31")
+            f"at its alias {alias:#04x}: declare it (a unit node whose out feeds "
+            f"<hub>.links.{link}) or pass -b {plat_ports[port_token]} -a {alias:#04x}")
     return [argv[0], "--transport", "i2c",
             "--bus", plat_ports[port_token], verb, *vargs]

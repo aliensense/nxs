@@ -23,17 +23,29 @@ def read_image_version(path: str) -> tuple:
 
 
 def image_identity(path: str) -> Optional[str]:
-    """The build identity a signed image carries (`v1.1.0-rc1`), None for
+    """The build identity a signed image carries (`vX.Y.Z-rcN`), None for
     an image that carries none."""
     with open(path, "rb") as f:
         return identity(f.read())
 
 
 def _same_build(carried: Optional[str], wanted: Optional[str]) -> bool:
-    """Whether two build identities name one build: `-dirty` marks the tree
-    a build came from, not the build, so it tells no two apart."""
+    """Whether an image's identity is the build `wanted` names, for choosing
+    the image: `-dirty` marks the tree a build came from, so it tells no two
+    apart here, and a bare tag names the build cut at it (`vX.Y.Z-0-g…`)."""
     strip = lambda name: name[:-len("-dirty")] if name and name.endswith("-dirty") else name
+    if carried is not None and wanted is not None and strip(carried).startswith(wanted + "-0-g"):
+        return True
     return strip(carried) == strip(wanted)
+
+
+def runs_build(device: Optional[str], image: Optional[str]) -> bool:
+    """Whether a unit serving the identity `device` runs the image carrying
+    `image`: the same identity, and neither a `-dirty` build. A dirty
+    identity names a working tree, not a build, so it never converges."""
+    if device is None or image is None or device != image:
+        return False
+    return not device.endswith("-dirty")
 
 
 def find_image(store_dir: str, pin: str, build: Optional[str] = None) -> str:

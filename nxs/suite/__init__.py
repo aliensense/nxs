@@ -91,7 +91,7 @@ def stray_declaration(config_path: str) -> Optional[str]:
     stray = _user_config_path()
     if not os.path.exists(stray):
         return None
-    from nxs.suite.switch_cam import STATE_GROUP
+    from nxs.suite.switch_host import STATE_GROUP
 
     moved = [path for path in (stray, hardware_path(stray)) if os.path.exists(path)]
     target = os.path.dirname(_SYSTEM_CONFIG)

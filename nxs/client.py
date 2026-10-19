@@ -13,22 +13,20 @@ from nxs._generated_constants import RunnerStates
 from nxs.click_facts import is_decodable, parse_sample
 
 from nxs.device_errors import (
-    CALIB_ERR_REASON, CAM_ABORT_ERR_REASON, CAM_RUN_ERR_REASON,
-    CAM_VERDICT_REASON, COMMISSION_ERR_REASON, DFU_ERR_REASON, DeviceRefused,
+    CALIB_ERR_REASON, CAM_VERDICT_REASON, COMMISSION_ERR_REASON, DFU_ERR_REASON, DeviceRefused,
     ERRNO_EAGAIN, ERRNO_EBADF, ERRNO_EBUSY, ERRNO_ECANCELED, ERRNO_EEXIST, ERRNO_EINVAL,
     ERRNO_ENODATA, ERRNO_ENOENT, ERRNO_ENOTSUP, LOAD_ERR_REASON, PULL_ERR_REASON,
     SESSION_LIVE_REASON, STORE_ERR_REASON, XFER_ERR_REASON, err_reason,
     exc_detail, import_failure_detail, op_error_name,)
 from nxs.capabilities import (
-    ADDR_UNSET, CAL_VECTORS, CAM_RUN_TERMINAL, CAN_BITRATE_PROFILES,
+    ADDR_UNSET, CAL_VECTORS, CAN_BITRATE_PROFILES,
     CAN_TERM_OFF, CAN_TERM_ON, CAN_TERM_UNSET, COMMISSION_TOPICS,
     CalibrationRecord, CamRunState, NODE_ID_ANONYMOUS, NODE_ID_MAX,
     ROTATION_NAMES, SCALAR_TOPIC_SPAN, SUBJECT_ID_MAX, SupportsBitTiming,
     SupportsCalibration, SupportsCameraRun, SupportsCanTermination,
     SupportsCommissioning, SupportsEgressDecimation, SupportsFaultCounters,
     SupportsIdentify, SupportsRecovery, SupportsSampleFifo, SupportsSlotPeek,
-    SupportsTimeSync, _CAL_STRUCT, await_cam_run, cam_run_state_name,
-    rotation_code, rotation_name, validate_can_bitrate, validate_can_term,
+    SupportsTimeSync, rotation_code, rotation_name, validate_can_bitrate, validate_can_term,
     validate_commission, validate_sample_fifo_depth,)
 from nxs.firmware import (
     DFU_REBOOT_TIMEOUT_S, FirmwareTooOld, MIN_FIRMWARE, MIN_FIRMWARE_ASSET,
@@ -38,13 +36,13 @@ from nxs.firmware import (
 from nxs.time_sync import (
     DRIVER_UP_POLL_S, DRIVER_UP_TIMEOUT_S, PUSH_ECHO_POLL_S,
     PUSH_ECHO_TIMEOUT_S, PUSH_INTERVAL_S, SYNC_LOST_PUSHES,
-    TimeSyncEstimator, await_driver_up, estimate_and_push,)
+    TimeSyncEstimator, await_driver_up,
+    estimate_and_push,)
 
 #: The names `nxs.client` has always answered to, wherever they now live.
 __all__ = [
     "ACTIVE_SLOT", "ADDR_UNSET", "CALIB_ERR_REASON", "CAL_READ_ATTEMPTS",
-    "CAL_REFRESH_S", "CAL_VECTORS", "CAM_ABORT_ERR_REASON",
-    "CAM_RUN_ERR_REASON", "CAM_RUN_TERMINAL", "CAM_VERDICT_REASON",
+    "CAL_REFRESH_S", "CAL_VECTORS", "CAM_VERDICT_REASON",
     "CAN_BITRATE_PROFILES", "CAN_TERM_OFF", "CAN_TERM_ON", "CAN_TERM_UNSET",
     "COMMISSION_ERR_REASON", "COMMISSION_TOPICS", "CalibrationRecord",
     "CamRunState", "DFU_ERASE_TIMEOUT_S", "DFU_ERR_REASON",
@@ -63,9 +61,8 @@ __all__ = [
     "SupportsEgressDecimation", "SupportsFaultCounters", "SupportsIdentify",
     "SupportsRecovery", "SupportsSampleFifo", "SupportsSlotPeek",
     "SupportsTimeSync", "TimeSyncEstimator", "XFER_ERR_REASON",
-    "_CAL_STRUCT", "active_driver_tag", "await_cam_run",
-    "await_driver_unloaded", "await_driver_up", "await_reachable",
-    "cam_run_state_name", "contract_mismatch", "err_reason",
+    "active_driver_tag", "await_driver_unloaded", "await_driver_up", "await_reachable",
+    "contract_mismatch", "err_reason",
     "estimate_and_push", "exc_detail", "firmware_too_old",
     "import_failure_detail", "op_error_name", "parse_fw_identity",
     "peek_slot", "push_and_verify", "read_firmware_version", "read_identity",
@@ -246,7 +243,6 @@ class Sample:
 
 
 
-assert _CAL_STRUCT.size == CalConstants.RECORD_SIZE
 
 
 

@@ -18,7 +18,7 @@ import yaml
 
 from nxs.client import (ERRNO_EBADF, ERRNO_ENOTSUP, DeviceRefused, SupportsCameraRun,
                         SupportsSlotPeek)
-from nxs.personality.records import ParamMap, RunParam
+from nxs.personality.records import ParamMap
 
 from .contracts import ContractError
 
@@ -66,8 +66,7 @@ class UnitPersonality:
 
 def cache_path(topology: Topology, link: LinkSpec) -> Path:
     """`<state_dir>/unit-descriptors/<port>-<link>.yaml`."""
-    directory = port_state.state_dir() / CACHE_DIR
-    directory.mkdir(parents=True, exist_ok=True)
+    directory = port_state.ensure_dir(port_state.state_dir() / CACHE_DIR)
     return directory / f"{port_state.port_name(topology)}-{link.name}.yaml"
 
 
@@ -100,7 +99,6 @@ def cache_descriptor(topology: Topology, link: LinkSpec, descriptor: Descriptor,
             "modes": {str(k): int(v) for k, v in params.modes.items()},
             "trigger_index": params.trigger_index,
             "triggers": {str(k): int(v) for k, v in params.triggers.items()},
-            "run_params": {str(k): dataclasses.asdict(v) for k, v in params.run_params.items()},
         },
         "descriptor": doc,
     }
@@ -159,9 +157,7 @@ def cached_params(topology: Topology, link: LinkSpec) -> Optional[ParamMap]:
     return ParamMap(mode_index=p.get("mode_index"),
                     modes={str(k): int(v) for k, v in (p.get("modes") or {}).items()},
                     trigger_index=p.get("trigger_index"),
-                    triggers={str(k): int(v) for k, v in (p.get("triggers") or {}).items()},
-                    run_params={str(k): RunParam(**v)
-                                for k, v in (p.get("run_params") or {}).items()})
+                    triggers={str(k): int(v) for k, v in (p.get("triggers") or {}).items()})
 
 
 def forget(topology: Topology, link: LinkSpec) -> None:
@@ -171,17 +167,14 @@ def forget(topology: Topology, link: LinkSpec) -> None:
 
 
 def slot_kind(client, slot: int) -> Optional[str]:
-    """`'click'`, `'cam'`, or None for an empty slot, from the peek view;
-    None too on a transport without one."""
+    """`'click'`, `'cam'`, or None for an empty slot, from the slot's store
+    entry; None too on a transport that reads none."""
     if not isinstance(client, SupportsSlotPeek):
         return None
     info = client.read_slot_info(slot)
     if info is None:
         return None
     kind = getattr(info, "kind", None)
-    if isinstance(kind, int):
-        from nxs.image import IMAGE_KIND_NAMES
-        kind = IMAGE_KIND_NAMES.get(kind)
     return str(kind) if kind else None
 
 
@@ -210,8 +203,8 @@ def read_unit_personality(client, known_crc: Optional[int] = None
                           ) -> Optional[UnitPersonality]:
     """The cam personality in the unit's store, read over an open
     client: the first camera slot whose descriptor trailer carries an
-    IDENTITY record (click personality and empty slots are refused by the unit and
-    skipped). With `known_crc`, a trailer of that CRC-32 is not decoded and
+    IDENTITY record (the directory names click personality and empty slots,
+    which are skipped). With `known_crc`, a trailer of that CRC-32 is not decoded and
     the returned personality carries no descriptor: the caller's cache is
     current. None when the unit holds no cam personality or the
     transport cannot read trailers; UnreadableSlot when a slot's trailer
@@ -231,7 +224,7 @@ def read_unit_personality(client, known_crc: Optional[int] = None
                 raise
             stale = stale or StaleSlot(slot, STALE_PEEKS[exc.code], str(exc))
             continue
-        if kind == "click":
+        if kind != "cam":
             continue
         try:
             data = client.read_personality_info(slot)
@@ -307,24 +300,61 @@ def refresh_from_unit(topology: Topology, link: LinkSpec, opener=None
     return found
 
 
-def last_run_text(state: int) -> str:
-    """`last run <STATE>` for a camera run state the unit reports, and
-    `never run` before its first run (IDLE)."""
-    from nxs.client import CamRunState, cam_run_state_name
+#: The `CURRENT_MODE` a door reports before a run set a mode.
+NO_MODE = 0xFF
 
-    if state == CamRunState.IDLE:
-        return "never run"
-    return f"last run {cam_run_state_name(state)}"
+
+def door_state(client) -> Tuple[int, int, int]:
+    """The unit door's `STATE`, `ERROR` and `CURRENT_MODE` as its header
+    serves them: BUSY while a commit runs, READY after one the unit applied
+    or before any, FAULT with the errno of one it refused or that failed
+    (Interface Description §6.4); `NO_MODE` before a run set a mode."""
+    with client.door(client.address) as door:
+        head = door.header()
+    return int(head["state"]), int(head["error"]), int(head["current_mode"])
+
+
+def door_text(state: int, error: int, mode: int = NO_MODE) -> str:
+    """The door's state in its own words: `door READY, mode 1`, `door READY,
+    no mode` before a run set one, `door BUSY`, and `door FAULT, ERROR 19:
+    <reason>` with the errno the door holds and the reason the host reads
+    it as."""
+    from nxs._libnxs_map import MapState
+    from nxs.device_errors import COMMIT_ERR_REASON, err_reason
+
+    name = MapState._NAMES.get(int(state), str(int(state)))
+    if int(state) == MapState.FAULT:
+        return f"door {name}, ERROR {int(error)}: {err_reason(int(error), COMMIT_ERR_REASON)}"
+    if int(state) == MapState.BUSY:
+        return f"door {name}"
+    return f"door {name}, " + ("no mode" if int(mode) == NO_MODE else f"mode {int(mode)}")
+
+
+def camera_values(client) -> Tuple[Dict[str, int], Dict[str, str]]:
+    """The camera personality's rows in effect at the client's unit door, by
+    name, and their units: the rows of the owner of the mode row."""
+    from nxs._libnxs_map import ParamId
+
+    with client.door(client.address) as door:
+        rows = door.rows()
+        owners = door.owners()
+        mode = next((i for i, row in enumerate(rows) if row.id == ParamId.MODE), None)
+        if mode is None:
+            return {}, {}
+        cells = door.cells(rows)
+    mine = [i for i in range(len(rows)) if owners[i] == owners[mode]]
+    return ({rows[i].name: int(cells[i]["live"]) for i in mine},
+            {rows[i].name: rows[i].unit for i in mine if rows[i].unit})
 
 
 def unit_status(topology: Topology, link: LinkSpec, opener=None
                 ) -> Optional[Dict[str, Any]]:
-    """What the link's unit holds and last ran: the cam personality's
-    name, slot, sensor and mode values, the run state, and the values the
-    run recorded by parameter name; `summary` is the one line `status`
-    prints. None when the link carries no unit or it holds no camera
-    personality."""
-    from nxs.client import cam_run_state_name
+    """What the link's unit holds and what its unit door says: the cam
+    personality's name, slot, sensor and mode values, the door's state and
+    errno, and the rows' values in effect by name; `summary` is the one line
+    `status` prints. None when the link carries no unit or it holds no
+    camera personality."""
+    from nxs._libnxs_map import MapState
 
     found = refresh_from_unit(topology, link, opener)
     if found is None:
@@ -334,23 +364,42 @@ def unit_status(topology: Topology, link: LinkSpec, opener=None
     units: Dict[str, str] = {}
     try:
         with port_state.BusLock():
-            state, error = client.read_cam_state()
-            if found.params.run_params:
-                by_index = {p.index: name for name, p in found.params.run_params.items()}
-                units = {name: p.unit for name, p in found.params.run_params.items()}
-                raw = client.cam_read_params(found.slot, sorted(by_index))
-                values = {by_index[i]: int(v) for i, v in raw.items()}
+            state, error, mode = door_state(client)
+            if mode != NO_MODE:
+                values, units = camera_values(client)
     finally:
         close = getattr(client, "close", None)
         if close is not None:
             close()
-    run = {"state": cam_run_state_name(state), "error": int(error), "values": values}
-    parts = [f"{found.summary()}, slot {found.slot}, {last_run_text(state)}"]
-    parts.extend(f"{name} {value}" + (f" {units[name]}" if units.get(name) else "")
-                 for name, value in values.items())
+    run = {"state": MapState._NAMES.get(state, str(state)), "error": int(error),
+           "values": values}
+    parts = [f"{found.summary()}, slot {found.slot}, {door_text(state, error, mode)}"]
+    parts.extend(_shown(found.compatible, values, units))
     return {"name": found.name, "slot": int(found.slot), "compatible": found.compatible,
             "modes": {str(k): int(v) for k, v in found.modes.items()},
             "run": run, "summary": ", ".join(parts)}
+
+
+def _shown(compatible: str, values: Dict[str, int], units: Dict[str, str]) -> List[str]:
+    """Each row in effect as the camera's description shows it, `fps 30`,
+    `gain 10.6 dB`; a row the description does not carry keeps the door's
+    number and unit."""
+    from nxs import description
+
+    try:
+        rows = {row.name: row for row in description.of_type(compatible).rows}
+    except Exception:        # noqa: BLE001 (a type this host does not resolve shows the door's numbers)
+        rows = {}
+    out = []
+    for name, value in values.items():
+        row = rows.get(name)
+        if row is None:
+            out.append(f"{name} {value}" + (f" {units[name]}" if units.get(name) else ""))
+            continue
+        unit = description.unit_of(row)
+        out.append(f"{name} {description.display(row, value)}" + (f" {unit}" if unit else ""))
+
+    return out
 
 
 def unit_personality(topology: Topology, link: LinkSpec, opener=None

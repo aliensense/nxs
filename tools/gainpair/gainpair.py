@@ -2,15 +2,13 @@
 # Copyright (c) 2026 Aliensense.
 # SPDX-License-Identifier: Apache-2.0
 
-"""gainpair: a synced pair's two analog gain registers, sampled once a frame.
+"""gainpair: a synced pair's two gains, sampled once a frame.
 
 A bench tool beside `nxs`, not one of its verbs. Once a frame period at the
 port's rate it takes the bus lock every tool run shares in one attempt, reads
-the leading head's gain register and the following head's at their host
-addresses, and prints a line whenever either changes. A frame another run
-holds the bus in is skipped. A leader value other than the last one taken is
-read again and taken only when both reads agree, as nxsd's follower takes it:
-the leader's driver writes the bytes under its own hold.
+the leading head's gain and the following head's from their capture nodes'
+gain control, as each head's kernel driver holds it, and prints a line
+whenever either changes. A frame another run holds the bus in is skipped.
 
 A sample is in step when the following head holds the leading head's gain, or
 the gain the leading head held at the sample before: the follower copies the
@@ -22,25 +20,25 @@ samples out of step, with the longest out-of-step stretch (from its first
 sample to the first in-step one, or to the run's end) and the widest gap
 among them in dB.
 
-The heads, the register and its dB step are the ones nxsd's follower copies,
-the hub's `build_follow` for the port: the port record's leader and follower,
-else the port's first two camera links (a pair `camera.gain_db` locks).
-`--leader`, `--follower` and `--reg` replace the addresses and the register.
-The bus is the libnxs handle (ADR 0003).
+The heads and the gain's dB step are the ones nxsd's follower copies, the
+hub's `build_follow` for the port: the port record's leader and follower,
+else the port's first two camera links (a pair a declared gain locks).
+`--leader` and `--follower` replace the capture node addresses. The nodes
+are the host's V4L2 subdevices (`nxs.cam.follow.HeadControls`).
 """
 
 from __future__ import annotations
 
 import argparse
 import dataclasses
-import errno
 import math
 import sys
 import time
 from typing import Callable, List, Optional, Tuple
 
-from nxs import _libnxs
+from nxs.cam import port_state
 from nxs.cam.contracts import FollowPlan
+from nxs.cam.follow import HeadControls
 
 #: The rate a port runs at when its record names none.
 DEFAULT_FPS = 30.0
@@ -48,7 +46,7 @@ DEFAULT_FPS = 30.0
 
 @dataclasses.dataclass(frozen=True)
 class Sample:
-    """Both heads' raw gain register values, `t` seconds into the run."""
+    """Both heads' gain control values, `t` seconds into the run."""
 
     t: float
     slot: int
@@ -123,28 +121,15 @@ def _declared(name: str):
     return port
 
 
-def _gain(bus, plan: FollowPlan, addr: int) -> int:
-    reg, width, order = plan.register
-    raw = bus.read(addr, reg.to_bytes(2, "big"), width)
-    return int.from_bytes(raw, "little" if order == "le" else "big")
-
-
-def _read_pair(bus, plan: FollowPlan, taken: Optional[int]) -> Optional[Tuple[int, int]]:
+def _read_pair(controls, plan: FollowPlan, lock) -> Optional[Tuple[int, int]]:
     """Both heads' gain in one hold of the bus lock; None for a frame another
-    run holds the bus in, or a changed leader value two reads disagree on."""
-    try:
-        bus.lock(0)
-    except OSError as exc:
-        if exc.errno != errno.EBUSY:
-            raise
+    run holds the bus in."""
+    if not lock.acquire_now():
         return None
     try:
-        leader = _gain(bus, plan, plan.leader_addr)
-        if leader != taken and _gain(bus, plan, plan.leader_addr) != leader:
-            return None
-        return leader, _gain(bus, plan, plan.follower_addr)
+        return controls.get(plan.leader_addr), controls.get(plan.follower_addr)
     finally:
-        bus.unlock()
+        lock.release()
 
 
 def change_line(taken: Sample, plan: FollowPlan) -> str:
@@ -153,21 +138,22 @@ def change_line(taken: Sample, plan: FollowPlan) -> str:
             f"{plan.follower}={taken.follower * plan.db_per_step:.1f}dB")
 
 
-def sample(bus, plan: FollowPlan, period_s: float, seconds: float,
+def sample(controls, plan: FollowPlan, period_s: float, seconds: float,
            clock: Callable[[], float] = time.monotonic,
            sleep: Callable[[float], None] = time.sleep,
            out: Callable[[str], None] = print) -> Run:
     """Sample both heads once a `period_s` on the monotonic `clock` for
     `seconds` (a slot a read overran is skipped, never made up), printing a
     `change_line` to `out` whenever either head's gain changes. Ctrl+C ends
-    the run early. OSError: the bus's."""
+    the run early. OSError: a capture node's."""
     start = due = clock()
     samples: List[Sample] = []
     skipped = slot = 0
     shown: Optional[Tuple[int, int]] = None
+    lock = port_state.BusLock()
     try:
         while (now := clock()) - start < seconds:
-            got = _read_pair(bus, plan, samples[-1].leader if samples else None)
+            got = _read_pair(controls, plan, lock)
             if got is None:
                 skipped += 1
             else:
@@ -243,33 +229,32 @@ def summary_line(summary: Summary, plan: FollowPlan) -> str:
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="gainpair", description="Sample a synced pair's two gain registers once a frame.")
+        prog="gainpair", description="Sample a synced pair's two gains once a frame.")
     parser.add_argument("port", help="the camera port, as the manifest names it (cam0)")
     parser.add_argument("--seconds", type=float, default=60.0, help="how long to sample (60)")
     parser.add_argument("--bus", help="the port's I2C bus (the port's own)")
     parser.add_argument("--leader", type=lambda s: int(s, 0),
-                        help="the leading head's host address (0x1e)")
+                        help="the leading head's capture node address (0x33)")
     parser.add_argument("--follower", type=lambda s: int(s, 0),
-                        help="the following head's host address (0x1b)")
-    parser.add_argument("--reg", type=lambda s: int(s, 0), help="the gain register (0x3514)")
+                        help="the following head's capture node address (0x35)")
     args = parser.parse_args(argv)
 
     plan, bus_path, fps = plan_for(_declared(args.port))
     plan = dataclasses.replace(
         plan,
         leader_addr=plan.leader_addr if args.leader is None else args.leader,
-        follower_addr=plan.follower_addr if args.follower is None else args.follower,
-        register=(plan.register[0] if args.reg is None else args.reg, *plan.register[1:]))
+        follower_addr=plan.follower_addr if args.follower is None else args.follower)
     print(f"sampling {args.port}: {plan.leader} at {plan.leader_addr:#04x}, "
-          f"{plan.follower} at {plan.follower_addr:#04x}, gain register {plan.register[0]:#06x}, "
+          f"{plan.follower} at {plan.follower_addr:#04x}, "
           f"{fps:g} fps for {args.seconds:g} s")
-    bus = _libnxs.Bus.open(args.bus or bus_path)
+    controls = HeadControls(args.bus or bus_path, mapped=plan.mapped)
     try:
-        run = sample(bus, plan, 1.0 / fps, args.seconds)
-    except OSError as exc:
-        raise SystemExit(f"gainpair: {exc.filename}: {exc.strerror}") from exc
+        run = sample(controls, plan, 1.0 / fps, args.seconds)
+    except (LookupError, OSError) as exc:
+        raise SystemExit(f"gainpair: {exc.filename}: {exc.strerror}" if isinstance(exc, OSError)
+                         and exc.filename else f"gainpair: {exc}") from exc
     finally:
-        bus.close()
+        controls.close()
     print(summary_line(summarize(run, plan), plan))
     return 0
 

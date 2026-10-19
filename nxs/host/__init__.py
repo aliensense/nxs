@@ -9,6 +9,7 @@ hub and the sensor plugins never name a host."""
 
 from __future__ import annotations
 
+import functools
 import glob
 import hashlib
 import os
@@ -17,9 +18,14 @@ import subprocess
 from pathlib import Path
 from typing import Any, Callable, Collection, Dict, List, Optional
 
+from . import v4l2
+
 
 #: The camera port aliases the bus rules create, one per connector.
 CAMERA_BUS_GLOB = "/dev/i2c-cam*"
+#: Who drives the hub behind a connector, by the `<connector>_driver` row's
+#: value: nxs, or a kernel driver that owns the SerDes while nxs writes nothing.
+DRIVERS = ("nxs", "kernel")
 #: Where a host's camera bus rules install.
 BUS_RULES_TARGET = "/etc/udev/rules.d/99-aliensense-i2c.rules"
 
@@ -89,6 +95,20 @@ class Host:
         channel's node behind a hub ({} when the host generates none)."""
         del port
         return {}
+
+    # --- the capture nodes' controls -------------------------------------
+    #: Where the kernel lists its V4L2 devices; a test points it elsewhere.
+    video4linux = v4l2.VIDEO4LINUX
+
+    def controls(self, bus: str, addr: int) -> v4l2.Subdev:
+        """The V4L2 controls of the capture node at `addr` on a port's bus,
+        the subdevice its kernel driver registered there, open until
+        `close()`. LookupError when no driver is bound at that address."""
+        path = v4l2.find_subdev(bus, int(addr), self.video4linux)
+        if path is None:
+            raise LookupError(f"no capture node is bound at {int(addr):#04x} on {bus}: the "
+                              f"booted overlay names none there, or its driver did not probe")
+        return v4l2.Subdev(path)
 
     def booted_modes(self, bus: str) -> List[Dict[str, Any]]:
         """The capture modes the booted contract offers on a port's bus:
@@ -162,13 +182,18 @@ class Host:
     def overlay(self, hub, port: str, lanes: int,
                 sensors: Optional[List[str]] = None, direct: bool = False,
                 node_addr: Optional[int] = None, fps: Optional[float] = None,
-                bit_depth: Optional[int] = None) -> str:
+                bit_depth: Optional[int] = None,
+                camera_maps: Optional[Dict[int, int]] = None,
+                passive: Optional[Dict[int, bytes]] = None) -> str:
         """The contract source for a port; ``direct`` for a port whose
         sensor is wired straight to the host, ``node_addr`` the address
         that sensor answers at when it is not the descriptor's own, ``fps``
         the rate the port runs at (the rows' default rate), ``bit_depth``
         the bit depth its declaration runs (None: the depth of the row
-        with the longest exposure)."""
+        with the longest exposure). ``camera_maps`` names the channels whose
+        node is a camera door's, {vc: its address}, and ``passive`` the
+        channels of a host another node owns the hub's bus for, {vc: the
+        compiled mode table}."""
         raise NotImplementedError(f"{self.name}: no capture contract generator")
 
     def compile(self, dts: str, out: Path) -> Path:
@@ -200,9 +225,11 @@ class Host:
         writes names; [] when the host installs none."""
         return []
 
-    def kernel_package_missing(self) -> Optional[str]:
+    def kernel_package_missing(self, camera_maps: bool = False) -> Optional[str]:
         """The fact line when this host's camera kernel package is absent for
-        the booted kernel; None on a host that needs none."""
+        the booted kernel, or lacks the camera map's driver where an
+        overlay carries a pod's camera map node (`camera_maps`); None on a host that
+        needs none."""
         return None
 
     def kernel_package_next(self) -> str:
@@ -365,6 +392,12 @@ class Host:
         return []
 
     # --- identity ---------------------------------------------------------
+    def description(self):
+        """This host as a block (a `nxs.description.Description`): its
+        plugin's HOST image read back. A host without a plugin is the
+        generic host, its camera connectors the ones its bus rules name."""
+        return generic_description(tuple(sorted(self.camera_buses())))
+
     def keeps_system_declaration(self) -> bool:
         """Whether the host's one declaration is the system file nxsd reads,
         whoever runs the verb (a camera host); False here, where a user
@@ -403,6 +436,73 @@ def detect() -> Host:
     return Host()
 
 
+def plugin_description(name: str):
+    """The description of the host plugin `name`: the running host's when
+    the name is its own, the Jetson plugin's by its name, the generic
+    host's for `generic`; None for a plugin this tool does not know. A
+    host's connector rows narrow through the options hook
+    (`connector_options`)."""
+    from nxs.suite import options
+
+    options.register("host", connector_options)
+    host = current()
+    if name == host.name:
+        return host.description()
+    from . import jetson
+    if name == jetson.JetsonHost.name:
+        return jetson.description()
+    if name == Host.name:
+        return generic_description()
+    return None
+
+
+def connector_options(view) -> dict:
+    """The host's rows a declaration sets at this point of the graph: a
+    connector's `<connector>_driver` names who drives the hub behind it, so
+    a connector no hub feeds takes none."""
+    from nxs.suite.options import Option
+
+    out = {}
+    for row in view.description.rows:
+        connector = row.name[:-len("_driver")] if row.name.endswith("_driver") else None
+        if connector is None or view.description.port(connector) is None:
+            continue
+        if not any(peer.description.kind == "hub" for peer in view.peers.get(connector) or ()):
+            out[row.name] = Option(applicable=False,
+                                   finding=f"no hub feeds {connector}, so nothing there is driven")
+    return out
+
+
+@functools.lru_cache(maxsize=8)
+def generic_description(connectors: tuple = ()):
+    """A host without a plugin as a block, compiled to its HOST image: a CSI
+    input per camera connector of `connectors` with its I²C output beside
+    it, the connector's `<connector>_lanes` row (2 or 4, its wiring
+    unknown) and `<connector>_driver` row, and the buses it offers by their
+    device's name (`nxs.host.buses`)."""
+    import dataclasses
+
+    from nxs.compiler import HostDevice, Port, PortDirection, PortType
+    from nxs.description import from_compiled
+
+    from . import buses
+
+    class GenericDevice(HostDevice):
+        COMPATIBLE = Host.name
+        PRODUCT = "host"
+        PORTS = tuple(port for name in connectors
+                      for port in (Port(name, PortType.CSI, PortDirection.INPUT),
+                                   Port(f"bus_{name}", PortType.I2C, PortDirection.OUTPUT)))
+
+        def declare_rows(self) -> None:
+            for name in connectors:
+                self.declare_row(f"{name}_lanes", values=[2, 4], default=4)
+                self.declare_row(f"{name}_driver", values=list(range(len(DRIVERS))), default=0,
+                                 labels=DRIVERS)
+
+    return dataclasses.replace(from_compiled(GenericDevice().compile({})), buses=buses.bus_port)
+
+
 _current: Optional[Host] = None
 
 
@@ -431,7 +531,7 @@ OVERLAY_RECORDS = "booted-overlays.yaml"
 
 def _boot_id() -> str:
     from nxs.cam import port_state
-    return port_state._boot_id() or ""
+    return port_state.boot_id() or ""
 
 
 def _overlay_records() -> Dict[str, Dict[str, Any]]:
@@ -451,7 +551,6 @@ def _write_overlay_records(records: Dict[str, Dict[str, Any]]) -> None:
     from nxs.cam import port_state
     path = port_state.state_dir() / OVERLAY_RECORDS
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(yaml.safe_dump(records, sort_keys=True))
+        port_state.write_store_file(path, yaml.safe_dump(records, sort_keys=True))
     except OSError:
         pass

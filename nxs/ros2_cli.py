@@ -10,6 +10,11 @@ from nxs.stamp_modes import STAMP_ITOW, STAMP_MODES, STAMP_SYNCED
 from nxs.stream_cli import _configure_stream
 from nxs import transports
 
+#: How long the plan waits for a unit's output descriptors: a unit restarting
+#: its personality after a camera run serves them within seconds.
+DESCRIPTOR_ATTEMPTS = 12
+DESCRIPTOR_RETRY_S = 0.5
+
 
 _DEVICE_FLAGS = {'-t', '--transport', '-b', '--bus', '-p', '--port',
                  '-a', '--addr', '--baud', '--remote-node-id'}
@@ -69,12 +74,15 @@ def _ros2_targets(args, argv=None, cfg=None):
 
 def _ros2_lock_tokens(args, targets):
     """One run-lock token per bridged target, keyed on the resolved link kwargs
-    (suite and --unit) or the global device flags (ad-hoc)."""
+    (suite and --unit) or the global device flags (ad-hoc). The host node-ID
+    a shared CAN iface allots is the run's, not the link's, so a suite run
+    and a --unit run of one unit share a token."""
     adhoc = [(f, getattr(args, f, None))
              for f in ('transport', 'port', 'bus', 'addr',
                        'remote_node_id')]
-    return [f"{tr or 'flags'}:{sorted(kw.items()) if kw else adhoc}"
+    return [f"{tr or 'flags'}:{sorted(k for k in kw.items() if k[0] != 'local_node_id') if kw else adhoc}"
             for _, tr, kw in targets]
+
 
 def cmd_ros2(args, opener=None, argv=None, cfg=None):
     """Bridge decoded samples onto ROS 2 topics: the whole suite by
@@ -96,7 +104,7 @@ def cmd_ros2(args, opener=None, argv=None, cfg=None):
     suite_mode, targets = _ros2_targets(args, argv, cfg=cfg)
     if not getattr(args, 'plan', False):
         run_lock = acquire_run_lock(  # noqa: F841 (held for process lifetime)
-            _ros2_lock_tokens(args, targets))
+            _ros2_lock_tokens(args, targets), [name for name, _, _ in targets])
     if args.map and suite_mode:
         raise SystemExit("nxs ros2: --map applies to a single device — "
                          "use --unit or the transport flags")
@@ -134,7 +142,18 @@ def cmd_ros2(args, opener=None, argv=None, cfg=None):
             if personality:
                 break
             time.sleep(0.2)
-        fields = client.read_outputs()
+        # A unit restarting its personality after a camera run serves its
+        # descriptors seconds later: the read waits for them.
+        fields = None
+        for attempt in range(DESCRIPTOR_ATTEMPTS):
+            fields = client.read_outputs()
+            if fields or attempt + 1 == DESCRIPTOR_ATTEMPTS:
+                break
+            time.sleep(DESCRIPTOR_RETRY_S)
+        if fields is None:
+            refuse(label, f"its output descriptors changed during each of {DESCRIPTOR_ATTEMPTS} "
+                          f"reads — retry once its personality settles", client)
+            continue
         if not fields:
             refuse(label, "serves no output descriptors — upload and run "
                           "a personality first", client)

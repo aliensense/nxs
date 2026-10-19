@@ -183,7 +183,7 @@ def fetch_override(url: str, sha256: str, log=print) -> Path:
     target = override_store_path(sha256)
     if target.is_file() and hashlib.sha256(target.read_bytes()).hexdigest() == sha256:
         return target
-    target.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_dir(target.parent)
     partial = target.with_suffix(".tmp")
     log(f"tuning: fetching the vendor override {url}")
     try:
@@ -234,12 +234,12 @@ def _record_tuning(port: str, host, rows: List[Dict[str, Any]], digest: str,
     import yaml
 
     record = tuning_record_path(port)
-    record.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_dir(record.parent)
     made: Dict[str, Any] = {"port": port, "badge": host.tuning_badge(port), "stack": host.stack(),
                             "hash": digest, "file": str(installed), "rows": rows}
     if overrides:
         made["overrides"] = {c: o["sha256"] for c, o in sorted(overrides.items())}
-    record.write_text(yaml.safe_dump(made, sort_keys=False))
+    _write_store(record, yaml.safe_dump(made, sort_keys=False))
     return record
 
 
@@ -264,8 +264,7 @@ def build_tuning(host, topology, sensor_id: Optional[int] = None,
         f"about {TUNING_BUILD_MINUTES} minutes, the capture daemon restarts")
     installed = host.tuning_make(port, topology.i2c_bus, int(sensor_id), overrides=files)
     stored = tuning_store_path(host.tuning_badge(port), digest)
-    stored.parent.mkdir(parents=True, exist_ok=True)
-    stored.write_bytes(installed.read_bytes())
+    _write_store(stored, installed.read_bytes())
     return installed, _record_tuning(port, host, rows, digest, installed, overrides)
 
 
@@ -341,7 +340,7 @@ def preparing_marker(port: str) -> Path:
     from nxs.cam import port_state
 
     path = port_state.state_dir() / "tuning" / f"{port}.preparing"
-    path.parent.mkdir(parents=True, exist_ok=True)
+    port_state.ensure_dir(path.parent)
     return path
 
 
@@ -387,6 +386,25 @@ def _cmd_modes(args) -> int:
     return 0
 
 
+def _ensure_dir(path: Path) -> Path:
+    from nxs.cam.port_state import ensure_dir
+    return ensure_dir(path)
+
+
+def _write_store(path: Path, data) -> None:
+    from nxs.cam.port_state import write_store_file
+    write_store_file(path, data)
+
+
+def unwritable_store(exc: OSError) -> str:
+    """A store path this run cannot write: the fact, then the chmod that
+    opens the store to its group, which nxsd writes as root."""
+    from nxs.cam.port_state import SYSTEM_STATE_DIR
+    where = exc.filename or "the state store"
+    return (f"nxs host: cannot write {where}: {(exc.strerror or 'permission denied').lower()}\n"
+            f"  - sudo chmod -R g+w {SYSTEM_STATE_DIR}/cam (the store is shared through the i2c group)")
+
+
 def generate(hub, topology, port_name: str, lanes: int,
              sensors: Optional[List[str]], out_dir: Path) -> List[Dict[str, Any]]:
     """Generate (and compile when dtc is present) the port's overlay into
@@ -421,18 +439,56 @@ def generate(hub, topology, port_name: str, lanes: int,
             f"{PERSONALITY_DIR}, and no unit of the port has served one — "
             f"install the assets (nxs-assets-<version>.tar.gz, nxs assets install) "
             f"or upload a personality to the link's unit")
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # A channel whose link carries a pod or a smart camera gets the camera-map node.
+    from nxs.cam.hubs import map_address
+
+    camera_maps = ({int(link.csi_vc): addr for link in topology.links
+                    if (addr := map_address(hub, link)) is not None} if topology is not None else {})
+    passive = passive_tables(hub, topology, host) if topology is not None else {}
+    camera_maps.update({vc: addr for vc, (addr, _rows) in passive.items()})
     dts = host.overlay(hub, port_name, lanes, sensors, direct=direct, node_addr=node_addr,
-                       fps=layout["default_fps"], bit_depth=layout["bit_depth"])
+                       fps=layout["default_fps"], bit_depth=layout["bit_depth"], camera_maps=camera_maps,
+                       passive={vc: rows for vc, (_addr, rows) in passive.items()})
     name = gen.dtbo_basename(port_name, lanes, direct)
     dts_path = out_dir / name.replace(".dtbo", ".dts")
-    dts_path.write_text(dts)
+    try:
+        _write_store(dts_path, dts)
+    except PermissionError as exc:
+        raise SystemExit(unwritable_store(exc))
     record: Dict[str, Any] = {"port": port_name, "lanes": lanes,
                               "dts": str(dts_path), "dtbo": None,
                               "modes": len(table), "direct": direct}
     if shutil.which("dtc"):
         record["dtbo"] = str(host.compile(dts, out_dir / name))
     return [record]
+
+
+def passive_tables(hub, topology, host) -> Dict[int, tuple]:
+    """The passive nodes of a port this host takes the stream of while a
+    module masters the hub's bus: {vc: (the node's address, the mode table
+    its camera door would serve)}, a channel per camera link; {} on a port
+    this host owns. The table is the CAMERA_MAP record's mode rows of the
+    link's personality, as the host holds or compiles it."""
+    from nxs.cam import port_state
+    from nxs.cam.compose_heads import personality
+    from nxs.cam.contracts import InfeasibleConfig
+    from nxs.cam.hubs import map_address
+    from nxs.personality import records
+
+    if getattr(topology, "hub_driver", "nxs") != "module":
+        return {}
+    aliases = host.node_aliases(port_state.port_name(topology)) or {}
+    out: Dict[int, tuple] = {}
+    for link in topology.camera_links:
+        try:
+            _name, _image, compiled, _params = personality(
+                hub, link, hub.descriptor(link.sensor_compatible))
+        except InfeasibleConfig as exc:
+            raise SystemExit(f"nxs host: {port_state.port_name(topology)}: the passive node of "
+                             f"link {link.name} takes its personality's mode table: {exc.reason}")
+        addr = map_address(hub, link) or aliases.get(int(link.csi_vc))
+        out[int(link.csi_vc)] = (int(addr), records.camera_map_mode_rows(compiled.trailer))
+    return out
 
 
 def boot_write_refusal(exc: PermissionError) -> str:
@@ -486,7 +542,7 @@ def reboot_rule(host, hub, topology, links, modes: Dict[str, str],
     wrote, which entries it dropped) go to ``report`` when given, else into
     the sentence; an overlay that is not generated or not installed raises
     BootTableRefused."""
-    from nxs.cam import port_state
+    from nxs.cam import hubs, port_state
     from nxs.cam.hubs import native_sensor_address
     from nxs.host import capture_table as tables
 
@@ -515,6 +571,14 @@ def reboot_rule(host, hub, topology, links, modes: Dict[str, str],
                 wanted = host.node_aliases(port_state.port_name(topology)) or {}
         except Exception:
             wanted = {}
+    # A pod's or a smart camera's channel carries a camera map: its node
+    # sits at the map's address, wherever the sensor straps.
+    mapped = {}
+    for link in links:
+        vc = (vcs or {}).get(link.name)
+        addr = hubs.map_address(hub, link)
+        if vc is not None and addr is not None:
+            wanted[int(vc)] = mapped[link.name] = int(addr)
     for link in links:
         vc = (vcs or {}).get(link.name)
         if ids and vc is not None and int(vc) not in ids:
@@ -522,7 +586,9 @@ def reboot_rule(host, hub, topology, links, modes: Dict[str, str],
         elif vc is not None and int(vc) in wanted:
             booted_addr = topology.node_addr(int(vc))
             if booted_addr is not None and booted_addr != int(wanted[int(vc)]):
-                place = "the sensor's address" if topology.is_direct else "its alias"
+                place = ("the unit's camera map" if link.nxs_units
+                         else "the camera map" if link.name in mapped
+                         else "the sensor's address" if topology.is_direct else "its alias")
                 missing.append(f"virtual channel {int(vc)}'s node at {place} "
                                f"{int(wanted[int(vc)]):#04x} (booted {booted_addr:#04x}, "
                                f"link {link.name})")
@@ -569,7 +635,7 @@ def reboot_rule(host, hub, topology, links, modes: Dict[str, str],
     lanes = int(topology.csi_lanes)
     booted_lanes = host.booted_lanes(topology.i2c_bus)
     if booted_lanes is not None and int(booted_lanes) != lanes:
-        missing.append(f"csi_lanes: {lanes} (booted {int(booted_lanes)})")
+        missing.append(f"{lanes} lanes (booted {int(booted_lanes)})")
     records: List[Dict[str, Any]] = []
     stale = False
     from nxs import experimental

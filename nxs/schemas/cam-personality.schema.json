@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://aliensense.github.io/nxs-docs/schemas/cam-personality.schema.json",
   "title": "NXS chip facts (<chip>.yaml)",
-  "description": "One chip's facts, a cam personality's head or a hub's deserializer or serializer: identity, registers, modes (sensors), windows and pipes (deserializers), limits, and the declarative status probes. The laws and knobs come from the law family meta.chip names, or from a paired physics module; this schema pins the shape the loader reads.",
+  "description": "One chip's facts, a cam personality's head or a hub's deserializer or serializer: identity, registers, modes (sensors), windows, outputs and pipes (deserializers), limits, and the declarative status probes. The laws and knobs come from the law family meta.chip names, or from a paired physics module; this schema pins the shape the loader reads.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -64,9 +64,12 @@
           "description": "The personality kind these facts describe; cam when absent."
         },
         "chip": {
-          "type": "string",
-          "pattern": "^[a-z][a-z0-9_]*$",
-          "description": "The law family (nxs.cam.chips) whose laws and knobs this sensor's facts bind; generic when absent. The .py beside a sensor's facts is the behaviour class the unit runs, never a law module."
+          "enum": [
+            "generic",
+            "sony_imx",
+            "native"
+          ],
+          "description": "The law family (its <family>/ directory beside the cam personalities) whose laws and knobs this sensor's facts bind: generic for a table-only part, sony_imx for the FRAMOS register vocabulary, native for a head that programs its own sensor and serves the camera map alone, the smart camera; generic when absent. The .py beside a sensor's facts is the behaviour class the unit runs, never a law module."
         },
         "reg_bits": {
           "enum": [
@@ -142,6 +145,102 @@
         "gain_max": {
           "$ref": "#/$defs/int",
           "description": "The largest raw gain register value the gain knob accepts."
+        },
+        "exposure_min_us": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "A native head's shortest exposure, in microseconds; the camera map serves it in lines of the running mode."
+        },
+        "exposure_margin_us": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "A native head's margin between the exposure and the frame period, in microseconds."
+        },
+        "frame_period_max_us": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "A native head's longest frame period, in microseconds."
+        },
+        "gain_min_mdb": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "A native head's lowest gain, in millidecibels, a multiple of the camera map's 100 mdB unit."
+        },
+        "gain_max_mdb": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "A native head's highest gain, in millidecibels, a multiple of 100 mdB."
+        },
+        "gain_step_mdb": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "A native head's gain increment, in millidecibels, a multiple of 100 mdB."
+        },
+        "black_level": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "min",
+            "max"
+          ],
+          "properties": {
+            "min": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "max": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "description": "A native head's black-level range, in DN at the mode's bit depth; absent, the head offers no black level."
+        },
+        "flips": {
+          "type": "boolean",
+          "description": "A native head offers the flips field of the camera map."
+        },
+        "temperature": {
+          "type": "boolean",
+          "description": "A native head paints its temperature in the camera map."
+        },
+        "stream_gate": {
+          "type": "boolean",
+          "description": "A native head gates its stream through the camera map; the host writes no sensor register for it."
+        },
+        "fast_trigger": {
+          "type": "object",
+          "description": "The fast-trigger timing chart: the data output delay t_TGDLY as a fixed time, whole lines and wait registers, and the wait registers that extend the pulse's exposure. The family's output delay, readout delay and trigger exposure laws read it; a datasheet without the chart declares none.",
+          "additionalProperties": false,
+          "required": [
+            "output_delay_us",
+            "output_delay_lines",
+            "output_delay_regs"
+          ],
+          "properties": {
+            "output_delay_us": {
+              "type": "number",
+              "minimum": 0
+            },
+            "output_delay_lines": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "output_delay_regs": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Z][A-Z0-9_]*$"
+              }
+            },
+            "exposure_regs": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Z][A-Z0-9_]*$"
+              }
+            }
+          }
         }
       }
     },
@@ -367,11 +466,61 @@
         "$ref": "#/$defs/int"
       }
     },
-    "bank_offset": {
-      "$ref": "#/$defs/int"
+    "outputs": {
+      "type": "object",
+      "description": "A deserializer's CSI-2 outputs by port name, one controller's port each: its MIPI_TX block, its controller number, its code in a map's MAP_DPHY_DEST field and in the PHY copy, its bit in the controllers' reset register, its rate register and PLL, and the controller's registers there.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "block",
+          "controller",
+          "dphy",
+          "reset_bit",
+          "clock",
+          "pll",
+          "deskew",
+          "lanes",
+          "alt_mem_map",
+          "tunnel"
+        ],
+        "properties": {
+          "block": {
+            "$ref": "#/$defs/int"
+          },
+          "controller": {
+            "type": "integer"
+          },
+          "dphy": {
+            "type": "integer"
+          },
+          "reset_bit": {
+            "type": "integer"
+          },
+          "clock": {
+            "type": "string"
+          },
+          "pll": {
+            "type": "string"
+          },
+          "deskew": {
+            "type": "string"
+          },
+          "lanes": {
+            "type": "string"
+          },
+          "alt_mem_map": {
+            "type": "string"
+          },
+          "tunnel": {
+            "type": "string"
+          }
+        }
+      }
     },
     "bank_blob_lanes": {
-      "type": "integer"
+      "type": "integer",
+      "description": "Port A's lane count the captured bank blob carries; a port with another count corrects it after the blob."
     },
     "windows": {
       "type": "object",
@@ -387,7 +536,11 @@
         "required": [
           "arm",
           "vlock",
-          "bank"
+          "block",
+          "map_en",
+          "maps",
+          "dest_0_3",
+          "dest_4_7"
         ],
         "properties": {
           "arm": {
@@ -396,8 +549,22 @@
           "vlock": {
             "type": "string"
           },
-          "bank": {
-            "type": "integer"
+          "block": {
+            "$ref": "#/$defs/int",
+            "description": "The MIPI_TX block that holds the pipe's maps."
+          },
+          "map_en": {
+            "type": "string"
+          },
+          "maps": {
+            "type": "string",
+            "description": "MAP_SRC_0, the first of the source and destination pairs."
+          },
+          "dest_0_3": {
+            "type": "string"
+          },
+          "dest_4_7": {
+            "type": "string"
           }
         }
       }
@@ -692,7 +859,30 @@
           }
         },
         "timing": {
-          "type": "object"
+          "type": "object",
+          "properties": {
+            "line_time_ns": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "A native head's line period in this mode, in nanoseconds: the increment of its exposure and its frame period."
+            },
+            "frame_period_min_us": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "A native head's shortest frame period in this mode, in microseconds."
+            },
+            "waits": {
+              "type": "object",
+              "description": "The mode's own wait registers from its register list, where they differ from the sensor-wide captured set; the output delay reads them.",
+              "minProperties": 1,
+              "propertyNames": {
+                "pattern": "^[A-Z][A-Z0-9_]*$"
+              },
+              "additionalProperties": {
+                "$ref": "#/$defs/int"
+              }
+            }
+          }
         },
         "sony": {
           "type": "object",

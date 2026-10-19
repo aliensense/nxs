@@ -4,7 +4,8 @@
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-from nxs._generated_constants import RunnerStates
+from nxs._generated_constants import NxsMap, RunnerStates
+from nxs.suite.firmware import runs_build
 from nxs.suite.schema import (UnitSpec, device_proves_patch, device_runs,
                               parse_version)
 from nxs.suite.state import SuiteState
@@ -18,13 +19,13 @@ class UnitDrift:
     personality: bool = False
     shape: bool = False
     params: Dict[str, Tuple[object, object]] = field(default_factory=dict)
-    egress: Dict[str, Tuple[object, object]] = field(default_factory=dict)
+    #: The unit's own rows whose served value differs from the declared one,
+    #: by name: (declared, live).
+    rows: Dict[str, Tuple[object, object]] = field(default_factory=dict)
     fw: bool = False
-    orientation: bool = False
 
     def any(self) -> bool:
-        return (self.personality or self.shape or bool(self.params)
-                or bool(self.egress) or self.fw or self.orientation)
+        return self.personality or self.shape or bool(self.params) or bool(self.rows) or self.fw
 
     def kinds(self) -> List[str]:
         """Render labels, most invasive first."""
@@ -35,37 +36,75 @@ class UnitDrift:
             kinds.append("shape")
         if self.params:
             kinds.append("config")
-        if self.egress:
-            kinds.append("egress")
+        if self.rows:
+            kinds.append("rows")
         if self.fw:
             kinds.append("fw")
-        if self.orientation:
-            kinds.append("orientation")
         return kinds
 
 
-def orientation_drift(unit: UnitSpec, transport) -> bool:
-    """True when the declared mounting orientation differs from the device."""
-    from nxs.client import SupportsCalibration, rotation_code
-    if unit.orientation is None or not isinstance(transport, SupportsCalibration):
-        return False
-    return transport.read_calibration().orientation \
-        != rotation_code(unit.orientation)
+def declared_rows(unit: UnitSpec) -> Dict[str, int]:
+    """The unit's own declared rows the row step commits: every one but the
+    node id a Cyphal/CAN route commissions."""
+    from nxs.suite.schema_nodes import CAN_NODE_ID
+
+    by_can = any(link.transport == "cyphal-can" for link in unit.links)
+    return {k: v for k, v in unit.rows.items() if not (by_can and k == CAN_NODE_ID)}
+
+
+def unit_door(transport):
+    """The unit's map door at the address `transport` reaches it at, None
+    for a route that reaches no door (a Cyphal link, a test's client)."""
+    door = getattr(transport, "door", None)
+    address = getattr(transport, "address", None)
+    if door is None or address is None:
+        return None
+    try:
+        at = address() if callable(address) else address
+        return door(int(at)) if at is not None else None
+    except (RuntimeError, OSError, TypeError):
+        return None
+
+
+def rows_drift(unit: UnitSpec, transport) -> Optional[Dict[str, Tuple[int, Optional[int]]]]:
+    """The declared rows of the unit that it serves at another value, by
+    name: (declared, live), live None for a row the unit serves none of. {}
+    when every declared row holds or none is declared; None when rows are
+    declared and the route reaches no unit door."""
+    from nxs._libnxs_map import find_row
+
+    declared = declared_rows(unit)
+    if not declared:
+        return {}
+    door = unit_door(transport)
+    if door is None:
+        return None
+    with door:
+        rows = door.rows()
+        cells = door.cells(rows)
+    out: Dict[str, Tuple[int, Optional[int]]] = {}
+    for name, want in declared.items():
+        index = find_row(rows, name)
+        live = cells[index]["live"] if index is not None else None
+        if live != want:
+            out[name] = (int(want), live)
+    return out
 
 
 def firmware_drift(unit: UnitSpec, state: SuiteState, transport,
                    pin: Optional[str] = None, image: Optional[str] = None) -> bool:
-    """True when apply would flash. `image` is the build identity the
-    pinned image carries: the unit runs that image exactly when it reports
-    the identity, as `push-fw` judges a push. Without one, a provable
-    mismatch or an unknown version without a matching state record. `pin`
-    is the version to hold the unit at; the unit's own `firmware` when None."""
+    """True when apply would flash. `image` is the build identity the pinned
+    image carries: the unit runs that image exactly when it reports the
+    identity and neither is a dirty build, as `push-fw` judges a push.
+    Without one, true on a provable mismatch or an unknown version without a
+    matching state record. `pin` is the version to hold the unit at; the
+    unit's own `firmware` when None."""
     pin = pin or unit.firmware
     if not pin:
         return False
     device = transport.read_fw_version()
     if image is not None:
-        return device != image
+        return not runs_build(device, image)
     want = parse_version(pin)
 
     # A full build identity proves the whole triple and decides alone; the
@@ -81,7 +120,7 @@ def firmware_drift(unit: UnitSpec, state: SuiteState, transport,
     # to the exact pin: a recorded version other than the pin is drift.
     recorded = state.unit(unit.name).get("fw_version")
     if recorded is not None:
-        # Compare parsed versions ("1.1.0" equals "1.1"). An unparseable
+        # Compare parsed versions ("X.Y.0" equals "X.Y"). An unparseable
         # record reflashes.
         try:
             return parse_version(recorded) != want
@@ -112,27 +151,27 @@ def click_slots(transport) -> List[int]:
                 raise
             slots.append(slot)
             continue
-        kind = getattr(info, "kind", None)
-        if info is not None and IMAGE_KIND_NAMES.get(kind, kind) != camera:
+        if info is not None and getattr(info, "kind", None) != camera:
             slots.append(slot)
     return slots
 
 
-def egress_drift(unit: UnitSpec, transport) -> Dict[str, Tuple[object, object]]:
-    """Declared egress factors that differ from the device, keyed by 'device'
-    (the gate) or the subject token. Empty when no egress section is declared."""
-    if unit.egress is None:
-        return {}
-    drift = {}
-    if unit.egress.decimation is not None:
-        live = transport.read_decimation()
-        if live != unit.egress.decimation:
-            drift["device"] = (unit.egress.decimation, live)
-    for subject, want in unit.egress.subjects.items():
-        live = transport.read_decimation(subject=subject)
-        if live != want:
-            drift[subject] = (want, live)
-    return drift
+def declared_values(compiled) -> Dict[str, object]:
+    """The values a compiled click personality configures, by name: every
+    parameter but its GATE row, which starts and parks the sampling."""
+    return {p.name: p.current for p in compiled.params if p.kind != "gate"}
+
+
+def live_values(params, compiled) -> Dict[str, object]:
+    """The configuration among the parameters a transport reads, by name.
+    The GATE row starts and parks the sampling, and a row the device owns
+    (`OWNER_DEVICE`) belongs to no personality, so neither is configuration.
+    A transport that serves no kind names no row's kind, so the compiled
+    personality's GATE rows are left out by name as well."""
+    gates = {p.name for p in compiled.params if p.kind == "gate"}
+    return {p["name"]: p["current"] for p in params
+            if p.get("kind") != "gate" and p["name"] not in gates
+            and p.get("owner") != NxsMap.OWNER_DEVICE}
 
 
 def detect_unit_drift(unit: UnitSpec, panel: list, transport,
@@ -141,13 +180,11 @@ def detect_unit_drift(unit: UnitSpec, panel: list, transport,
     `panel` is the compiled `[(SensorSpec, CompiledDriver), ...]` and
     `expected_hash` the manifest-side panel digest."""
     drift = UnitDrift(fw=firmware_drift(unit, state, transport),
-                      egress=egress_drift(unit, transport),
-                      orientation=orientation_drift(unit, transport))
+                      rows=rows_drift(unit, transport) or {})
     if not panel:
-        # Declared-empty (`sensors: []`): a click personality running or
-        # stored is personality drift. An unmanaged panel (key absent) is never drift.
-        if unit.sensors is not None and (
-                transport.read_personality_name() or click_slots(transport)):
+        # A socket no click feeds is empty: a click personality running or
+        # stored is personality drift.
+        if transport.read_personality_name() or click_slots(transport):
             drift.personality = True
         return drift
 
@@ -169,8 +206,8 @@ def detect_unit_drift(unit: UnitSpec, panel: list, transport,
         return drift
 
     compiled = next(c for _, c in panel if c.name == active)
-    desired = {p.name: p.current for p in compiled.params}
-    live = {p["name"]: p["current"] for p in transport.read_capabilities()}
+    desired = declared_values(compiled)
+    live = live_values(transport.read_capabilities(), compiled)
     drift.params = {name: (desired[name], live[name])
                     for name in desired.keys() & live.keys()
                     if desired[name] != live[name]}

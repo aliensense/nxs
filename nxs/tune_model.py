@@ -2,94 +2,398 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """The panel's model: one channel per node of the rig (a port, each of its
-links, a pod or a unit), its knobs from the declaration, the laws and the
-installed personalities, and the one writer of the declaration."""
+links, a pod or a unit). A channel's DECLARE knobs choose what the rig
+holds, a port's hub, a link's camera and pod, a unit's clicks; each block
+the declaration then names opens one rows section, each knob a row its
+description offers at that point of the graph with the values its options
+admit there (`nxs.suite.views`). Every step re-asks every block's options
+on the declaration the knobs make, so a step on one block narrows or hides
+another's rows. The one writer of the declaration is `nxs.tune_write`."""
 
 from __future__ import annotations
 
 import dataclasses
 import os
-from typing import Any, Dict, List, Optional
+from decimal import Decimal
+from typing import Any, Dict, List, Optional, Tuple
 
-from nxs import tune_camera as laws
-from nxs.tune_fields import (NONE, Channel, Field, Section, _EmptyConfig, _platform_port_buses,
+from nxs.tune_fields import (NONE, Channel, Field, Section, _EmptyConfig, _platform_port_buses, token,
                              _platform_ports, _unit_name)
 from nxs.tune_sweep import ROUTES, pods as swept_pods, presence, sweep as sweep_buses
 
-CONNECTOR = laws.CONNECTOR
-#: The decimation ladder a knob steps through; --set takes any integer inside the bounds.
-DECIMATIONS = (1, 2, 4, 5, 8, 10, 16, 20, 25, 32, 50, 64, 100, 200, 250, 500, 1000)
-DECIMATION_BOUNDS = (0, 0xFFFF)
-#: The free-run rates a step pulls onto, where the menu offers them.
-FPS_DETENTS = (30, 60)
+#: The HUB of a camera on the host's connector: a port without a hub.
+CONNECTOR = "connector"
+#: A block's section: its rows as knobs.
+ROWS = "rows"
+#: The steps a range row's knob offers between its ends; a batch takes any value inside.
+_LADDER = 50
 
 
 # ---------------------------
-# Fields
+# What is installed
 # ---------------------------
 
-def _label(option):
-    return option[1] if isinstance(option, tuple) else str(option)
+def installed_hubs() -> List[str]:
+    """The compatibles of every deserializer the installed hubs serve."""
+    from nxs.cam import hubs
+
+    out: List[str] = []
+    try:
+        found = hubs.discover()
+    except Exception:        # noqa: BLE001 (no hub installed: nothing to offer)
+        return out
+    for hub in found:
+        for chip in hub.chips:
+            try:
+                d = hub.descriptor(chip)
+            except Exception:        # noqa: BLE001 (a chip that does not load is status's finding)
+                continue
+            if d.role == "DES" and d.compatible not in out:
+                out.append(d.compatible)
+    return out
 
 
-def _token(option):
-    return option[0] if isinstance(option, tuple) else option
+def hub_product(compatible: str) -> Optional[str]:
+    """The product name the installed hub prints for a deserializer
+    compatible; None where no hub names one."""
+    from nxs.cam import hubs
+
+    try:
+        return hubs.product_name(compatible)
+    except Exception:        # noqa: BLE001 (no hub installed: the compatible stands)
+        return None
 
 
-def _choice(name, options, current, **kw):
-    """A knob opened on `current` where offered, else on its first option."""
-    tokens = [_token(o) for o in options]
-    index = tokens.index(current) if current in tokens else 0
-    return Field(name, options, index, **kw)
+def installed_sensors() -> List[str]:
+    """The compatibles of every installed cam personality: a head is its own
+    node, and any hub's link or the connector may carry it."""
+    from nxs.cam import cam_personalities
+
+    try:
+        registry = cam_personalities.registry()
+        return list(dict.fromkeys(registry.find(name).compatible for name in registry.names()))
+    except Exception:        # noqa: BLE001 (a store that does not read offers nothing)
+        return []
 
 
-def _nearest(options, wanted):
-    return min(options, key=lambda o: (abs(float(o) - float(wanted)), o))
+def hub_for(topology):
+    """The hub, or the connector's flows, serving `topology`; None when nothing
+    installed does, or without a topology."""
+    from nxs.cam import hubs
+
+    if topology is None:
+        return None
+    try:
+        return hubs.for_topology(topology)
+    except Exception:        # noqa: BLE001 (the finding is `status`'s)
+        return None
 
 
-def _rate_knob(name, rates, wanted, declared=None):
-    """An fps knob over `rates`, on `wanted` where offered, else the nearest;
-    a declared rate (29.97 stays 29.97) joins the menu."""
-    options = list(rates)
-    if declared is not None and options:
-        value = int(declared) if float(declared).is_integer() else float(declared)
-        if value not in options:
-            options = sorted(set(options) | {value})
-    pick = wanted if wanted in options else _nearest(options, wanted)
-    detents = tuple(sorted({r for r in FPS_DETENTS if r in options} | {max(options)}))
-    return Field(name, options, options.index(pick), unit="fps", detents=detents), pick
+# ---------------------------
+# A block's rows as knobs
+# ---------------------------
+
+def row_token(row, raw: int):
+    """A served value as the declaration writes it and a knob offers it:
+    the name where the row names its values, else the number in the row's
+    display form, whole where it is one."""
+    from nxs.description import display, present
+
+    text = display(row, int(raw))
+    if present(row).labels is not None:
+        return text
+    number = Decimal(text)
+    return int(number) if number == number.to_integral_value() else float(number)
+
+
+def _ladder(lo: int, hi: int, step: int, current: Optional[int]) -> List[int]:
+    """A range's ends and the values a knob steps through between them."""
+    step = max(1, step)
+    count = (hi - lo) // step
+    stride = max(1, count // _LADDER) * step
+    values = set(range(lo, hi + 1, stride)) | {lo, hi}
+    if current is not None and lo <= current <= hi and (current - lo) % step == 0:
+        values.add(current)
+    return sorted(values)
+
+
+def row_field(row, option, raw: int, declared: bool) -> Field:
+    """A row's knob: the values its option admits in display form, opened on
+    `raw` where admitted, else on the admitted value nearest it. A range
+    row's knob steps a ladder and takes any admitted value from a batch.
+    `declared` says the file names the value, which a save then keeps."""
+    from nxs.description import named_values, unit_of
+
+    span = option.span if option.span is not None else (
+        tuple(row.values) if row.is_range and option.values is None else None)
+    if option.values is not None:
+        raws = list(option.values)
+    elif named_values(row, span) is not None:
+        raws = list(named_values(row, span))
+    elif span is not None:
+        raws = _ladder(span[0], span[1], span[2], raw)
+    else:
+        raws = list(row.values)
+    pick = raw if option.admits(raw) and (raw in raws or span is not None) else _nearest(raws, raw)
+    if pick not in raws:
+        raws = sorted(set(raws) | {pick})
+    unit = unit_of(row) if (row.present is None or row.present.labels is None) else ""
+    field = Field(row.name, [row_token(row, v) for v in raws], raws.index(pick),
+                  render=lambda value, u=unit: f"{value} {u}".rstrip(), unit=unit or None)
+    field.row, field.option, field.raws = row, option, raws
+    field.default = None if declared else row_token(row, row.default)
+    if span is not None and option.values is None:
+        field.bounds = (span[0], span[1])
+    return field
+
+
+def field_raw(field) -> int:
+    """The served value a row knob holds."""
+    return field.raws[field.index]
+
+
+def admit(field, text: str) -> Optional[int]:
+    """The index a row knob takes for `text` from a batch: an offered token,
+    else any value its option admits, added to the knob; None for neither."""
+    from nxs.description import DescriptionError, parse
+
+    for i, option in enumerate(field.options):
+        if str(token(option)).lower() == text.lower():
+            return i
+    row = getattr(field, "row", None)
+    if row is None:
+        return None
+    try:
+        raw = parse(row, text)
+    except DescriptionError:
+        return None
+    if not field.option.admits(raw):
+        return None
+    raws = sorted(set(field.raws) | {raw})
+    field.raws, field.options = raws, [row_token(row, v) for v in raws]
+    return raws.index(raw)
+
+
+def _nearest(values: List[int], wanted: int) -> int:
+    return min(values, key=lambda v: (abs(v - wanted), v)) if values else wanted
 
 
 def _spelled(field) -> bool:
-    """Whether a save spells the knob out: a declared value, one the
-    operator set, or one stepped off the default the laws seeded."""
-    return field.default is None or _token(field.value) != _token(field.default)
+    """Whether a save spells the knob out: a value the file declares or one
+    the operator set. A knob left alone stays the block's to default, the
+    value it opened on included where its row's default is not offered."""
+    return field.default is None
 
 
-def _keep_spelling(old, fields):
-    """A rebuilt knob the operator had set stays spelled out."""
-    spelled = {f.name for f in (old.fields if old is not None else []) if f.default is None}
-    for field in fields:
-        if field.name in spelled:
-            field.default = None
+def spelled(section) -> Dict[str, Any]:
+    """A rows section's knobs a save writes, row name to token, a pin set
+    to (none) among them."""
+    return {f.name: token(f.value) for f in section.fields if _spelled(f)}
 
 
-def _replace_section(channel, kind, section, after=None):
-    """Put `section` (None removes) where the channel's section of `kind`
-    sits, else after the section of kind `after`, else at the end. A section
-    that stays keeps its identity (its fields move in), so a cursor or a
-    batch holding it still holds it."""
-    old = next((s for s in channel.sections if s.kind == kind), None)
-    if old is not None:
-        if section is None:
+# ---------------------------
+# The model
+# ---------------------------
+
+class Model:
+    """The channels and what their rows rebuild from: the declaration's
+    file as loaded and its graph. Every rows section's rebuild is the
+    model's (`rebuild`)."""
+
+    def __init__(self, path: str, doc: dict, previous, channels: List[Channel]):
+        self.path, self.doc, self.previous, self.channels = path, doc, previous, channels
+
+    def rebuild(self) -> Tuple[Optional[str], bool]:
+        """Re-ask every block's options on the declaration the knobs make and
+        rebuild each rows section: a knob keeps its value where its row
+        still admits it, else snaps to the nearest admitted value, and a row
+        the block no longer offers here leaves. Returns (note, snapped):
+        an operator line, and whether a value the operator set moved."""
+        from nxs.suite import views
+        from nxs.suite.schema import ManifestError, parse_suite_config
+        from nxs.tune_write import draft
+
+        try:
+            doc, roles = draft(self.doc, self.previous, self.channels)
+        except (ManifestError, SystemExit):
+            # The knobs make no declaration yet (a link's camera before its
+            # port's hub): the rows wait, and the save names the refusal.
+            return None, False
+        try:
+            cfg = parse_suite_config(doc, self.path)
+            graph, seen = cfg.graph, views.views(cfg)
+        except ManifestError:
+            # A draft the laws refuse is judged as it reads, every node with
+            # its peers, so a step toward a lawful one moves nothing else.
+            cfg = None
+            graph, seen = views.draft(doc, self.path)
+        notes, snapped = [], False
+        for channel in self.channels:
+            for role, label, unit in _roles_of(channel):
+                note, moved = _rebuild_section(channel, role, label, unit, doc, roles, graph, seen)
+                notes += [note] if note else []
+                snapped |= moved
+        if cfg is None:
+            refusal = self.refusal()
+            notes += [refusal] if refusal else []
+        return ("; ".join(notes) if notes else None), snapped
+
+    def refusal(self) -> Optional[str]:
+        """Why the declaration the knobs make does not load, None where it
+        does."""
+        from nxs.suite.schema import ManifestError, parse_suite_config
+        from nxs.tune_write import draft
+
+        try:
+            parse_suite_config(draft(self.doc, self.previous, self.channels)[0], self.path)
+        except (ManifestError, SystemExit) as exc:
+            return f"the declaration does not load: {getattr(exc, 'fact', exc)}"
+        return None
+
+
+def _roles_of(channel) -> List[Tuple[tuple, str, Optional[str]]]:
+    """The blocks a channel's rows sections speak for: `(role, label, unit)`,
+    the role as the writer names its node (`tune_write.draft`)."""
+    if channel.kind == "port":
+        return [(("hub", channel.name), "hub", None), (("host", channel.name), "host", None)]
+    if channel.kind == "link":
+        return [(("camera", channel.port_name, channel.letter), "camera", None)]
+    out = []
+    for i, f in enumerate(channel.declare().fields):
+        if f.value != NONE:
+            out.append((("click", channel.name, i), f"{channel.name}/{f.value}", channel.name))
+    out.append((("unit", channel.name), channel.name, channel.name))
+    return out
+
+
+def _rebuild_section(channel, role, label, unit, doc, roles, graph, seen) -> Tuple[Optional[str], bool]:
+    """One block's rows section, rebuilt on the draft: placed where its kind
+    sits, removed when the role names no node."""
+    from nxs import description
+    from nxs.suite.options import BlockView, options_for
+
+    old = next((s for s in channel.sections if s.kind == ROWS and getattr(s, "role", None) == role),
+               None)
+    name = roles.get(role)
+    node_type = (doc.get("nodes") or {}).get(name, {}).get("type") if name else None
+    block = None
+    if node_type is not None:
+        try:
+            block = description.of_type(node_type)
+        except (description.UnknownType, description.DescriptionError):
+            block = None
+    if block is None:
+        if old is None:
+            return None, False
+        channel.sections.remove(old)
+        # Rows that leave are no snap: nothing the operator set moved.
+        return (f"{channel.name}: camera rows wait for a hub and a sensor"
+                if role[0] == "camera" else None), False
+    node = graph.nodes.get(name) if graph is not None else None
+    view = seen.get(name) if name in seen else BlockView(block, node=name or "")
+    if node is not None:
+        block = node.description
+    current = dict(node.values) if node is not None else {}
+    # Declared is what the file states for the node; a knob the operator set stays spelled.
+    filed = ((channel.model.doc.get("nodes") or {}).get(name) or {})
+    declared = set(filed.get("parameters") or {}) if filed.get("type") == node_type else set()
+    rows = [r for r in block.rows if role[0] != "host" or r.name.startswith(f"{role[1]}_")]
+    options = options_for(view)
+    old_fields = {f.name: f for f in (old.fields if old is not None else [])}
+    # A knob that leaves keeps its value for when its row comes back.
+    remembered = dict(getattr(old, "remembered", None) or {})
+    fields, notes, moved = [], [], False
+    if old is not None and getattr(old, "node_type", node_type) != node_type:
+        # Another block's knobs carry nothing over: a value the operator set goes.
+        lost = [f.name for f in old.fields if f.default is None and f.name != "firmware"]
+        if lost:
+            notes.append(f"{channel.name}: {node_type} opens its own rows: "
+                         f"{', '.join(lost)} at {node_type}'s")
+            moved = True
+        old_fields, remembered = {}, {}
+    for row in rows:
+        option = options.get(row.name)
+        if option is None or not option.applicable:
+            if row.name in old_fields:
+                left = old_fields[row.name]
+                remembered[row.name] = (field_raw(left), left.default is None)
+                notes.append(f"{channel.name}: {row.name} leaves: {option.finding if option else ''}"
+                             .rstrip(": "))
+            continue
+        before = old_fields.get(row.name)
+        back = remembered.pop(row.name, None) if before is None else None
+        raw = (field_raw(before) if before is not None else back[0] if back is not None
+               else int(current.get(row.name, row.default)))
+        field = row_field(row, option, raw, declared=row.name in declared)
+        if (before is not None and before.default is None) or (back is not None and back[1]):
+            field.default = None        # the operator's word stays spelled
+        # A stated value that moves is the note; a default the block narrows opens quietly.
+        if field_raw(field) != raw and field.default is None:
+            notes.append(f"{channel.name}: {row.name} {row_token(row, raw)} is not offered: "
+                         f"set to {field.value}" + (f" ({option.finding})" if option.finding else ""))
+            moved |= before is not None and before.default is None
+        fields.append(field)
+    if role[0] == "unit":
+        fields.append(_firmware_field(filed if filed.get("type") == node_type else {}, old_fields))
+    if not fields:
+        if old is not None:
             channel.sections.remove(old)
-        else:
-            old.fields, old.label = section.fields, section.label
+        return ("; ".join(notes) or None), moved
+    section = Section(label, fields, ROWS, unit_name=unit,
+                      sensor_index=role[2] if role[0] == "click" else None)
+    section.role, section.node, section.node_type = role, name, node_type
+    section.remembered = remembered
+    section.rebuild = channel.model.rebuild
+    _place(channel, old, section, role)
+    return ("; ".join(notes) or None), moved
+
+
+def _place(channel, old, section, role) -> None:
+    """Put a rows section where the old one sat, else after the DECLARE
+    section and the sections of the roles before it."""
+    if old is not None:
+        old.fields, old.label = section.fields, section.label
+        old.node, old.node_type, old.remembered = section.node, section.node_type, section.remembered
         return
-    if section is None:
-        return
-    at = next((i + 1 for i, s in enumerate(channel.sections) if s.kind == after), len(channel.sections))
+    order = [r for r, _l, _u in _roles_of(channel)]
+    at = 1 if channel.sections and channel.sections[0].kind == "declare" else 0
+    for i, sec in enumerate(channel.sections):
+        if sec.kind == ROWS and getattr(sec, "role", None) in order and \
+                order.index(sec.role) < order.index(role):
+            at = i + 1
     channel.sections.insert(at, section)
+
+
+def _firmware_field(entry: dict, old_fields) -> Field:
+    """A unit's firmware pin: the versions the installed assets hold, the
+    one the file's `entry` declares first."""
+    params = entry.get("parameters") or {}
+    declared = str(params["firmware"]) if params.get("firmware") is not None else None
+    before = old_fields.get("firmware")
+    pick = token(before.value) if before is not None else (declared or NONE)
+    pins = _firmware_pins()
+    if declared and declared not in pins:
+        pins = [declared] + pins
+    options = [NONE] + pins
+    field = Field("firmware", options, options.index(pick) if pick in options else 0)
+    field.default = None if (declared or (before is not None and before.default is None)) else NONE
+    return field
+
+
+def _firmware_pins() -> List[str]:
+    """The versions of the signed images the installed assets hold."""
+    import glob
+
+    from nxs.suite import FIRMWARE_DIR
+    from nxs.suite.firmware import read_image_version
+
+    pins = []
+    for path in sorted(glob.glob(os.path.join(FIRMWARE_DIR, "*.bin"))):
+        try:
+            pins.append(".".join(map(str, read_image_version(path))))
+        except (OSError, ValueError):
+            continue
+    return list(dict.fromkeys(pins))
 
 
 # ---------------------------
@@ -97,8 +401,8 @@ def _replace_section(channel, kind, section, after=None):
 # ---------------------------
 
 class PortFamily:
-    """A port's channel and its links': the knobs that depend on one another
-    (the hub, the sensors, the modes, the sync) rebuild together."""
+    """A port's channel and its links': the hub, each link's camera and pod,
+    and the shape they make."""
 
     def __init__(self, name, spec, template, finding, bus=None):
         self.name = name
@@ -108,8 +412,8 @@ class PortFamily:
         self.bus = bus              # the host's bus for the port
         self.port: Channel = None
         self.links: List[Channel] = []
-        #: The bus a new entry names: set where the host does not resolve
-        #: the port's name to it (`generate` on a host without port rules).
+        #: The hub's control bus a new entry names: set where the host does not
+        #: resolve the port's name to it (`generate` on a host without port rules).
         self.pinned_bus = None
 
     def link(self, letter):
@@ -170,7 +474,7 @@ class PortFamily:
                 shapes.setdefault(link.name, link)
         links = []
         for ch in self.links:
-            sensor = ch.knobs().get("SENSOR", NONE)
+            sensor = ch.knobs().get("CAM", NONE)
             shape = shapes.get(ch.letter)
             if hub == CONNECTOR:
                 shape = LinkSpec(name=ch.letter, des_window=None, csi_vc=0,
@@ -206,198 +510,26 @@ class PortFamily:
                                sensor_compatible=None, ser_compatible=ser) for letter in sorted(windows))
         return Topology(carrier=f"platform/{self.name}", i2c_bus=self.bus, des_compatible=hub, links=links)
 
-    def modes(self, written=False) -> Dict[str, str]:
-        """Each link's mode by name; with `written`, the ones the declaration
-        spells out (declared, or stepped off the laws' default)."""
-        out = {}
-        for ch in self.links:
-            camera = ch.camera()
-            mode = next((f for f in camera.fields if f.name == "mode"), None) if camera else None
-            if mode is not None and (not written or _spelled(mode)):
-                out[ch.letter] = _token(mode.value)
-        return out
 
-    def rates(self, written=False) -> Dict[str, float]:
-        out = {}
-        for ch in self.links:
-            camera = ch.camera()
-            fps = next((f for f in camera.fields if f.name == "fps"), None) if camera else None
-            if fps is not None and (not written or _spelled(fps)):
-                out[ch.letter] = float(fps.value)
-        return out
-
-    def sync(self, written=False) -> Optional[dict]:
-        section = next((s for s in self.port.sections if s.kind == "sync"), None)
-        if section is None:
-            return None
-        fields = {f.name: f for f in section.fields}
-        if fields["source"].value != "fsync":
-            return None
-        out = {"source": "fsync"}
-        fps = fields.get("fps")
-        if fps is not None and (not written or _spelled(fps)):
-            out["fps"] = float(fps.value)
-        return out
-
-    def gain(self):
-        section = next((s for s in self.port.sections if s.kind == "gain"), None)
-        if section is None:
-            return None
-        value = section.fields[0].value
-        return None if value == NONE else float(value)
-
-    def rebuild(self):
-        """Re-derive the dependent knobs: each link's CAMERA (the sensor's
-        modes, the rates under the port's sync), the port's SYNC and GAIN.
-        Returns (note, snapped) like a section's rebuild."""
-        notes, snapped = [], False
-        topology = self.topology()
-        hub = laws.hub_for(topology)
-        synced = self._source() == "fsync" and hub is not None and not (topology is None or topology.is_direct)
-        for ch in self.links:
-            note, moved = self._rebuild_camera(ch, topology, hub, synced)
-            notes += [note] if note else []
-            snapped |= moved
-        note, moved = self._rebuild_sync(topology, hub)
-        notes += [note] if note else []
-        snapped |= moved
-        self._rebuild_gain(topology, hub)
-        return ("; ".join(notes) if notes else None), snapped
-
-    def _rebuild_camera(self, ch, topology, hub, synced):
-        old = ch.camera()
-        sensor = ch.knobs().get("SENSOR", NONE)
-        link = next((l for l in topology.links if l.name == ch.letter), None) if topology else None
-        offered = laws.mode_options(hub, sensor) if (hub is not None and sensor != NONE) else []
-        if not offered:
-            # Knobs that leave are no snap: nothing the operator set moved.
-            if old is None:
-                return None, False
-            ch.sections.remove(old)
-            return (f"{ch.name}: camera knobs wait for a hub and a sensor" if sensor == NONE or hub is None
-                    else f"{ch.name}: {sensor} offers no mode here"), False
-        # The knobs of another sensor carry nothing over: a sensor change opens
-        # the new sensor's modes and rates at their defaults.
-        current = {f.name: f.value for f in old.fields} if old and getattr(old, "sensor", None) == sensor else {}
-        # The mode the laws run when nothing names one: what `on` would pick.
-        tokens = [t for t, _l in offered]
-        ruled = laws.mode_name(hub, sensor, laws.default_mode(hub, topology, link)) if link is not None else None
-        default = next((o for o in offered if o[0] == ruled), offered[0])
-        wanted_mode = _token(current["mode"]) if "mode" in current else ch.declared_mode
-        if wanted_mode is not None and wanted_mode not in tokens:
-            wanted_mode = laws.mode_name(hub, sensor, wanted_mode) or wanted_mode
-        mode = _choice("mode", offered, wanted_mode if wanted_mode is not None else default[0], render=_label)
-        # The declared rate joins a menu only at the declared mode; a mode
-        # the declaration leaves to the laws stays implicit until stepped.
-        declared_mode = laws.mode_name(hub, sensor, ch.declared_mode) or ch.declared_mode
-        mode.default = None if ch.declared_mode is not None else default
-        ch.at_declared_mode = declared_mode is None or _token(mode.value) == declared_mode
-        declared_fps = ch.declared_fps if ch.at_declared_mode else None
-        fields = [mode]
-        note, moved = None, False
-        if _token(mode.value) != wanted_mode and wanted_mode is not None:
-            note, moved = f"{ch.name}: {sensor} does not offer {wanted_mode}: mode set to {_token(mode.value)}", True
-        if not synced:
-            rates = laws.free_run_rates(hub, topology, link, _token(mode.value)) if link is not None else []
-            if rates:
-                # The rate carries over: the knob's own, else the port's synced
-                # rate when the sync just left, else the declared one.
-                wanted = current.get("fps", self._synced_fps())
-                if wanted is None:
-                    wanted = declared_fps if declared_fps is not None else min(30, max(rates))
-                field, pick = _rate_knob("fps", rates, wanted, declared=declared_fps)
-                field.default = None if declared_fps is not None else _nearest(field.options, min(30, max(rates)))
-                fields.append(field)
-                if "fps" in current and pick != current["fps"]:
-                    note = (f"{ch.name}: {_token(mode.value)} offers {min(rates):g}–{max(rates):g} fps, "
-                            f"not {current['fps']:g}: fps set to {pick:g}")
-                    moved = True
-                elif "fps" not in current and old is not None:
-                    note = f"{ch.name}: fps knob back: {pick:g} fps"
-            elif "fps" in current:
-                note, moved = f"{ch.name}: no fps knob for {_token(mode.value)}: the mode runs at its native timing", True
-        elif "fps" in current:
-            note = f"{ch.name}: fps follows the frame sync"
-        if old is None or getattr(old, "sensor", None) == sensor:
-            _keep_spelling(old, fields)
-        section = Section("CAMERA", fields, "camera")
-        section.rebuild = self.rebuild
-        _replace_section(ch, "camera", section, after="declare")
-        ch.camera().sensor = sensor
-        return note, moved
-
-    def _source(self):
-        """The sync source the knob holds, else the declared one."""
-        section = next((s for s in self.port.sections if s.kind == "sync"), None)
-        if section is not None:
-            return section.fields[0].value
-        return self.spec.sync_source if self.spec is not None else "free_run"
-
-    def _synced_fps(self):
-        section = next((s for s in self.port.sections if s.kind == "sync"), None)
-        fps = next((f for f in section.fields if f.name == "fps"), None) if section else None
-        return float(fps.value) if fps is not None else None
-
-    def _rebuild_sync(self, topology, hub):
-        old = next((s for s in self.port.sections if s.kind == "sync"), None)
-        cameras = topology.camera_links if topology is not None else ()
-        if hub is None or not cameras:
-            _replace_section(self.port, "sync", None)
-            return None, False
-        sources = ["free_run"] if topology.is_direct else ["free_run", "fsync"]
-        current = {f.name: f.value for f in old.fields} if old else {}
-        wanted = current.get("source", self.spec.sync_source if self.spec is not None else "free_run")
-        source = _choice("source", sources, wanted)
-        fields = [source]
-        note, moved = (None, False) if source.value == wanted else (f"{self.name}: no frame sync on the connector", True)
-        if source.value == "fsync":
-            rates = laws.synced_rates(hub, topology, self.modes())
-            if rates:
-                # The declared synced rate (`sync.fps`, else the port shorthand's)
-                # joins the menu at the declared modes only.
-                declared = None
-                if self.spec is not None and all(getattr(l, "at_declared_mode", True) for l in self.links):
-                    declared = self.spec.sync_fps if self.spec.sync_fps is not None else self.spec.camera_fps
-                wanted_fps = current.get("fps", declared if declared is not None else min(30, max(rates)))
-                field, pick = _rate_knob("fps", rates, wanted_fps, declared=declared)
-                field.default = None if declared is not None else _nearest(field.options, min(30, max(rates)))
-                fields.append(field)
-                if "fps" in current and pick != current["fps"]:
-                    note, moved = f"{self.name}: frame sync offers {min(rates):g}–{max(rates):g} fps, not {current['fps']:g}: fps set to {pick:g}", True
-            elif "fps" in current:
-                note, moved = f"{self.name}: the trigger laws leave no rate for these modes", True
-        _keep_spelling(old, fields)
-        section = Section("SYNC", fields, "sync")
-        section.rebuild = self.rebuild
-        _replace_section(self.port, "sync", section, after="declare")
-        return note, moved
-
-    def _rebuild_gain(self, topology, hub):
-        old = next((s for s in self.port.sections if s.kind == "gain"), None)
-        span = laws.gain_range(hub, topology) if (hub is not None and topology is not None) else None
-        if span is None:
-            _replace_section(self.port, "gain", None)
-            return
-        declared = self.spec.camera_gain_db if self.spec is not None else None
-        options: List[Any] = [NONE] + list(range(span[0], span[1] + 1))
-        if declared is not None and declared not in options:
-            options = [NONE] + sorted(set(options[1:]) | {declared})
-        current = old.fields[0].value if old else (declared if declared is not None else NONE)
-        section = Section("GAIN", [_choice("gain_db", options, current, unit="dB", bounds=span)], "gain")
-        section.rebuild = self.rebuild
-        _replace_section(self.port, "gain", section, after="sync")
+def _hub_option(compatible):
+    """A hub's option: the compatible is its token, the product the hub names its label."""
+    product = hub_product(compatible)
+    return (compatible, product) if product else compatible
 
 
-def _port_family(name, spec, template, finding, cfg, bus=None) -> PortFamily:
-    """The channels of one port: the port's with HUB, each link's with SENSOR
-    and POD, then the dependent knobs the family rebuilds."""
+def _label(option):
+    return option[1] if isinstance(option, tuple) else str(option)
+
+
+def _port_family(model, name, spec, template, finding, bus=None) -> PortFamily:
+    """The channels of one port: the port's with HUB, each link's with CAM
+    and POD; the rows sections come with the model's rebuild."""
     family = PortFamily(name, spec, template, finding, bus=bus)
     declared = spec is not None
     channel = Channel(name, [], kind="port", declared=declared, presence=presence(finding),
                       template=template)
-    channel.port = spec
-    channel.family = family
-    hubs = laws.installed_hubs()
+    channel.port, channel.family, channel.model = spec, family, model
+    hubs = [_hub_option(h) for h in installed_hubs()]
     channel.note = ""
     if spec is not None and spec.hub_compatible:
         current = spec.hub_compatible
@@ -405,24 +537,23 @@ def _port_family(name, spec, template, finding, cfg, bus=None) -> PortFamily:
         current = CONNECTOR
     else:
         current = NONE
-    options = [current] + [h for h in [NONE, CONNECTOR] + hubs if h != current]
-    declare = Section("DECLARE", [Field("HUB", options, 0, pinned=current if current != NONE else None)],
-                      "declare")
-    declare.rebuild = family.rebuild
+    options = [next((h for h in hubs if token(h) == current), current)]
+    options += [h for h in [NONE, CONNECTOR] + hubs if token(h) != current]
+    declare = Section("DECLARE", [Field("HUB", options, 0, render=_label,
+                                        pinned=current if current != NONE else None)], "declare")
+    declare.rebuild = model.rebuild
     channel.sections.append(declare)
     family.port = channel
-    sensors = laws.installed_sensors()
+    sensors = installed_sensors()
     found_links = (finding or {}).get("links", {})
     declared_pods = {l.name: l.unit for l in (spec.links if spec else []) if l.unit is not None}
     for letter in family.letters():
         link_spec = next((l for l in spec.links if l.name == letter), None) if spec else None
         link = Channel(f"{name}/{letter}", [], kind="link", declared=link_spec is not None,
                        presence=channel.presence)
-        link.letter, link.family, link.port_name = letter, family, name
-        # A link's declared mode and rate: its own, else the port shorthand's.
-        link.declared_mode = (link_spec.camera_mode or spec.camera_mode) if link_spec else None
-        link.declared_fps = (link_spec.camera_fps if link_spec.camera_fps is not None
-                             else spec.camera_fps) if link_spec else None
+        link.letter, link.family, link.port_name, link.model = letter, family, name, model
+        # A link the walk did not read says why, so no pod offered on it is not a silence.
+        link.note = (found_links.get(letter) or {}).get("unwalked") or ""
         sensor = link_spec.camera if link_spec else None
         # (none) after a declared sensor: stepping onto it removes the camera at save.
         sensor_options = ([sensor, NONE] + [s for s in sensors if s != sensor]) if sensor else [NONE] + sensors
@@ -435,21 +566,22 @@ def _port_family(name, spec, template, finding, cfg, bus=None) -> PortFamily:
             pod_name = _pod_name(name, letter)
             pod_options = [NONE, (pod_name, f"{pod_name} @{found['addr']:#04x}")]
         section = Section("DECLARE", [
-            Field("SENSOR", sensor_options, 0, pinned=sensor),
+            Field("CAM", sensor_options, 0, pinned=sensor),
             Field("POD", pod_options, 0, render=_label, pinned=pod.name if pod else None)], "declare")
-        section.rebuild = family.rebuild
+        section.rebuild = model.rebuild
         link.sections.append(section)
         family.links.append(link)
-    family.rebuild()
     if template is None and spec is None:
         channel.note = "no hub installed: a camera on the connector declares with HUB = connector"
     elif spec is not None and spec.hub_compatible is None and not spec.links:
-        channel.note = "no hub declared — set HUB and a link's SENSOR, then save"
+        channel.note = "no hub declared — set HUB and a link's CAM, then save"
     elif spec is not None and spec.hub_driver == "kernel":
         channel.note = "no camera knobs: a kernel driver owns the hub"
+    elif spec is not None and spec.hub_driver == "module":
+        channel.note = f"no camera knobs: {spec.owner} masters the hub's bus"
     elif spec is not None and not any(l.camera for l in spec.links):
-        channel.note = "no link sensor declared — set a link's SENSOR, then save"
-    elif spec is not None and spec.hub_compatible and laws.hub_for(family.topology()) is None:
+        channel.note = "no link sensor declared — set a link's CAM, then save"
+    elif spec is not None and spec.hub_compatible and hub_for(family.topology()) is None:
         channel.note = f"no camera knobs: hub {spec.hub_compatible} is not installed"
     return family
 
@@ -464,80 +596,24 @@ def _pod_name(port, letter):
 # ---------------------------
 
 def _personality_knob(index):
-    return "PERSONALITY" if index == 0 else f"PERSONALITY-{index + 1}"
+    return "CLICK" if index == 0 else f"CLICK-{index + 1}"
 
 
-def _param_table(personality, config) -> List[dict]:
-    """The compiled parameter table of a click personality at `config`:
-    name, type, values, default, current, unit."""
-    from nxs.suite.reconcile import load_click_personality
-
-    compiled = load_click_personality(personality)().compile(dict(config or {}))
-    return [{"name": p.name, "type": p.param_type, "values": list(p.values), "default": p.default,
-             "current": p.current, "unit": p.unit} for p in compiled.params]
-
-
-def _params_section(unit_name, index, personality, config) -> Optional[Section]:
-    """One click personality's parameters as knobs, from its compiled table;
-    None for a personality that does not load or declares none."""
-    try:
-        table = _param_table(personality, config)
-    except Exception:        # noqa: BLE001 (a personality that does not load is status's finding)
-        return None
-    fields = []
-    for entry in table:
-        values = list(entry["values"])
-        current = (config or {}).get(entry["name"], entry["current"])
-        bounds = None
-        if entry["type"] == "range" and len(values) >= 2:
-            lo, hi = int(values[0]), int(values[1])
-            bounds = (lo, hi)
-            step = max(1, (hi - lo) // 50)
-            values = sorted({lo, hi, *range(lo, hi + 1, step)}
-                            | ({int(current)} if lo <= int(current) <= hi else set()))
-        unit_label = f" {entry['unit']}".rstrip() if entry["unit"] else ""
-        field = _choice(entry["name"], values, current,
-                        render=lambda v, u=unit_label: f"{v}{u}", unit=entry["unit"] or None,
-                        bounds=bounds)
-        field.default = entry["default"]
-        fields.append(field)
-    if not fields:
-        return None
-    return Section(f"{unit_name}/{personality}", fields, "sensor", unit_name=unit_name,
-                   sensor_index=index)
-
-
-def _firmware_pins() -> List[str]:
-    """The versions of the signed images the installed assets hold."""
-    import glob
-
-    from nxs.suite import FIRMWARE_DIR
-    from nxs.suite.firmware import read_image_version
-
-    pins = []
-    for path in sorted(glob.glob(os.path.join(FIRMWARE_DIR, "*.bin"))):
-        try:
-            pins.append(".".join(map(str, read_image_version(path))))
-        except (OSError, ValueError):
-            continue
-    return list(dict.fromkeys(pins))
-
-
-def _unit_channel(name, unit, declared=True, presence_word="unknown", template=None,
+def _unit_channel(model, name, unit, declared=True, presence_word="unknown", template=None,
                   link_ref=None, running=None) -> Channel:
-    """A unit's or a pod's channel: its PERSONALITY knobs (one per declared
-    entry and one to add), each personality's parameters, then MOUNT,
-    EGRESS and FIRMWARE."""
-    from nxs.capabilities import ROTATION_NAMES
+    """A unit's or a pod's channel: its CLICK knobs, one per declared click
+    and one to add; each click's rows and the unit's own come with the
+    model's rebuild."""
     from nxs.suite.reconcile import known_click_personalities
 
     channel = Channel(name, [], kind="unit", declared=declared, presence=presence_word,
                       template=template)
     channel.unit_spec, channel.link_ref, channel.running = unit, link_ref, running
+    channel.model = model
     known = known_click_personalities()
     if running in known:
         known = [running] + [p for p in known if p != running]
-    sensors = list(unit.sensors or []) if unit is not None else []
+    sensors = list(unit.sensors) if unit is not None else []
     fields = []
     for i, spec in enumerate(sensors):
         fields.append(Field(_personality_knob(i),
@@ -547,58 +623,22 @@ def _unit_channel(name, unit, declared=True, presence_word="unknown", template=N
     declare = Section("DECLARE", fields, "declare")
     declare.rebuild = lambda: _rebuild_unit(channel)
     channel.sections.append(declare)
-    for i, spec in enumerate(sensors):
-        section = _params_section(name, i, spec.personality, spec.config)
-        if section is not None:
-            channel.sections.append(section)
-    orientation = unit.orientation if unit is not None else None
-    channel.sections.append(Section("MOUNT", [_choice("orientation", [NONE] + list(ROTATION_NAMES),
-                                                      orientation if orientation else NONE)], "mount"))
-    decimation = unit.egress.decimation if unit is not None and unit.egress is not None else None
-    ladder: List[Any] = [NONE] + sorted(set(DECIMATIONS) | ({decimation} if decimation is not None else set()))
-    channel.sections.append(Section("EGRESS", [_choice("decimation", ladder,
-                                                       decimation if decimation is not None else NONE,
-                                                       bounds=DECIMATION_BOUNDS)], "egress"))
-    firmware = unit.firmware if unit is not None else None
-    pins = _firmware_pins()
-    if firmware and firmware not in pins:
-        pins = [firmware] + pins
-    channel.sections.append(Section("FIRMWARE", [_choice("firmware", [NONE] + pins,
-                                                         firmware if firmware else NONE)], "firmware"))
-    if unit is not None and sensors and not any(s.kind == "sensor" for s in channel.sections):
-        channel.note = "no parameter knobs: the personality exposes none, or it did not load"
     return channel
 
 
 def _rebuild_unit(channel):
-    """After a PERSONALITY step: a parameters section per named personality
-    (at its defaults when the name changed), and a fresh (none) slot after
-    the last named one."""
+    """After a CLICK step: a fresh (none) slot after the last named click,
+    then the model's rebuild (a renamed click's rows at their defaults)."""
     declare = channel.declare()
     names = [f.value for f in declare.fields]
     if names and names[-1] != NONE:
         known = [o for o in declare.fields[-1].options if o != NONE]
         declare.fields.append(Field(_personality_knob(len(names)), [NONE] + known, 0))
-    old = {s.sensor_index: s for s in channel.sections if s.kind == "sensor"}
-    for section in list(old.values()):
-        channel.sections.remove(section)
-    note = None
-    at = channel.sections.index(declare) + 1
-    for i, personality in enumerate(names):
-        if personality == NONE:
-            continue
-        previous = old.get(i)
-        config = ({f.name: f.value for f in previous.fields}
-                  if previous is not None and previous.label.endswith(f"/{personality}") else {})
-        section = _params_section(channel.name, i, personality, config)
-        if section is None:
-            note = f"{personality} exposes no parameters"
-            continue
-        channel.sections.insert(at, section)
-        at += 1
-        if previous is None or not previous.label.endswith(f"/{personality}"):
-            note = f"parameter knobs of {personality}"
-    return note, False
+    for section in [s for s in channel.sections if s.kind == ROWS and s.role[0] == "click"]:
+        index = section.role[2]
+        if index >= len(names) or not section.label.endswith(f"/{names[index]}"):
+            channel.sections.remove(section)
+    return channel.model.rebuild()
 
 
 # ---------------------------
@@ -615,22 +655,25 @@ def load_model(sweep=None, path=None, buses=None, templates=None):
     ({port: Topology}) in place of the host's."""
     from nxs.suite import default_config_path
     from nxs.suite.schema import LinkSpec, load_suite_config
+    from nxs.tune_write import read_document
 
     path = path or default_config_path()
     # An absent or empty file is an empty declaration, as `generate` takes it.
     cfg = load_suite_config(path) if os.path.exists(path) and os.path.getsize(path) > 0 else _EmptyConfig()
+    doc = read_document(path)
+    model = Model(path, doc, getattr(cfg, "graph", None), [])
     if buses is None:
         buses = _platform_port_buses()
     if sweep is None:
         sweep = sweep_buses(buses, cfg) if buses else {}
     if templates is None:
         templates = _platform_ports() if buses else {}
-    channels: List[Channel] = []
+    channels = model.channels
     names = sorted(cfg.ports) + sorted(n for n in buses if n not in cfg.ports)
     for name in names:
         spec = cfg.ports.get(name)
         bus = (spec.bus if spec is not None and spec.bus else None) or buses.get(name)
-        family = _port_family(name, spec, templates.get(name), sweep.get(bus), cfg, bus=bus)
+        family = _port_family(model, name, spec, templates.get(name), sweep.get(bus), bus=bus)
         channels.append(family.port)
         channels.extend(family.links)
     # Units: the declared ones (a pod on a link and a unit on a bus alike),
@@ -649,42 +692,50 @@ def load_model(sweep=None, path=None, buses=None, templates=None):
             finding = sweep.get(spec.bus or buses.get(port_name))
             if finding and finding["hub"]:
                 link = finding["links"].get(letter)
-                word = "present" if link and link["pod"] else ("absent" if link and link["walked"] else "unknown")
+                word = "present" if link and link["pod"] else ("absent" if link and not link["unwalked"] else "unknown")
         else:
             for link in unit.links:
                 if link.transport == "i2c" and link.bus in sweep and sweep[link.bus]:
                     word = ("present" if any(a == link.address for a, *_ in sweep[link.bus]["units"])
                             else "absent")
-        channels.append(_unit_channel(unit.name, unit, presence_word=word, link_ref=link_ref))
+        channels.append(_unit_channel(model, unit.name, unit, presence_word=word, link_ref=link_ref))
     for bus in sorted(sweep):
         found = sweep[bus]
         if not found:
             continue
         for route, serial, click in found.get("routes", []):
             if bus == ROUTES and route.identity() not in declared_edges:
-                channels.append(_unit_channel(_unit_name(route), None, declared=False, presence_word="present",
-                                              template=(route, serial), running=_running(click)))
+                channels.append(_unit_channel(model, _unit_name(route), None, declared=False,
+                                              presence_word="present", template=(route, serial),
+                                              running=_running(click)))
         for letter, pod in swept_pods(found):
             if (found["port"], letter) in declared_pods:
                 continue
-            channels.append(_found_pod(found["port"], letter, bus, pod))
+            channels.append(_found_pod(model, found["port"], letter, bus, pod))
         for address, serial, click in found["units"]:
             route = LinkSpec(transport="i2c", bus=bus, address=address)
             if route.identity() in declared_edges or (bus, address) in riding_addresses:
                 continue
-            channels.append(_unit_channel(_unit_name(route), None, declared=False, presence_word="present",
-                                          template=(route, serial), running=_running(click)))
+            channels.append(_unit_channel(model, _unit_name(route), None, declared=False,
+                                          presence_word="present", template=(route, serial),
+                                          running=_running(click)))
+    model.rebuild()
+    for channel in channels:
+        if channel.kind == "unit" and channel.declared and channel.unit_spec is not None \
+                and channel.unit_spec.sensors and not any(
+                    s.kind == ROWS and s.role[0] == "click" for s in channel.sections):
+            channel.note = "no parameter knobs: the personality exposes none, or it did not load"
     return path, cfg, channels
 
 
-def _found_pod(port, letter, bus, pod) -> Channel:
+def _found_pod(model, port, letter, bus, pod) -> Channel:
     """The channel of a pod that answered on `port`'s link `letter`
     undeclared: named as `generate` names it, routed through the link, the
     click personality it runs offered first."""
     from nxs.suite.schema import LinkSpec
 
     route = LinkSpec(transport="i2c", bus=bus, address=pod["addr"], link_ref=f"{port}/{letter}")
-    return _unit_channel(_pod_name(port, letter), None, declared=False, presence_word="present",
+    return _unit_channel(model, _pod_name(port, letter), None, declared=False, presence_word="present",
                          template=(route, pod["serial"]), link_ref=f"{port}/{letter}",
                          running=_running(pod["click"]))
 

@@ -18,8 +18,9 @@ from .jetson_overlay import PORTS
 
 #: Vendor trees end -nv or -nv-super; the suffix-less and kernel_ files beside them share the compatible.
 _VENDOR_DTB = re.compile(r"^(?!kernel_).*-nv(-super)?\.dtb$")
-#: How the camera package names a port's GMSL overlay, after the port name.
-GMSL_OVERLAY_SUFFIX = "-gmsl-overlay.dtbo"
+#: The GMSL companion overlay's suffix, a file the package does not ship: a label naming one
+#: drops it, since a hub port boots from its universal overlay alone.
+RETIRED_OVERLAY_SUFFIX = "-gmsl-overlay.dtbo"
 #: How the camera package names the carrier's camera I2C mux overlay, which
 #: boots the camera connectors' buses.
 MUX_OVERLAY_SUFFIX = "general-mux-ch-overlay.dtbo"
@@ -216,19 +217,11 @@ def with_label(text: str, label: str, overlays: List[str], select: bool,
     return "\n".join(out).rstrip("\n") + "\n"
 
 
-def companion_overlays(port: str, boot_dir: Path) -> Dict[str, str]:
-    """The camera package's overlays a port's boot label needs beside the
-    generated one: the carrier's mux overlay (first) and the port's GMSL overlay
-    (after the port's own). An absent file is an absent key."""
-    found: Dict[str, str] = {}
-    if not boot_dir.is_dir():
-        return found
-    for path in sorted(boot_dir.glob("*.dtbo")):
-        if path.name.endswith(MUX_OVERLAY_SUFFIX):
-            found.setdefault("mux", str(path))
-        elif path.name.endswith(f"{port}{GMSL_OVERLAY_SUFFIX}"):
-            found.setdefault("gmsl", str(path))
-    return found
+def companion_overlays(boot_dir: Path) -> Dict[str, str]:
+    """The camera package's overlay a boot label needs beside the generated
+    ones: the carrier's mux overlay, first. An absent file is an absent key."""
+    mux = mux_overlay(boot_dir)
+    return {"mux": mux} if mux else {}
 
 
 def mux_overlay(boot_dir: Path) -> Optional[str]:
@@ -238,28 +231,19 @@ def mux_overlay(boot_dir: Path) -> Optional[str]:
     return str(found[0]) if found else None
 
 
-def with_companions(order: List[str], port: str,
-                    companions: Dict[str, str]) -> List[str]:
-    """The label's overlays with the package's companions in place: the mux
-    overlay first, the port's GMSL overlay after the port's last overlay. One
-    the list already carries stays where it is."""
-    have = {Path(o).name for o in order}
+def with_companions(order: List[str], companions: Dict[str, str]) -> List[str]:
+    """The label's overlays with the package's mux overlay first; one the
+    list already carries stays where it is."""
     mux = companions.get("mux")
-    if mux and Path(mux).name not in have:
+    if mux and Path(mux).name not in {Path(o).name for o in order}:
         order = [mux] + order
-    gmsl = companions.get("gmsl")
-    if gmsl and Path(gmsl).name not in have:
-        mine = [i for i, o in enumerate(order) if f"-{port}-" in Path(o).name]
-        at = (mine[-1] + 1) if mine else len(order)
-        order = order[:at] + [gmsl] + order[at:]
     return order
 
 
 def overlay_port(entry: str) -> Optional[str]:
     """The carrier port a label entry is an overlay of, by the port's name in
-    the file name (the generated `…universal-cam0-2lane-overlay.dtbo`, the
-    package's `…_cam0-gmsl-overlay.dtbo`); None for the mux overlay and any
-    other."""
+    the file name (the generated `…universal-cam0-2lane-overlay.dtbo`); None
+    for the mux overlay and any other."""
     name = Path(entry).name
     return next((port for port in PORTS if re.search(rf"[-_]{re.escape(port)}-", name)), None)
 
@@ -281,16 +265,16 @@ def label_overlay_order(current: List[str], port: str, names: List[str], boot_di
                         declared: Optional[Collection[str]] = None) -> List[str]:
     """The boot label's OVERLAYS with this port's overlays replaced in place by
     the newly compiled ones under ``boot_dir``, the overlays of a port outside
-    ``declared`` left out (`undeclared_overlays`) and everything else kept in
-    order (a port's GMSL overlay must follow its universal ones).
-    ``companions`` fills in the package's."""
+    ``declared`` left out (`undeclared_overlays`), a retired companion left
+    out, and everything else kept in order. ``companions`` fills in the
+    package's."""
     fresh = {n: str(boot_dir / n) for n in names}
     undeclared = undeclared_overlays(current, port, declared)
     out: List[str] = []
     slot = None
     for entry in current:
         name = Path(entry).name
-        if entry in undeclared:
+        if entry in undeclared or name.endswith(RETIRED_OVERLAY_SUFFIX):
             continue
         if f"-{port}-" not in name:
             out.append(entry)
@@ -303,4 +287,4 @@ def label_overlay_order(current: List[str], port: str, names: List[str], boot_di
         out.extend(leftovers)
     else:
         out[slot:slot] = leftovers
-    return with_companions(out, port, companions or {})
+    return with_companions(out, companions or {})

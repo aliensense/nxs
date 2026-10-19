@@ -2,7 +2,9 @@
 ros2` process per unit (one suite-mode process without a manifest); `viz:=true`
 adds RViz2 and a static TF per unit; `cameras:=true` adds one capture node per
 camera link the ports' records carry, publishing `/<topic_base>/<port>/<link>/
-image_raw` and `camera_info`. Usage: ros2 launch "$(nxs ros2 --launch-file)"."""
+image_raw` and `camera_info`. On a host whose `nxsd` serves the units, the
+launch starts no bridge, and no camera node while the daemon runs its own.
+Usage: ros2 launch "$(nxs ros2 --launch-file)"."""
 
 import os
 import sys
@@ -20,7 +22,7 @@ except ImportError:
 from nxs.stamp_modes import STAMP_MODES, STAMP_SYNCED
 
 from launch import LaunchDescription
-from launch.actions import (DeclareLaunchArgument, ExecuteProcess, TimerAction,
+from launch.actions import (DeclareLaunchArgument, ExecuteProcess, LogInfo, TimerAction,
                             OpaqueFunction, RegisterEventHandler)
 from launch.event_handlers import OnProcessIO
 from launch.substitutions import LaunchConfiguration
@@ -42,6 +44,26 @@ def _manifest_units():
                 for u in cfg.units]
     except Exception:
         return []
+
+
+def _nxsd_data_plane():
+    """The unit bridge a running nxsd serves on this host (`nxs.daemon.data_plane`),
+    None without one: the launch then runs the bridges itself."""
+    try:
+        from nxs.daemon import data_plane
+        return data_plane()
+    except Exception:
+        return None
+
+
+def _nxsd_camera_plane():
+    """The camera nodes a running nxsd runs on this host (`nxs.daemon.camera_plane`),
+    None without them: the launch then runs the camera nodes itself."""
+    try:
+        from nxs.daemon import camera_plane
+        return camera_plane()
+    except Exception:
+        return None
 
 
 def _viz_actions(context):
@@ -99,6 +121,12 @@ def _camera_actions(context):
     container."""
     if LaunchConfiguration("cameras").perform(context).lower() not in ("true", "1"):
         return []
+    plane = _nxsd_camera_plane()
+    if plane is not None:
+        # The daemon serves every camera link that comes up, so the launch
+        # adds no node, a link it brings up later included.
+        return [LogInfo(msg=f"nxsd (pid {plane['pid']}) serves the camera links; "
+                            "cameras:=true adds nothing")]
     from nxs.ros2_cameras import (CAMERA_SOURCES, CAMERA_STAGGER_S, argus_node, camera_plan,
                                   gscam_node, port_openers)
     topic_base = LaunchConfiguration("topic_base").perform(context)
@@ -136,7 +164,11 @@ def generate_launch_description():
     topic_base = LaunchConfiguration("topic_base")
 
     units = _manifest_units()
-    if units:
+    plane = _nxsd_data_plane()
+    if plane is not None:
+        bridges = [LogInfo(msg=f"nxsd (pid {plane['pid']}) serves the units; "
+                               "the launch starts no bridge")]
+    elif units:
         bridges = [ExecuteProcess(
             cmd=["nxs", "--unit", name, "ros2",
                  "--stamp", stamp, "--topic-base", topic_base],

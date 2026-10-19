@@ -12,9 +12,10 @@ from nxs._generated_constants import CyphalDefaults, NxsDevices
 from nxs.suite.schema import SuiteConfig, LinkSpec, stable_path
 from nxs import transports
 
-# The register-map address, plus NXS+1: the alias convention for a second
-# unit presented on the same host bus by a SerDes/mux.
-I2C_ADDRESSES = (NxsDevices.RBDevice.NXS, NxsDevices.RBDevice.NXS + 1)
+# The register-map address every unit straps, and the aliases a hub's serializers present pods
+# at on the host bus: 0x32 and 0x34, each with its camera map one above it.
+I2C_ADDRESSES = (NxsDevices.RBDevice.NXS, NxsDevices.RBDevice.NXS + 2,
+                 NxsDevices.RBDevice.NXS + 4)
 
 
 @dataclass
@@ -33,10 +34,12 @@ def _suggest_name(link: LinkSpec) -> str:
     return f"unit-{os.path.basename(link.port)}"
 
 
-def _inspect(transport, link: LinkSpec) -> Optional[Found]:
+def _inspect(transport, link: LinkSpec, answers=None) -> Optional[Found]:
+    """What answered on `link`, `answers(transport)` deciding presence (one
+    probe by default); None when nothing did."""
     try:
         try:
-            alive = transport.probe()
+            alive = answers(transport) if answers is not None else transport.probe()
         except Exception:
             return None
         if not alive:
@@ -97,8 +100,12 @@ def _i2c_buses() -> List[str]:
 
 def scan_bus_units(bus: str, addresses=I2C_ADDRESSES,
                    opener=None) -> List[Found]:
-    """The units answering on one I2C bus at the given addresses. The
-    opener defaults to the one `nxs.transports` holds at the call."""
+    """The units answering on one I2C bus at the given addresses, each asked
+    as the unit door's probe asks (`nxs._libnxs_map.unit_answers`): a pod's
+    probe can land inside its own transfer and NAK once. The opener
+    defaults to the one `nxs.transports` holds at the call."""
+    from nxs._libnxs_map import unit_answers
+
     opener = opener or transports.open_client
     found = []
     for address in addresses:
@@ -110,7 +117,7 @@ def scan_bus_units(bus: str, addresses=I2C_ADDRESSES,
             # the reason, since it reads like "no board here" otherwise.
             print(f"scan: {bus}: {e}", file=sys.stderr)
             break
-        hit = _inspect(transport, link)
+        hit = _inspect(transport, link, unit_answers)
         if hit:
             found.append(hit)
     return found

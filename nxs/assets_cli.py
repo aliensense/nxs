@@ -20,6 +20,8 @@ from nxs.host import root
 from nxs.suite import PERSONALITY_DIR
 
 ASSETS_ROOT = os.path.dirname(PERSONALITY_DIR)
+#: The directory under ASSETS_ROOT the release's pod firmware lands in.
+FIRMWARE_SUBDIR = "firmware"
 RELEASE_URL = "https://github.com/aliensense/nxs/releases/download/{tag}/nxs-assets-{version}.tar.gz"
 _VERSION = re.compile(r"^(\d+\.\d+\.\d+)(?:rc(\d+))?$")
 LICENSE_MEMBER = "LICENSE"
@@ -129,10 +131,15 @@ def install(path: str, *, accept_license: bool = False, log=print) -> int:
                   file=sys.stderr)
             return 1
         text = _license_text(tar)
+        firmware = any(m.name.split("/", 1)[0] == FIRMWARE_SUBDIR for m in tar.getmembers())
         marker = os.path.join(ASSETS_ROOT, ".license-accepted")
         if text and not os.path.exists(marker) and not _accepted(text, accept_license):
             return 1
     root.run(["install", "-d", "-m", "755", ASSETS_ROOT])
+    if firmware:
+        # The pod firmware is the release's alone: an image an earlier
+        # release left would meet the switch's search for the pin.
+        root.run(["rm", "-rf", os.path.join(ASSETS_ROOT, FIRMWARE_SUBDIR)])
     # Root's own, whatever owner the archive names: tar keeps the archive's
     # owners when it runs as root, and a directory an earlier install left
     # under another owner keeps it through an extraction.
@@ -145,8 +152,8 @@ def install(path: str, *, accept_license: bool = False, log=print) -> int:
 
 
 def release_tag(version: str) -> str:
-    """The tag a tool version was cut from: 1.1.0 is v1.1.0, 1.1.0rc1 is
-    v1.1.0-rc1; ValueError for anything else."""
+    """The tag a tool version was cut from: X.Y.Z is vX.Y.Z, X.Y.ZrcN is
+    vX.Y.Z-rcN; ValueError for anything else."""
     m = _VERSION.match(version)
     if m is None:
         raise ValueError(f"not a release version: {version}")

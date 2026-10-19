@@ -9,10 +9,14 @@ from typing import List, Optional, Tuple
 
 from nxs.compiler import (CompiledDriver, CompileError, ParamDescriptor,
                           PatchEntry, field_width, resolve_field_offsets)
-from nxs._generated_constants import NxsDriverImage
-from nxs.opcodes import Op, INSTRUCTION_SIZE, OPCODE_SINCE_MINOR
+from nxs.dsl.compiled import HOST_KINDS
+from nxs.dsl.fields import FIELD_TYPES
+from nxs._generated_constants import NxsMap, NxsDriverImage
+from nxs.opcodes import Op, INSTRUCTION_SIZE
 
 _ParamKind = NxsDriverImage.ParamKind
+#: A parameter's kind by the name the DSL gives it: `ParamKind` in lower case.
+_PARAM_KINDS = {name.lower(): number for number, name in _ParamKind._NAMES.items()}
 _BusKind = NxsDriverImage.BusKind
 ImageKind = NxsDriverImage.ImageKind
 TrailerRecord = NxsDriverImage.TrailerRecord
@@ -20,14 +24,16 @@ TrailerRecord = NxsDriverImage.TrailerRecord
 NXS_MAGIC = b"NXS\x00"
 NXS_MAJOR = NxsDriverImage.NXS_MAJOR
 NXS_MINOR = NxsDriverImage.NXS_MINOR
+NXS_MINOR_FIRST = NxsDriverImage.NXS_MINOR_FIRST
 
-# Header: magic, major, required minor, kind, flags, name_len, num_params,
+# Header: magic, major, format minor, kind, flags, name_len, num_params,
 # num_outputs, probe_len (bytes of the probe program, the offset where
 # configure begins).
 _HEADER = struct.Struct("<4sBBBBBBBH")
 HEADER_SIZE = _HEADER.size
-# The v1.0 layout's header, recognised only to name the rebuild command.
-_FORMAT1_HEADER_SIZE = 9
+#: The 9-byte header of a format 1.0 image (`NXS_MAJOR` below `NXS_MINOR_FIRST`), with no kind,
+#: flags or probe length: refused as another major's, read only to name the rebuild.
+V1_0_HEADER_SIZE = 9
 
 IMAGE_FLAG_SEALED = NxsDriverImage.IMAGE_FLAG_SEALED
 IMAGE_FLAG_AUTO = NxsDriverImage.IMAGE_FLAG_AUTO
@@ -35,11 +41,9 @@ SEAL_NONCE_SIZE = NxsDriverImage.SEAL_NONCE_SIZE
 MAX_TRAILER_SIZE = NxsDriverImage.MAX_TRAILER_SIZE
 _TRAILER_RECORD_HEADER = struct.Struct("<BH")
 
-IMAGE_KIND_NAMES = {ImageKind.DRIVER: 'click', ImageKind.CAMERA: 'cam',
-                    ImageKind.HUB: 'hub'}
-#: The NXS minor that introduced a kind; an image of that kind never asks
-#: for less, whatever its opcodes need.
-IMAGE_KIND_SINCE_MINOR = {ImageKind.HUB: 3}
+IMAGE_KIND_NAMES = {ImageKind.CLICK: 'click', ImageKind.CAMERA: 'cam',
+                    ImageKind.HUB: 'hub', ImageKind.MODULE: 'module',
+                    ImageKind.GRAPH: 'graph', ImageKind.HOST: 'host'}
 
 # The hint every format refusal carries; a caller that knows the
 # personality substitutes its name.
@@ -47,12 +51,8 @@ REBUILD_HINT = "rebuild it: nxs upload <name>"
 
 # Field type codes; firmware stores and forwards them verbatim, so every decoder
 # must map through FIELD_TYPE_NAMES.
-_FIELD_TYPE_MAP = {
-    'int8': 0, 'uint8': 1, 'int16': 2, 'uint16': 3,
-    'int32': 4, 'uint32': 5, 'float32': 6, 'float64': 7,
-    'string': 8,
-}
-FIELD_TYPE_NAMES = {v: k for k, v in _FIELD_TYPE_MAP.items()}
+_FIELD_TYPE_MAP = {name: code for code, name in enumerate(FIELD_TYPES)}
+FIELD_TYPE_NAMES = dict(enumerate(FIELD_TYPES))
 
 # Bus-kind encoding for the optional bus_config trailer.
 BUS_KIND_I2C  = _BusKind.I2C
@@ -86,6 +86,14 @@ _BYTE_ORDER_TO_INT = {'big': 0, 'little': 1}
 _BYTE_ORDER_NAMES = {v: k for k, v in _BYTE_ORDER_TO_INT.items()}
 
 
+def _u32(value, what: str) -> int:
+    """`value` as an unsigned 32-bit cell, CompileError past one."""
+    v = int(value)
+    if not 0 <= v <= 0xFFFFFFFF:
+        raise CompileError(f"{what} {v} does not fit the image's unsigned 32-bit cell")
+    return v
+
+
 def _code_name(names: dict, code: int, what: str) -> str:
     """Map a wire switch code to its name, failing on an unknown value so a
     corrupt image can't silently decode to a default the firmware rejects."""
@@ -102,20 +110,28 @@ def _code_int(mapping: dict, name: str, what: str) -> int:
     return mapping[name]
 
 
-def _required_minor(bytecode: bytes) -> int:
-    """Minimum NXS minor an image needs: the max `since_minor` over its opcodes.
-    Walks instruction by instruction (MEMCPY_IMM is variable-length)."""
-    required = 0
-    pc = 0
-    n = len(bytecode)
-    while pc < n:
-        op = bytecode[pc]
-        required = max(required, OPCODE_SINCE_MINOR.get(op, 0))
-        size = INSTRUCTION_SIZE.get(op, 1) or 1
-        if op == Op.MEMCPY_IMM and pc + 3 <= n:
-            size = 3 + bytecode[pc + 2]
-        pc += size
-    return required
+#: Characters a name keeps on the unit: its 16-byte field holds the NUL
+#: (the firmware's `MAX_PARAM_NAME` and `MAX_DRIVER_NAME`).
+NAME_CHARS_MAX = 15
+#: Characters an output field's unit keeps: its row's `UNIT` field in the
+#: OUTPUTS record, which the map serves.
+UNIT_CHARS_MAX = NxsMap.ROW_UNIT_LEN
+#: Characters a parameter's unit keeps: its row's `UNIT` field, which both
+#: maps serve.
+PARAM_UNIT_CHARS_MAX = NxsMap.ROW_UNIT_LEN
+
+
+def _text(value: str, limit: int, what: str) -> bytes:
+    """`value` as ASCII, refused past `limit` characters: the unit keeps no
+    more, and a name it clamped would match nothing by name."""
+    try:
+        raw = str(value).encode("ascii")
+    except UnicodeEncodeError:
+        raise CompileError(f"{what} {value!r} is not ASCII") from None
+    if len(raw) > limit:
+        raise CompileError(f"{what} {value!r} takes at most {limit} characters, "
+                           f"the unit keeps no more")
+    return raw
 
 
 def serialize(compiled: CompiledDriver) -> bytes:
@@ -127,9 +143,9 @@ def serialize(compiled: CompiledDriver) -> bytes:
         raise CompileError(
             f"{compiled.name}: {len(compiled.params)} params exceeds the "
             f"{MAX_PARAMS}-param image limit")
-    # A hub image runs on the host executor and takes its program budget;
-    # a pod's slot holds the rest.
-    host = compiled.kind == ImageKind.HUB
+    # A hub or graph image runs on the host executor and takes its program
+    # budget; a pod's slot holds the rest.
+    host = compiled.kind in HOST_KINDS
     program_cap = VM_HOST_PROGRAM_SIZE if host else VM_MAX_PROGRAM_SIZE
     if len(compiled.bytecode) > program_cap:
         raise CompileError(
@@ -139,24 +155,16 @@ def serialize(compiled: CompiledDriver) -> bytes:
         raise ValueError(f"{compiled.name}: unknown image kind {compiled.kind!r}")
 
     buf = bytearray()
-    name_bytes = compiled.name.encode('ascii')
+    name_bytes = _text(compiled.name, NAME_CHARS_MAX, "the personality name")
 
-    # A sealed section cannot be walked for its opcodes, so its required
-    # minor is the one carried in from the read.
-    if compiled.sealed:
-        if compiled.required_minor is None:
-            raise ValueError(
-                f"{compiled.name}: a sealed image needs its required minor")
-        if len(compiled.seal_nonce) != SEAL_NONCE_SIZE:
-            raise ValueError(
-                f"{compiled.name}: a sealed image carries a "
-                f"{SEAL_NONCE_SIZE}-byte nonce, got {len(compiled.seal_nonce)}")
-        required_minor = int(compiled.required_minor)
-    else:
-        # A reader older than the kind itself must refuse the image as
-        # NEEDS_NEWER_MINOR rather than meet an unknown kind past the gate.
-        required_minor = max(_required_minor(compiled.bytecode),
-                             IMAGE_KIND_SINCE_MINOR.get(compiled.kind, 0))
+    # The header's minor is the format minor of the wheel that built the
+    # image; an image read back keeps the one it carries.
+    required_minor = (NXS_MINOR if compiled.required_minor is None
+                      else int(compiled.required_minor))
+    if compiled.sealed and len(compiled.seal_nonce) != SEAL_NONCE_SIZE:
+        raise ValueError(
+            f"{compiled.name}: a sealed image carries a "
+            f"{SEAL_NONCE_SIZE}-byte nonce, got {len(compiled.seal_nonce)}")
 
     probe_len = int(compiled.probe_len)
     if not 0 <= probe_len <= len(compiled.bytecode):
@@ -216,6 +224,32 @@ def serialize(compiled: CompiledDriver) -> bytes:
             f"{len(buf) - len(compiled.bytecode)} B header/metadata)")
 
     return bytes(buf)
+
+
+def compose_graph(hub_asset: bytes, records, name: str) -> bytes:
+    """A graph image named `name`: the hub asset's program under the kind
+    GRAPH, its section as the asset stores it (a sealed one's nonce and
+    ciphertext byte for byte), its parameters and its bus profile, and a
+    trailer of the program's IDENTITY head, the GRAPH `records` and the
+    program's HUB_PHASES. Nothing is sealed here, so a released hub program
+    stays sealed under the release key. CompileError names a refusal: an
+    asset that is no hub image, or records the program cannot run
+    (`records_graph.graph_trailer`)."""
+    from nxs.personality.records_fields import RecordError
+    from nxs.personality.records_graph import graph_trailer
+
+    program = deserialize(hub_asset)
+    if program.kind != ImageKind.HUB:
+        raise CompileError(f"{name}: a graph composes against a hub image, and {program.name} "
+                           f"is a {IMAGE_KIND_NAMES[program.kind]} image")
+    try:
+        trailer = graph_trailer(program, records, name)
+    except RecordError as exc:
+        raise CompileError(str(exc)) from None
+    program.kind = ImageKind.GRAPH
+    program.name = name
+    program.trailer = trailer
+    return serialize(program)
 
 
 def trailer_bytes(records, name: str = "image") -> bytes:
@@ -287,26 +321,26 @@ def parse_trailer(data: bytes) -> List[Tuple[int, bytes]]:
 
 def format_refusal(major: int, minor: int) -> Optional[str]:
     """The one-line reason this tool refuses an image of format
-    `major.minor`, or None when it reads that format."""
-    if major == NXS_MAJOR and minor <= NXS_MINOR:
+    `major.minor`, or None when it reads that format: its own major, from
+    its first minor (`NXS_MINOR_FIRST`) to its own."""
+    if major == NXS_MAJOR and NXS_MINOR_FIRST <= minor <= NXS_MINOR:
         return None
-    layout = " (the v1.0 image layout)" if major < NXS_MAJOR else ""
+    layout = (f" (the v{major}.{minor} image layout)"
+              if major == NXS_MAJOR and minor < NXS_MINOR_FIRST else "")
     return (f"image format {major}.{minor}{layout}, this tool builds "
             f"{NXS_MAJOR}.{NXS_MINOR} — {REBUILD_HINT}")
 
 
 def peek_format(data: bytes) -> tuple:
-    """`(major, minor, kind, flags)` from an NXS header. A v1.0 header (major
-    below this tool's) answers kind DRIVER and no flags, the only values that
-    layout could carry; a truncated artifact is rejected here."""
-    if len(data) < _FORMAT1_HEADER_SIZE or data[:4] != NXS_MAGIC:
+    """`(major, minor, kind, flags)` from an NXS header. A v1.0 header
+    answers kind CLICK and no flags, the only values that layout could
+    carry; a truncated artifact is rejected here."""
+    if (len(data) >= V1_0_HEADER_SIZE and data[:4] == NXS_MAGIC
+            and data[4] == NXS_MAJOR and data[5] < NXS_MINOR_FIRST):
+        return data[4], data[5], ImageKind.CLICK, 0
+    if len(data) < HEADER_SIZE or data[:4] != NXS_MAGIC:
         raise ValueError(f"Not an NXS image header: {data[:HEADER_SIZE]!r}")
-    major, minor = data[4], data[5]
-    if major < NXS_MAJOR:
-        return major, minor, ImageKind.DRIVER, 0
-    if len(data) < HEADER_SIZE:
-        raise ValueError(f"Not an NXS image header: {data[:HEADER_SIZE]!r}")
-    return major, minor, data[6], data[7]
+    return data[4], data[5], data[6], data[7]
 
 
 def deserialize(data: bytes) -> CompiledDriver:
@@ -325,17 +359,18 @@ def _deserialize(data: bytes) -> CompiledDriver:
     # Header
     if data[:4] != NXS_MAGIC:
         raise ValueError(f"Bad magic: {data[:4]!r}")
+    # The v1.0 layout shares this major and has a header of its own.
+    if len(data) >= 6 and data[4] == NXS_MAJOR and data[5] < NXS_MINOR_FIRST:
+        raise ValueError(format_refusal(data[4], data[5]))
     if len(data) < HEADER_SIZE:
         raise ValueError("image header truncated")
     (_magic, major, minor, kind, flags, name_len, num_params,
      num_outputs, probe_len) = _HEADER.unpack_from(data, pos)
     pos += HEADER_SIZE
-    # Major gates the wire layout. Minor is the image's required firmware minor,
-    # enforced at load by the firmware, so any same-major image is inspectable.
+    # Major gates the wire layout. Minor, the building wheel's format minor, gates the load on the
+    # firmware alone, so any same-major image is inspectable.
     if major != NXS_MAJOR:
-        refusal = format_refusal(major, minor)
-        raise ValueError(refusal if major < NXS_MAJOR
-                         else f"Unsupported major version: {major}")
+        raise ValueError(format_refusal(major, minor))
     if kind not in IMAGE_KIND_NAMES:
         raise ValueError(f"image declares unknown kind {kind}")
     if num_outputs > MAX_OUTPUTS:
@@ -429,7 +464,7 @@ def _read_trailer(data: bytes, pos: int):
 def _write_param(buf: bytearray, param: ParamDescriptor,
                  patch_map: List[PatchEntry]):
     """Write a parameter descriptor."""
-    name_bytes = param.name.encode('ascii')
+    name_bytes = _text(param.name, NAME_CHARS_MAX, "parameter")
     buf += struct.pack("<B", len(name_bytes))
     buf += name_bytes
 
@@ -440,13 +475,13 @@ def _write_param(buf: bytearray, param: ParamDescriptor,
     else:
         raise ValueError(f"unknown param_type: {param.param_type!r}")
     buf += struct.pack("<B", param_type)
-    kind = _ParamKind.LIVE if param.kind == "live" else _ParamKind.RELOAD
+    kind = _PARAM_KINDS.get(param.kind, _ParamKind.RUN)
     buf += struct.pack("<B", kind)
     buf += struct.pack("<II", int(param.default), int(param.current))
 
     # This param's patch sites, ordered by offset for a deterministic wire
-    # layout. Live params carry no patch: the value lives in current_value.
-    sites = ([] if param.kind == "live"
+    # layout. Apply params carry no patch: the value lives in current_value.
+    sites = ([] if param.kind == "apply"
              else sorted((p for p in patch_map if p.param_name == param.name),
                          key=lambda p: p.offset))
     if len(sites) > MAX_PATCH_SITES:
@@ -488,7 +523,7 @@ def _write_param(buf: bytearray, param: ParamDescriptor,
         buf += struct.pack("<HB", patch.offset, patch.size)
 
     # Enum params carry their allowed set; range params carry [min, max].
-    # Only enum reload params additionally carry per-value patch bytes.
+    # Only enum run params additionally carry per-value patch bytes.
     if param.param_type in ("enum", "range"):
         if len(param.values) > MAX_PARAM_VALUES:
             raise CompileError(
@@ -496,20 +531,20 @@ def _write_param(buf: bytearray, param: ParamDescriptor,
                 f"the {MAX_PARAM_VALUES}-value image limit")
         buf += struct.pack("<B", len(param.values))
         for v in param.values:
-            buf += struct.pack("<I", int(v))
+            buf += struct.pack("<I", _u32(v, f"param {param.name!r} value"))
         # Per-value patch bytes, site-major: all values for site 0, then site 1.
         if param.param_type == "enum":
             for patch in sites:
                 for v in param.values:
                     pv = patch.value_map.get(v, 0)
                     if patch.size == 4:
-                        buf += struct.pack("<I", int(pv))
+                        buf += struct.pack("<I", _u32(pv, f"param {param.name!r} patch value"))
                     elif patch.size == 2:
                         buf += struct.pack("<H", int(pv) & 0xFFFF)
                     else:
                         buf += struct.pack("<B", int(pv) & 0xFF)
 
-    unit_bytes = param.unit.encode('ascii')
+    unit_bytes = _text(param.unit, PARAM_UNIT_CHARS_MAX, f"parameter {param.name}'s unit")
     buf += struct.pack("<B", len(unit_bytes))
     buf += unit_bytes
 
@@ -524,9 +559,9 @@ def _read_param(data: bytes, pos: int):
         raise ValueError(f"invalid param type: {param_type_byte}")
     param_type = "enum" if param_type_byte == 0 else "range"
     kind_byte = data[pos]; pos += 1
-    if kind_byte > _ParamKind.LIVE:
+    if kind_byte > _ParamKind.TRIGGER:
         raise ValueError(f"invalid param kind: {kind_byte}")
-    kind = "live" if kind_byte == _ParamKind.LIVE else "reload"
+    kind = _ParamKind._NAMES[kind_byte].lower()
 
     default_val, current_val = struct.unpack_from("<II", data, pos); pos += 8
     num_sites = data[pos]; pos += 1
@@ -555,7 +590,7 @@ def _read_param(data: bytes, pos: int):
         for _ in range(num_values):
             v = struct.unpack_from("<I", data, pos)[0]; pos += 4
             values.append(v)
-        # Patch bytes: enum reload params only; site-major, width per site.
+        # Patch bytes: enum run params only; site-major, width per site.
         if param_type == "enum":
             for si in range(num_sites):
                 for v in values:
@@ -590,7 +625,7 @@ def _write_output_field(buf: bytearray, field: dict, param_index=None):
     """Write an output field descriptor. After scale/offset comes a
     `scale_param_index` byte (0xFF = none), then `byte_off`; string fields
     carry a trailing `<H` count so the deserializer recovers `sample_size`."""
-    name_bytes = field['name'].encode('ascii')
+    name_bytes = _text(field['name'], NAME_CHARS_MAX, "output field")
     buf += struct.pack("<B", len(name_bytes))
     buf += name_bytes
 
@@ -599,7 +634,7 @@ def _write_output_field(buf: bytearray, field: dict, param_index=None):
     buf += struct.pack("<BBB", ftype, byte_order,
                        int(field.get('semantic', 0)))
 
-    unit_bytes = field.get('unit', '').encode('ascii')
+    unit_bytes = _text(field.get('unit', ''), UNIT_CHARS_MAX, f"output field {field['name']}'s unit")
     buf += struct.pack("<B", len(unit_bytes))
     buf += unit_bytes
 

@@ -3,18 +3,31 @@
 from __future__ import annotations
 
 import struct
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
+from nxs._generated_constants import NxsMap
 from nxs.cam.descriptors import Descriptor
 from nxs.personality.records_fields import (
-    FAMILY_IDS, PIXEL_PHASES, RecordError, _CAPTURE_ENTRY, _CAPTURE_ENTRY_V1,
-    _CAPTURE_FLAG_CLOCK_NONCONTINUOUS, _CAPTURE_HEAD, _CHROMACITIES, _CONTROL_REGISTERS, _DELTA_SCALAR,
-    _DELTA_TABLE, _LAWS_HEAD, _LAW_FIELDS, _NONE_U8, _PROGRAM_ADBIT,
-    _PROGRAM_ADBIT_CODE, _PROGRAM_BLKLEVEL, _PROGRAM_BLKLEVEL_VALUE,
+    ACTION_PARAM, EXPOSURE_PARAM, FAMILY_IDS, FRAME_LENGTH_PARAM, FRAME_PERIOD_PARAM, GAIN_PARAM,
+    LINE_TIME_PARAM, MODE_PARAM, PIXEL_PHASES, RecordError, TRIGGER_PARAM, _CAPTURE_ENTRY,
+    _CAPTURE_ENTRY_V1, _CAPTURE_FLAG_CLOCK_NONCONTINUOUS, _CAPTURE_HEAD, _CHROMACITIES,
+    _CONTROL_REGISTERS, _DELTA_SCALAR, _DELTA_TABLE, _CAMERA_MAP_HEAD, _CAMERA_MAP_LAW,
+    _CAMERA_MAP_LAW_MODE, _CAMERA_MAP_MODE, _CAMERA_MAP_PARAMS, _CAMERA_MAP_PARAM_NAMES,
+    _CHART_REG_LISTS, _LAWS_HEAD, _LAW_FIELDS, _NONE_U8,
+    _PROGRAM_ADBIT, _PROGRAM_ADBIT_CODE, _PROGRAM_BLKLEVEL, _PROGRAM_BLKLEVEL_VALUE,
     _PROGRAM_FLAGS, _PROGRAM_HEAD, _PROGRAM_REPAIR, _PROGRAM_TAIL,
     _SYNC_ROLES, _TEST_PATTERN_SELECT, _TRIGGER_SLOTS, _VINT_BITS,
     _family_name, _fixed, _number, _read_table, _register, _register_spec,
-    _table, _u, _unpack)
+    _table, _u, _unit_modes, _unpack)
+from nxs.personality.records_params import camera_rows, encode_presentation_rows, encode_rows
+from nxs.personality.records_sensor import _param_index, _param_values, trigger_values
+
+#: The run values a pod's apply writes; a program that stages one stages
+#: the others, with the action and the line time beside them.
+_APPLY_VALUES = (EXPOSURE_PARAM, FRAME_LENGTH_PARAM, GAIN_PARAM)
+#: The pixel streams the camera map's mode table carries, its `DATA_TYPE`
+#: the RAW sample depth (Interface Description §13.3).
+_CAMERA_MAP_DATA_TYPES = ("RAW10", "RAW12")
 
 
 def _encode_laws(descriptor: Descriptor) -> bytes:
@@ -22,13 +35,25 @@ def _encode_laws(descriptor: Descriptor) -> bytes:
     if family not in FAMILY_IDS:
         raise RecordError(f"{descriptor.name}: unknown chip family {family!r}; "
                           f"have {sorted(FAMILY_IDS)}")
+    if family == "native":
+        # A native head's limits are the camera map's physical bounds and
+        # ride the CAMERA_MAP record; the LAWS record names the family alone.
+        return _LAWS_HEAD.pack(FAMILY_IDS[family], 0)
     limits = descriptor.limits
     present = 0
     body = bytearray()
     waits = list((limits.get("captured_waits") or {}).items())
+    names = [k for k, _ in waits]
+    # A mode's own waits ride the LAWS record by the mode's index, so an
+    # older tool's MODES decoder never meets them.
+    mode_waits = []
+    for index, name in enumerate(_unit_modes(descriptor)):
+        own = (descriptor.modes[name].get("timing") or {}).get("waits")
+        if isinstance(own, dict):
+            mode_waits.append((index, own))
     for bit, (key, fmt) in enumerate(_LAW_FIELDS):
-        value = limits.get(key)
-        if value is None:
+        value = mode_waits if key == "mode_waits" else limits.get(key)
+        if value is None or (key == "mode_waits" and not value):
             continue
         present |= 1 << bit
         what = f"{descriptor.name} limits.{key}"
@@ -43,12 +68,17 @@ def _encode_laws(descriptor: Descriptor) -> bytes:
         elif fmt == "w":
             body += _table(((k, v) for k, v in waits), what)
         elif fmt == "i":
-            names = [k for k, _ in waits]
+            body += _wait_indices(value, names, what)
+        elif fmt == "f":
+            chart = dict(value)
+            body += struct.pack("<IB", _u(round(float(chart["output_delay_us"]) * 1000), 32, what),
+                                _u(chart["output_delay_lines"], 8, what))
+            for regs_key in _CHART_REG_LISTS:
+                body += _wait_indices(chart.get(regs_key) or [], names, what)
+        elif fmt == "m":
             body += struct.pack("<B", _u(len(value), 8, what))
-            for reg in value:
-                if str(reg) not in names:
-                    raise RecordError(f"{what}: {reg!r} is not a captured wait register")
-                body += struct.pack("<B", names.index(str(reg)))
+            for index, table in value:
+                body += struct.pack("<B", _u(index, 8, what)) + _table(table.items(), what)
         elif fmt == "d":
             if isinstance(value, dict):
                 body += struct.pack("<B", _DELTA_TABLE) + _table(value.items(), what)
@@ -59,6 +89,26 @@ def _encode_laws(descriptor: Descriptor) -> bytes:
         else:
             body += struct.pack("<" + fmt, _u(value, {"H": 16, "I": 32}[fmt], what))
     return _LAWS_HEAD.pack(FAMILY_IDS[family], present) + bytes(body)
+
+def _wait_indices(regs, names: List[str], what: str) -> bytes:
+    """A register list as indices into the captured waits: count u8, then
+    one index u8 per register."""
+    buf = bytearray(struct.pack("<B", _u(len(regs), 8, what)))
+    for reg in regs:
+        if str(reg) not in names:
+            raise RecordError(f"{what}: {reg!r} is not a captured wait register")
+        buf += struct.pack("<B", names.index(str(reg)))
+    return bytes(buf)
+
+def _read_wait_indices(payload: bytes, pos: int, names: List[str]) -> Tuple[List[str], int]:
+    count, pos = _unpack("B", payload, pos, "LAWS")
+    regs = []
+    for _ in range(count):
+        i, pos = _unpack("B", payload, pos, "LAWS")
+        if i >= len(names):
+            raise RecordError("LAWS names a wait register it does not carry")
+        regs.append(names[i])
+    return regs, pos
 
 def _encode_program(descriptor: Descriptor) -> bytes:
     program = descriptor.raw("program") or {}
@@ -172,16 +222,19 @@ def _encode_capture(descriptor: Descriptor, hub=None) -> bytes:
         buf += struct.pack("<B", _CAPTURE_FLAG_CLOCK_NONCONTINUOUS)
     return bytes(buf)
 
-def _decode_laws(payload: bytes) -> Tuple[int, Dict[str, Any]]:
-    """`(family id, limits)`: the declared limits the LAWS record carries."""
+def _decode_laws(payload: bytes) -> Tuple[int, Dict[str, Any], List[Tuple[int, Dict[str, int]]]]:
+    """`(family id, limits, mode waits)`: the declared limits the LAWS record
+    carries, and the own waits of each mode that declares them, by the
+    mode's index."""
     if not payload:
-        return FAMILY_IDS["generic"], {}
+        return FAMILY_IDS["generic"], {}, []
     if len(payload) < _LAWS_HEAD.size:
         raise RecordError("LAWS record truncated")
     family, present = _LAWS_HEAD.unpack_from(payload)
     pos = _LAWS_HEAD.size
     limits: Dict[str, Any] = {}
     waits: Dict[str, int] = {}
+    mode_waits: List[Tuple[int, Dict[str, int]]] = []
     for bit, (key, fmt) in enumerate(_LAW_FIELDS):
         if not present & (1 << bit):
             continue
@@ -200,15 +253,23 @@ def _decode_laws(payload: bytes) -> Tuple[int, Dict[str, Any]]:
             waits, pos = _read_table(payload, pos, "LAWS")
             limits[key] = dict(waits)
         elif fmt == "i":
+            limits[key], pos = _read_wait_indices(payload, pos, list(waits))
+        elif fmt == "f":
+            ns, pos = _unpack("I", payload, pos, "LAWS")
+            lines, pos = _unpack("B", payload, pos, "LAWS")
+            chart: Dict[str, Any] = {"output_delay_us": _number(ns),
+                                     "output_delay_lines": lines}
+            for regs_key in _CHART_REG_LISTS:
+                regs, pos = _read_wait_indices(payload, pos, list(waits))
+                if regs or regs_key == _CHART_REG_LISTS[0]:
+                    chart[regs_key] = regs
+            limits[key] = chart
+        elif fmt == "m":
             count, pos = _unpack("B", payload, pos, "LAWS")
-            names = list(waits)
-            regs = []
             for _ in range(count):
-                i, pos = _unpack("B", payload, pos, "LAWS")
-                if i >= len(names):
-                    raise RecordError("LAWS names a wait register it does not carry")
-                regs.append(names[i])
-            limits[key] = regs
+                index, pos = _unpack("B", payload, pos, "LAWS")
+                table, pos = _read_table(payload, pos, "LAWS")
+                mode_waits.append((index, table))
         elif fmt == "d":
             form, pos = _unpack("B", payload, pos, "LAWS")
             if form == _DELTA_TABLE:
@@ -219,7 +280,7 @@ def _decode_laws(payload: bytes) -> Tuple[int, Dict[str, Any]]:
             limits[key], pos = _read_table(payload, pos, "LAWS")
         else:
             limits[key], pos = _unpack(fmt, payload, pos, "LAWS")
-    return family, limits
+    return family, limits, mode_waits
 
 def _decode_sony(doc: Dict[str, Any], rows) -> None:
     """The Sony family re-derives its rows from registers and limits: the
@@ -399,3 +460,146 @@ def _decode_capture(payload: bytes) -> Dict[str, Any]:
     if pos < len(payload) and payload[pos] & _CAPTURE_FLAG_CLOCK_NONCONTINUOUS:
         cap["clock_noncontinuous"] = True
     return cap
+
+def _encode_camera(descriptor: Descriptor, params=None) -> Optional[Tuple[bytes, bytes, bytes]]:
+    """The CAMERA_MAP, PARAMS and PRESENTATION payloads of a cam personality:
+    the law the unit converts a commit with and the mode table it serves,
+    the public rows the camera map serves, and how they read. None when the
+    family derives no apply law for the descriptor, or a pod's program
+    stages no apply value (no `exposure`, `frame_length` or `gain`
+    parameter), and no camera map is served. A program that stages one and lacks another run value of
+    the apply (`action`, `line_time`, `exposure`, `frame_length`, `gain`)
+    is refused by name: the unit converts a commit at the run's line time
+    and runs it by the action, so its camera map would stay INERT. A
+    native head's law names no register: the head converts in its own
+    logic, so its record names no apply value. The trigger conversions
+    served are the ones the program's `trigger` parameter declares, as the
+    TRIGGERS record offers them."""
+    from nxs.cam import laws
+    from nxs.cam.descriptors import FREERUN
+
+    surface = laws.bind(descriptor)
+    if not hasattr(surface, "apply_law"):
+        return None
+    indices = [_param_index(params, name) for name in _CAMERA_MAP_PARAM_NAMES]
+    staging = dict(zip(_CAMERA_MAP_PARAM_NAMES, indices))
+    law = surface.apply_law()
+    what = f"{descriptor.name} camera map"
+    if law.frame_length is not None:
+        staged = [name for name in _APPLY_VALUES if staging[name] is not None]
+        if not staged:
+            return None
+        missing = [name for name in (ACTION_PARAM, LINE_TIME_PARAM, *_APPLY_VALUES)
+                   if staging[name] is None]
+        if missing:
+            raise RecordError(
+                f"{what}: the program stages {', '.join(staged)} and declares no "
+                f"{', '.join(missing)}; the unit converts a commit at the run's line time "
+                f"and runs the apply by the action, so declare_param() each of them")
+    modes = _unit_modes(descriptor)
+    if len(modes) > NxsMap.MODE_TABLE_MAX:
+        raise RecordError(f"{what}: {len(modes)} modes, the camera map serves "
+                          f"{NxsMap.MODE_TABLE_MAX}")
+    if len(law.line_times_ns) != len(modes) or not all(law.line_times_ns):
+        raise RecordError(f"{what}: the law states line times {law.line_times_ns} for "
+                          f"{len(modes)} modes; every mode needs one")
+    if law.gain_factor < 1:
+        raise RecordError(f"{what}: gain factor {law.gain_factor}; the map counts capture "
+                          f"units per decibel")
+    presets = trigger_values(descriptor)
+    declared = set(_param_values(params, TRIGGER_PARAM) or [])
+    triggers = sorted(value for value in presets.values() if value in declared)
+    default = str(descriptor.raw("default_mode"))
+    rows = camera_rows(descriptor, law, staging, triggers,
+                       presets.get(FREERUN, min(triggers) if triggers else 0),
+                       modes.index(default), len(modes),
+                       line_span=_param_values(params, LINE_TIME_PARAM),
+                       trigger_names={value: name for name, value in presets.items()},
+                       mode_names=modes,
+                       inck_hz=(descriptor.raw("limits") or {}).get("inck_hz"))
+    sync = descriptor.raw("sync") or {}
+    capture = descriptor.raw("capture") or {}
+    buf = bytearray(_CAMERA_MAP_HEAD.pack(len(modes),
+                                          _u(law.gain_factor, 16, f"{what} gain factor")))
+    buf += _CAMERA_MAP_PARAMS.pack(*(_NONE_U8 if i is None else _u(i, 8, f"{what} param index")
+                                     for i in indices))
+    buf += _CAMERA_MAP_LAW.pack(
+        _u(law.gain_min, 16, f"{what} gain min"), _u(law.gain_max, 16, f"{what} gain max"),
+        _u(law.gain_step, 16, f"{what} gain step"),
+        _u(law.frame_length_max, 32, f"{what} frame length max"),
+        _u(law.exposure_min, 32, f"{what} exposure min"),
+        _u(law.exposure_margin, 16, f"{what} exposure margin"))
+    # A law with one floor per mode keeps each; any other shape is the
+    # one floor the apply bytecode clamps every mode to.
+    floors = (law.frame_length_floors if len(law.frame_length_floors) == len(modes)
+              else (law.frame_length_min,) * len(modes))
+    for line_time_ns, floor in zip(law.line_times_ns, floors):
+        buf += _CAMERA_MAP_LAW_MODE.pack(_u(line_time_ns, 32, f"{what} line time"),
+                                         _u(floor, 32, f"{what} frame length floor"))
+    # The Bayer order of each capture row, by its geometry and depth: a
+    # host without a boot-time table reads the pixel format from the camera map.
+    phases = {(int(row["width"]), int(row["height"]), int(row["bit_depth"])):
+              PIXEL_PHASES.index(str(row["pixel_phase"]))
+              for row in (capture.get("table") or [])
+              if str(row.get("pixel_phase")) in PIXEL_PHASES}
+    for value, name in enumerate(modes):
+        mode = descriptor.modes[name]
+        geo, mipi = mode["geometry"], mode["mipi"]
+        data_type = str(mipi["data_type"])
+        if data_type not in _CAMERA_MAP_DATA_TYPES:
+            raise RecordError(f"{what}: {name} streams {data_type}, and the camera map's mode table "
+                              f"carries {' or '.join(_CAMERA_MAP_DATA_TYPES)}")
+        phase = phases.get((int(geo["width"]), int(geo["height"]), int(geo["bit_depth"])), 0xFF)
+        # A row takes the trigger conversions when the sensor takes a
+        # trigger on that mode's input and the program offers a conversion.
+        triggerable = bool(mipi.get("trigger_input")) and bool(sync.get("takes_trigger")) and bool(triggers)
+        mode_flags = ((NxsMap.MODE_FLAG_DEFAULT if name == default else 0)
+                      | (NxsMap.MODE_FLAG_TRIGGERABLE if triggerable else 0))
+        buf += _CAMERA_MAP_MODE.pack(
+            _u(geo["width"], 16, f"{name} width"), _u(geo["height"], 16, f"{name} height"),
+            _u(geo["bit_depth"], 8, f"{name} bit_depth"), _u(geo["lanes"], 8, f"{name} lanes"),
+            _u(geo["rate_mbps"], 16, f"{name} rate_mbps"), int(data_type[3:]), mode_flags,
+            _u(round(float(surface.fps_ceiling(name)) * 1000), 32, f"{name} max fps"),
+            value, phase)
+    what = f"{descriptor.name} parameters"
+    return bytes(buf), encode_rows(rows, what), encode_presentation_rows(rows, what)
+
+def _decode_camera_map(payload: bytes) -> Dict[str, Any]:
+    """The CAMERA_MAP record back: the mode count and the gain factor, the
+    run-value indices by parameter name (None when absent), the law head,
+    the law row of each mode and the mode rows."""
+    head = _CAMERA_MAP_HEAD.size + _CAMERA_MAP_PARAMS.size + _CAMERA_MAP_LAW.size
+    if len(payload) < head:
+        raise RecordError("CAMERA_MAP record truncated")
+    mode_count, g_factor = _CAMERA_MAP_HEAD.unpack_from(payload)
+    pos = _CAMERA_MAP_HEAD.size
+    indices = _CAMERA_MAP_PARAMS.unpack_from(payload, pos)
+    pos += _CAMERA_MAP_PARAMS.size
+    g_min, g_max, g_step, fl_max, e_min, e_margin = _CAMERA_MAP_LAW.unpack_from(payload, pos)
+    pos += _CAMERA_MAP_LAW.size
+    if pos + mode_count * (_CAMERA_MAP_LAW_MODE.size + _CAMERA_MAP_MODE.size) != len(payload):
+        raise RecordError(f"CAMERA_MAP record of {len(payload)} B does not hold "
+                          f"{mode_count} modes")
+    law_modes: List[Dict[str, int]] = []
+    for _ in range(mode_count):
+        line_time_ns, floor = _CAMERA_MAP_LAW_MODE.unpack_from(payload, pos)
+        pos += _CAMERA_MAP_LAW_MODE.size
+        law_modes.append({"line_time_ns": line_time_ns, "frame_length_floor": floor})
+    modes: List[Dict[str, Any]] = []
+    for _ in range(mode_count):
+        (width, height, bits, lanes, rate, data_type, mode_flags, fps1000, value,
+         phase) = _CAMERA_MAP_MODE.unpack_from(payload, pos)
+        pos += _CAMERA_MAP_MODE.size
+        modes.append({"width": width, "height": height, "bit_depth": bits, "lanes": lanes,
+                      "rate_mbps": rate, "data_type": data_type,
+                      "default": bool(mode_flags & NxsMap.MODE_FLAG_DEFAULT),
+                      "triggerable": bool(mode_flags & NxsMap.MODE_FLAG_TRIGGERABLE),
+                      "max_fps": fps1000 / 1000, "value": value,
+                      "pixel_phase": PIXEL_PHASES[phase] if phase < len(PIXEL_PHASES) else None})
+    return {"mode_count": mode_count, "gain_factor": g_factor,
+            "gain": {"min": g_min, "max": g_max, "step": g_step},
+            "exposure": {"min": e_min, "margin": e_margin},
+            "frame_length": {"max": fl_max},
+            "params": {name: (None if i == _NONE_U8 else i)
+                       for name, i in zip(_CAMERA_MAP_PARAM_NAMES, indices)},
+            "law_modes": law_modes, "modes": modes}

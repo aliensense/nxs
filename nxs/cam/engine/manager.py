@@ -16,6 +16,7 @@ from .models import (
     DeviceStep,
     ExpectFailedError,
     ExpectStep,
+    RawWriteStep,
     ReadStep,
     RetryBlockStep,
     Step,
@@ -42,9 +43,6 @@ class Manager:
         #: outcome otherwise.
         self.verbose: bool = os.environ.get(VERBOSE_ENV) == "1"
         self.last_read_results: dict[str, list[int]] = {}
-        #: Every polled expect the run waited on: what it waited for, how
-        #: long it actually took, the budget it had, and whether it held.
-        self.settles: list[dict[str, Any]] = []
 
     def _say(self, text: str) -> None:
         """The run's trace line, printed only under NXS_CAM_VERBOSE=1."""
@@ -100,9 +98,12 @@ class Manager:
         retries: int = 5,
         retry_delay_s: float = 0.05,
         continue_on_error: bool = False,
+        i2c: Optional[CamI2c] = None,
     ) -> bool:
         """Run the event plan on ``bus`` with per-operation retries; True when every
-        step succeeded. ``continue_on_error`` continues past exhausted retries."""
+        step succeeded. ``continue_on_error`` continues past exhausted retries.
+        ``i2c`` runs the plan on a handle the caller holds open, which the run
+        leaves open."""
         plan = self.config_handler.build_event_plan()
         cfg = self.config_handler.get_parsed_config()
         wait_cmd_id = cfg.commands.get("CMD_WAIT_MILLIS")
@@ -114,8 +115,10 @@ class Manager:
         else:
             default_addr = "0x00"
 
-        i2c = CamI2c(addr=default_addr, bus=bus)
-        i2c.open()
+        held = i2c is not None
+        if not held:
+            i2c = CamI2c(addr=default_addr, bus=bus)
+            i2c.open()
         self.last_read_results = {}
         had_errors = False
         best_effort = getattr(self.config_handler, "best_effort", frozenset())
@@ -137,7 +140,8 @@ class Manager:
                     else:
                         had_errors = True
         finally:
-            i2c.close()
+            if not held:
+                i2c.close()
 
         return not had_errors
 
@@ -167,6 +171,14 @@ class Manager:
 
             if isinstance(step, DeviceStep):
                 if self._execute_device_write(
+                    i2c, step, retries, retry_delay_s, effective_continue
+                ):
+                    had_errors = True
+                self._step_sleep(step.sleep_ms)
+                continue
+
+            if isinstance(step, RawWriteStep):
+                if self._execute_raw_write(
                     i2c, step, retries, retry_delay_s, effective_continue
                 ):
                     had_errors = True
@@ -246,6 +258,26 @@ class Manager:
         )
         return ok is False
 
+    def _execute_raw_write(
+        self,
+        i2c: CamI2c,
+        step: RawWriteStep,
+        retries: int,
+        retry_delay_s: float,
+        continue_on_error: bool,
+    ) -> bool:
+        """Execute one raw write; return True when it failed."""
+        device_addr = hex(step.device)
+        self._say(f"Write {device_addr} raw {self._fmt_values(step.data)}")
+        ok = self._retry_i2c(
+            op_desc=f"raw write {device_addr}",
+            op=lambda: i2c.write_raw(step.data, addr=device_addr),
+            retries=max(0, retries),
+            delay_s=max(0.0, retry_delay_s),
+            continue_on_error=continue_on_error,
+        )
+        return ok is False
+
     def _execute_read(
         self,
         i2c: CamI2c,
@@ -313,7 +345,6 @@ class Manager:
                 )
                 if passed:
                     elapsed_ms = int((time.monotonic() - started) * 1000)
-                    self._record_settle(step, what, elapsed_ms, True)
                     self._say(f"Expect {what}: OK"
                           + (f" after {elapsed_ms} ms" if step.timeout_ms else ""))
                     return
@@ -331,36 +362,11 @@ class Manager:
             if last_exc is not None
             else f"got 0x{last_got:02X}" if last_got is not None else "no read"
         )
-        self._record_settle(step, what, step.timeout_ms, False)
         raise ExpectFailedError(
             f"expect {what} within {step.timeout_ms} ms: {detail}",
             wait=step.comment or what,
             timeout_ms=step.timeout_ms,
         )
-
-    def _record_settle(self, step: ExpectStep, what: str, elapsed_ms: int,
-                       held: bool) -> None:
-        """Keep the wait on record (polled expects only)."""
-        if step.timeout_ms:
-            self.settles.append({
-                "what": step.comment or what, "elapsed_ms": elapsed_ms,
-                "budget_ms": step.timeout_ms, "held": held,
-                "soft": step.soft,
-            })
-
-    def settle_summary(self) -> Optional[str]:
-        """One line on the run's polled waits: count, time spent, budget."""
-        if not self.settles:
-            return None
-        spent = sum(s["elapsed_ms"] for s in self.settles) / 1000.0
-        budget = sum(s["budget_ms"] for s in self.settles) / 1000.0
-        missed = [s for s in self.settles if not s["held"]]
-        line = (f"{len(self.settles)} polled waits took {spent:.1f} s "
-                f"of a {budget:.1f} s budget")
-        if missed:
-            line += (f"; {len(missed)} ran to the deadline: "
-                     + ", ".join(s["what"] for s in missed))
-        return line
 
     def _execute_retry_block(
         self,

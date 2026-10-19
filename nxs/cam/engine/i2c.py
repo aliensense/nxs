@@ -1,19 +1,15 @@
 # Copyright (c) 2026 Aliensense.
 # SPDX-License-Identifier: Apache-2.0
 
-"""I2C register transport for camera/SerDes devices, on smbus2. One open bus
-handle serves every device on the segment by overriding ``addr`` per call;
-``bus_obj`` (``write_bytes`` / ``write_read``) is the duck-typed test seam."""
+"""Register-oriented I2C access for the camera engine, over libnxs's bus
+handle: one combined transaction per read, one write per write, the errno
+the bus answered with on a refusal."""
 
 from __future__ import annotations
 
 from typing import Optional
 
-try:
-    from smbus2 import SMBus, i2c_msg
-except ImportError:  # pragma: no cover - exercised via the bus_obj seam
-    SMBus = None
-    i2c_msg = None
+from nxs import _libnxs
 
 
 class I2CHandlerError(RuntimeError):
@@ -34,7 +30,7 @@ class CamI2c:
         self.bus = bus
         self.addr = addr
         self._bus_obj = bus_obj
-        self._smbus = None
+        self._handle: Optional[_libnxs.Bus] = None
         self._is_open = bus_obj is not None
 
     def _addr_int(self, addr: Optional[str] = None) -> int:
@@ -48,17 +44,13 @@ class CamI2c:
         return bus
 
     def open(self) -> None:
-        """Open the bus; I2CHandlerError when smbus2 is unavailable or the open fails."""
+        """Open the bus through libnxs; I2CHandlerError when the open fails."""
         if self._is_open:
             return
-        if SMBus is None:
-            raise I2CHandlerError(
-                "smbus2 is required for I2C access: pip install smbus2"
-            )
         try:
-            self._smbus = SMBus(self._bus_path())
-        except (OSError, ValueError) as exc:
-            self._smbus = None
+            self._handle = _libnxs.Bus.open(self._bus_path())
+        except OSError as exc:
+            self._handle = None
             raise I2CHandlerError(
                 f"failed to open I2C bus {self._bus_path()}"
             ) from exc
@@ -66,9 +58,9 @@ class CamI2c:
 
     def close(self) -> None:
         """Close the bus (an injected bus_obj is left to its owner)."""
-        if self._smbus is not None:
-            self._smbus.close()
-            self._smbus = None
+        if self._handle is not None:
+            self._handle.close()
+            self._handle = None
         self._is_open = self._bus_obj is not None
 
     # -- low-level transfers ------------------------------------------
@@ -83,7 +75,7 @@ class CamI2c:
         if not self._is_open:
             self.open()
         try:
-            self._smbus.i2c_rdwr(i2c_msg.write(addr_int, payload))
+            self._handle.write(addr_int, bytes(payload))
         except OSError as exc:
             raise I2CHandlerError("I2C transfer failed") from exc
 
@@ -99,16 +91,11 @@ class CamI2c:
                 raise I2CHandlerError("I2C transfer failed") from exc
         if not self._is_open:
             self.open()
-        wr = i2c_msg.write(addr_int, payload)
-        rd = i2c_msg.read(addr_int, read_len)
         try:
-            # One ioctl for both messages = repeated start between them.
-            self._smbus.i2c_rdwr(wr, rd)
+            # One combined transaction: the register, then the read.
+            return self._handle.read(addr_int, bytes(payload), read_len)
         except OSError as exc:
             raise I2CHandlerError("I2C transfer failed") from exc
-        # bytes() hits i2c_msg.__bytes__ (the read buffer); bytearray() would
-        # dump the ctypes message struct instead.
-        return bytes(rd)
 
     # -- register API --------------------------------------------------
 
@@ -142,6 +129,11 @@ class CamI2c:
             raise ValueError("data_width must be 8 or 16")
         self._do_write(self._addr_int(addr), payload)
 
+    def write_raw(self, data: list[int], addr: Optional[str] = None) -> None:
+        """Write ``data`` as one transaction with no register framing (a part
+        whose first byte is its register); I2CHandlerError on transfer failure."""
+        self._do_write(self._addr_int(addr), [v & 0xFF for v in data])
+
     def read_reg(
         self,
         reg: int,
@@ -160,4 +152,3 @@ class CamI2c:
         else:
             raise ValueError("data_width must be 8 or 16")
         return self._do_write_read(self._addr_int(addr), addr_bytes, read_len)
-

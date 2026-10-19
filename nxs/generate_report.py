@@ -39,7 +39,7 @@ def render_report(ports: List[PortFinding], units: List[UnitFinding]) -> str:
                 parts = [f"SEN {link.sensor} ({link.sensor_note})"]
             elif link.head_answers:
                 parts = [f"head answers at {link.head_addr:#04x} ({link.sensor_note}); "
-                         f"declare links.{link.name}.camera"]
+                         f"declare a camera node on links.{link.name}"]
             else:
                 parts = [f"no head ({link.sensor_note})"]
             if link.ser is not None:
@@ -76,17 +76,16 @@ def render_report(ports: List[PortFinding], units: List[UnitFinding]) -> str:
         if port.collided:
             addr, names = port.collided
             joined = " and ".join(names)
+            from nxs.generate_seed import pod_aliases
             aliases = " and ".join(
-                f"{name} a unit with alias 0x{addr + i + 1:02X}"
-                for i, name in enumerate(names))
+                f"{name} at {alias:#04x}" for name, alias in pod_aliases(names).items())
             lines.append(
-                f"  NXS answers @0x{addr:02X} for {joined} — every pod straps "
+                f"  NXS answers @0x{addr:02X} for {joined}: every pod straps "
                 "this address and the links are merged, so the walk cannot say "
                 "which answered")
             lines.append(
-                f"  give {aliases} in suite.yaml "
-                "— the seed writes them where there is no manifest yet, else "
-                "add them by hand — then run `on` and generate again")
+                f"  declare a pod node on each link in suite.yaml, {aliases}, "
+                "then run `on` and generate again")
     for unit in units:
         tail = f" serial {unit.serial}" if unit.serial else ""
         lines.append(f"unit on {unit.route}{tail}")

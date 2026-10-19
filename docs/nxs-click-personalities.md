@@ -1,6 +1,6 @@
 # NXS — Click Personality Reference
 
-Applies to: NXS v1.1 · image format 2.0 · `nxs` tool 1.1.x
+Applies to: NXS v1.1 · image format 1.1 · `nxs` tool 1.1.x
 
 | Document set | |
 |---|---|
@@ -98,7 +98,7 @@ Every personality, generated or hand-written, is verified against the device bef
 2. **Parameters against the datasheet.** Every `declare_param` value set matches a datasheet table (full-scale ranges, ODR dividers, oversampling ratios). Every config-dependent register write carries its `param=` tag, so runtime `set` works without re-upload.
 3. **Units are canonical and enforced.** Fields whose names infer an SI semantic inherit their canonical unit at compile time. Such names are `accel_*`, `gyro_*`, `mag_*`, `temp`, `pressure`, `angle`, `voltage` and more. The units are `m/s^2`, `rad/s`, `tesla`, `kelvin` and `pascal`, and a conflicting declared unit is a compile error.
 
-   The full recognized set, with each name's SI unit and standard subject, is the canonical-units table in §4.3, single-sourced from `constants/field_semantics.yaml`. Temperature is kelvin: fold the datasheet's Celsius zero point into the field's `offset` (+273.15). Fields with no SI semantic must declare a unit (`''` for unitless).
+   The full recognized set, with each name's SI unit and standard subject, is the canonical-units table in §4.4, single-sourced from `constants/field_semantics.yaml`. Temperature is kelvin: fold the datasheet's Celsius zero point into the field's `offset` (+273.15). Fields with no SI semantic must declare a unit (`''` for unitless).
 4. **Independent decode.** Stream from the device. Recompute at least one field by hand from the datasheet formula, raw counts × datasheet sensitivity. Compare the result against the device-served decode. The two derivations must agree. This check catches transposed scales that all other gates miss.
 5. **Physical plausibility.** A stationary accelerometer reads ≈ 9.81 m/s² on one axis. Ambient temperature is ≈ 293–300 K, ambient pressure ≈ 101 kPa, and Earth's magnetic field ≈ 25–65 µT.
 6. **Parameter round-trip.** `set` a full-scale range live. Check that the streamed magnitude stays the same for the same physical stimulus, because the scale retunes with the parameter.
@@ -116,7 +116,7 @@ Every personality, generated or hand-written, is verified against the device bef
 
 ### 4.2 The facts file (`<personality>.yaml`)
 
-A click personality ships as two files: the Python module (measurement logic) and a sibling facts file carrying its parameter table. The facts file is the machine-readable capability sheet — `nxs status` and `nxs tune` read it directly, with no personality import and no compilation.
+A click personality ships as two files: the Python module (measurement logic) and a sibling facts file carrying its parameter table. The facts file is the machine-readable capability sheet, and the compiler writes it into the image's PARAMS and PRESENTATION records. `nxs describe`, `nxs status` and `nxs tune` read a click personality's rows from its compiled image.
 
 ```yaml
 meta:
@@ -124,10 +124,18 @@ meta:
   brief: 6-axis IMU, register bus
 params:
   - {name: sample_rate, type: enum, values: [50, 100, 250, 500], default: 250, unit: Hz}
-  - {name: accel_fs, type: enum, values: [2, 4, 8, 16], default: 8, unit: g, kind: reload}
+  - {name: accel_fs, type: enum, values: [2, 4, 8, 16], default: 8, unit: g, kind: run}
 ```
 
-The loader that `nxs status` and `nxs tune` share judges the table before any compile, and names the file. Parameter names are unique, an enum default is one of its values, and a range is `[min, max]` in that order with its default inside it.
+`nxs personality check` and the compiler share one loader, which judges the table and names the file. Parameter names are unique, an enum default is one of its values, and a range is `[min, max]` in that order with its default inside it. A list of labels counts the row's values, and an id is a `ParamId` name.
+
+Three optional keys of an entry say how a host reads the row:
+
+- `show` names the unit a value shows in and the power of ten that scales it. A row served in millidecibels shows in decibels with `{unit: dB, exponent: -3}`.
+- `labels` names each value, an enum's in the order of its values and a range's from its min. A label takes 31 printable ASCII characters at most, and no two are alike.
+- `id` names the row's standard id by its `ParamId` name. A row without one is a custom row the host offers by name.
+
+A row without `show` reads in its own unit at exponent 0.
 
 `configure()` registers the whole table with one call:
 
@@ -137,15 +145,52 @@ self.declare_params_from_descriptor()
 
 Explicit `declare_param` calls remain valid alongside it for computed cases: a value set derived at configure time, or a parameter gated on the requested trigger. The split changes nothing on the wire. The compiled image is byte-identical to one built from explicit declarations, and the SDK pins that equivalence with image fixtures.
 
-### 4.3 `declare_param(name, values, default, param_type="enum", unit="", kind="reload")`
+### 4.3 `declare_param(name, values, default, param_type="enum", unit="", kind="run", id=0, show=None, labels=None, public=True)`
 
-Declares a runtime-settable parameter (name ≤ 16 bytes, unit ≤ 8 bytes). `param_type="enum"`: `values` is the allowed set, ≤ 16 entries. `param_type="range"`: `values` is `[min, max]`, validated inclusively on each set. A range parameter must be `kind="live"`, because a range has no bytecode patch site to re-apply on reload. The firmware rejects a non-live range at load.
+Declares a runtime-settable parameter (name ≤ 15 characters, unit ≤ 6). `param_type="enum"`: `values` is the allowed set, ≤ 16 entries, or ≤ 8 when a value passes 65535. Every value is a whole number from 0 up. `param_type="range"`: `values` is `[min, max]`, validated inclusively on each set. A range parameter must be `kind="apply"`, because a range has no bytecode patch site that a re-run of `configure()` would re-apply. The firmware rejects a range of another kind at load.
 
-Both shapes are validated at compile time, the declared default and any config override included, and are runtime-settable via `nxs set`. `kind="reload"` re-runs `configure()` on set, which is correct for sensor config registers. `kind="live"` applies without a restart, for values a running consumer reads continuously. Every parameter is visible to hosts with its allowed set or bounds and default (`nxs caps`, `GetParamInfo`).
+Three keyword arguments say how a host reads the row, the arguments the facts file's keys set (§4.2). `id` is the row's standard id by its number in the registry, `0`, a custom row, when absent ([Interface Description §4.5](nxs-host-interface.md)). An id names one row of the image, and `8`, `STREAM`, is the compiler's own. `show=Show(unit, exponent)` names the unit a value shows in, 6 printable ASCII characters at most, and its power of ten, from -128 to 127. `labels` names each value under the facts file's rules. The compiler names the values of the rows it adds: `bus` by its buses, `reset_active` as `low` and `high`, and `stream` as `off` and `on`.
+
+`public` concerns a hub or a host program alone. Every parameter of a click personality is a row of its PARAMS record. A hub program's parameter is a run parameter its walks stage, and `public=True` makes it a row the graph sets by name. A hub or host program declares a row that no phase reads with `declare_row()`, which takes the same arguments but `public` ([Cam Personality Reference §2.1](nxs-cam-personalities.md)).
+
+Both shapes are validated at compile time, the declared default and any config override included, and are runtime-settable via `nxs set`. `kind="run"` re-runs `configure()` on set, which is correct for sensor config registers. `kind="apply"` applies without a restart, for values a running consumer reads continuously. Every parameter is visible to hosts with its allowed set or bounds and default (`nxs caps`, `GetParamInfo`).
+
+A personality declares up to 16 parameters, counting those the compiler adds: `bus` on a register personality, `reset_active`, the two of `drive_pwm` and `stream`. The `stream` row closes every click's table: id 8 `STREAM` of kind GATE, `0` standby and `1` sampling, default `0`. Every click image carries its parameters as the PARAMS record, one 64-byte row each, in declaration order ([Interface Description §4.5](nxs-host-interface.md)). A row holds the name, the unit, the standard id, the kind, the values or the range, and the default. A declared row carries the id it names, 0 for a custom row, and kind RUN or APPLY. A range row's step is 1.
+
+The PRESENTATION record beside the rows holds an entry per row: the unit a value shows in, the exponent and the value names ([Interface Description §10.1](nxs-host-interface.md)). The unit door serves the same rows with their values and ranges ([Interface Description §6.4](nxs-host-interface.md)).
+
+`nxs personality records <path>` prints the records, each row on a line of its own. For the personality of §2:
+
+```sh
+nxs personality records ./my_sensor.py
+```
+
+```
+my_sensor: 5 records, 609 B trailer
+  IDENTITY (6)  64 B at 4..68
+  PARAMS (13)  256 B at 71..327
+    0 sample_rate CUSTOM RUN {50, 100, 250, 500} Hz, default 250
+    1 accel_fs CUSTOM RUN {2, 4, 8, 16} g, default 8
+    2 bus CUSTOM RUN {0, 1}, default 0
+    3 stream STREAM GATE {0, 1}, default 0
+  PRESENTATION (21)  49 B at 330..379
+    0 sample_rate Hz
+    1 accel_fs g
+    2 bus {i2c, spi}
+    3 stream {off, on}
+  OUTPUTS (14)  192 B at 382..574
+    0 accel_x ACCEL_X int16 at 0 m/s^2, scale 0.0023942, big-endian
+    1 accel_y ACCEL_Y int16 at 2 m/s^2, scale 0.0023942, big-endian
+    2 accel_z ACCEL_Z int16 at 4 m/s^2, scale 0.0023942, big-endian
+  PORTS (15)  32 B at 577..609
+    0 out CLICK OUTPUT
+```
+
+The IDENTITY head names the personality at the first address it answers on. The OUTPUTS rows are the output fields of §4.4. The PORTS row is the board's one output, `out`, a click port that a unit's `click` socket takes ([Interface Description §10.1](nxs-host-interface.md)).
 
 The compiler enforces the parameter contract, so a `set` is never a silent no-op. A param is declared before its `param=` tag, and the tagged value is in the declared set. A param patches at most `MAX_PATCH_SITES` bytecode sites, and a setting written to two registers owns two. A direct `write` still binds one register to one param, but read-modify-write sites do not clobber and may share.
 
-The set of patch sites must not change between values. A `reload` enum that patches no bytecode is rejected. So is a `live` param that no runtime consumer reads, and the runtime consumers are only the PWM pair and an output `scale_param`. Patch width follows the write: one byte for `write`, four for `set_baud` and a `write_modify` field, `n` for `stage(size=n)`. Every value must fit it.
+The set of patch sites must not change between values. A `run` enum that patches no bytecode is rejected. So is an `apply` param that no runtime consumer reads. The runtime consumers are the PWM pair, an output `scale_param`, and the unit for a row whose id it reads, `MOUNT_ORIENTATION`. Patch width follows the write: one byte for `write`, four for `set_baud` and a `write_modify` field, `n` for `stage(size=n)`. Every value must fit it.
 
 Filter bandwidth is a runtime parameter whenever the part has one. Declare the values as physical cutoff frequencies in Hz (never register codes), map each to its code in a lookup table, and tag the write. Codes that change the internal base rate the rate divider divides are excluded. Such a code re-times every declared `sample_rate` value rather than selecting a filter.
 
@@ -168,6 +213,8 @@ Omit `unit` for these fields: the compiler inherits the canonical unit and rejec
 
 The same semantics select per-unit calibration. Fields carrying the `accel_*`, `gyro_*`, and `mag_*` semantics form the three calibration vector buckets. The `angle` semantic carries the encoder zero-offset ([Interface Description §6.9](nxs-host-interface.md)). Declaring the semantic is the entire opt-in. The correction applies in the SI tier, so the personality's sample layout, scales, and raw stream are untouched.
 
+Every click image carries its output fields as the OUTPUTS record, one 64-byte row each in declaration order ([Interface Description §6.6](nxs-host-interface.md)). A row holds the name, the unit, the semantic, the type, the count, the position, the scale and the offset. A field with a `scale_param` carries its scale at the parameter's compiled value. A field's unit takes 6 characters at most, the row's `UNIT`.
+
 Fields are packed sequentially by default. `'at': N` places a field at an explicit byte position within the sample. That is the binary-record idiom, where fields map onto scattered offsets inside a captured frame and the gaps (headers, reserved bytes, checksums) carry no fields. Explicit placement is all-or-none per personality. Overlapping fields, a field past the sample buffer, or more fields than the descriptor table holds are compile errors. Every descriptor carries its resolved byte position on the wire, so hosts decode each field at its declared offset rather than accumulating widths.
 
 ### 4.5 `@measure_loop(trigger=...)`
@@ -180,7 +227,7 @@ A **fixed-sync part** (data-ready at a fixed hardware rate, no divider register)
 
 The body reads raw bytes and returns them, or `Sample(field=value)` for computed values, where on-device compensation runs in 64-bit fixed point. Returning `None` skips the tick.
 
-The body executes on-device. `configure()`, by contrast, is traced at compile time against mock reads, so a value read in `configure()` is a placeholder. A runtime conditional on it is rejected and belongs here in `measure()`. A register read-modify-write is `write_modify` (§4.7), whose read happens on-device at load.
+The body executes on-device. `configure()`, by contrast, is traced at compile time against mock reads, so a value read in `configure()` is a placeholder. A runtime conditional on it is rejected and belongs here in `measure()`. A register read-modify-write is `write_modify` (§4.8), whose read happens on-device at load.
 
 The body compiles to VM bytecode and resolves integer **literals** (write registers/masks as hex with a naming comment) and **UPPER_CASE class-level integer constants**. `self.CMD_X` is the home for computed wire words. Any other `self.*` value is rejected, except `configure()`-bound coefficients.
 
@@ -201,11 +248,11 @@ t_pass ≈ 9 × (N + 8) / f_i2c      # status gate + addressing + N-byte burst
 t_pass ≈ 8 × (N + 4) / f_spi      # the same pass over SPI
 ```
 
-`N` is the sample size in bytes. Add about 200 µs per bus transaction for the unit's own overhead, and every staging sleep at face value. Compare the pass with the sample period.
+`N` is the sample size in bytes. Add about 200 µs per bus transaction for the unit's own overhead, and the full length of every staging sleep. Compare the pass with the sample period.
 
 Some parts hold one coherent output set while a burst is on the wire (shadowed or latched output registers, block data update). Such a part reads a whole sample at any phase, and the pass has the full period: `t_pass ≤ period`. A part that rewrites its outputs under the burst needs 3× headroom: `t_pass ≤ period/3`. A declared rate that misses its bound on a declared bus is removed from the `sample_rate` values. Poll-paced parts run the same check with conversion sleeps included and no 3× headroom.
 
-Worked: a 14-byte sample on the socket's I²C bus, 330 kHz on the wire, takes about 0.8 ms. A part with a coherent output set holds 1000 Hz. A part without one stops at 250 Hz.
+Worked: a status read and a 14-byte sample on the socket's I²C bus, 330 kHz on the wire, take about 1.0 ms. A part with a coherent output set holds 1000 Hz. A part without one stops at 250 Hz.
 
 The on-chip FIFO stays disabled. A measure body is one fixed burst per wake, so it can neither drain a backlog nor filter a batch. Read one frame at a time, a FIFO adds bus transactions to every pass. A frame it queues behind a late pass is published under a later edge's stamp.
 
@@ -220,7 +267,7 @@ from nxs import StreamClickPersonality, ClickPersonality
 from nxs.compiler import ChecksumFletcher
 
 
-class BinaryRecordSensor(StreamClickPersonality):
+class BinaryRecSensor(StreamClickPersonality):
     """Fictional framed-binary protocol: sync A5 5A, 4-byte header
     (class 0x02, id 0x11, len 24 LE), 24-byte payload, 2-byte
     Fletcher checksum — 30 bytes buffered per record."""
@@ -265,7 +312,7 @@ def _read_word(addr):
     return word | ((bin(word).count("1") & 1) << 15)
 
 
-class ParityFramedEncoder(RegisterClickPersonality):
+class ParityEncoder(RegisterClickPersonality):
     BUSES = ('spi',)
     PINS = {}
     SPI_PROFILE = SpiProfile(max_hz=10_000_000, mode=1)
@@ -306,7 +353,7 @@ class ParityFramedEncoder(RegisterClickPersonality):
 
 
 # A wrong parity helper fails the compile, not the bench.
-assert ParityFramedEncoder.CMD_POSITION == 0xFFFF
+assert ParityEncoder.CMD_POSITION == 0xFFFF
 ```
 
 Cross-check every computed word against the datasheet's worked examples with a module-level `assert`. Register writes on such parts are two consecutive statement-position `xfer` words (command, then data).
@@ -373,7 +420,7 @@ class TwoDieCombo(RegisterClickPersonality):
 
 ### 4.10 `read_analog(ch)` and `drive_pwm(freq, duty)`
 
-`read_analog(ch)` samples the mikroBUS AN pad and returns the raw ADC count (u16), usable in expressions. Publish it through a named output field, `return Sample(voltage=raw)`, not a positional `Sample(raw)`. Unlike `read_burst`, `read_analog` stages its bytes off the sample buffer, so a positional commit ships empty bytes. `drive_pwm(freq=..., duty=...)`, called in `configure()`, drives the mikroBUS PWM pad and declares two live range parameters, `pwm_freq` at 500–25000 Hz and `pwm_duty` at 0–100 %. They are retunable at runtime via `nxs set` with no reload. The arguments are the initial drive applied when the personality loads.
+`read_analog(ch)` samples the mikroBUS AN pad and returns the raw ADC count (u16), usable in expressions. Publish it through a named output field, `return Sample(voltage=raw)`, not a positional `Sample(raw)`. Unlike `read_burst`, `read_analog` stages its bytes off the sample buffer, so a positional commit ships empty bytes. `drive_pwm(freq=..., duty=...)`, called in `configure()`, drives the mikroBUS PWM pad and declares two `apply` range parameters, `pwm_freq` at 500–25000 Hz and `pwm_duty` at 0–100 %. They are retunable at runtime via `nxs set` with no restart. The arguments are the initial drive applied when the personality loads.
 
 ### 4.11 Communication profiles and reset
 
@@ -389,12 +436,15 @@ The compiler enforces these limits with named errors:
 
 - bytecode ≤ 4096 bytes
 - serialized image ≤ 6144 bytes (header + metadata + bytecode, aggregate)
-- descriptor trailer ≤ 2048 bytes
+- descriptor trailer ≤ 4096 bytes
 - ≤ 16 output fields
 - sample ≤ 128 bytes (≤ 124 when the loop also uses a value-read, which stages in the last 4 bytes)
-- names ≤ 16 bytes
-- units ≤ 8 bytes
-- ≤ 16 values per parameter
+- class, parameter, output and port names ≤ 15 characters, a parameter unit and an output unit ≤ 6
+- parameter units ≤ 6 bytes
+- ≤ 16 parameters, counting those the compiler adds, the `stream` row among them
+- ≤ 16 ports
+- ≤ 16 values per parameter, ≤ 8 when a value passes 65535
+- a value label ≤ 31 characters, a `show` unit ≤ 6
 - ≤ 2 patch sites per parameter
 - ≤ 3 profiles
 - companion devices are I²C-only, each with a 7-bit fixed address
@@ -404,6 +454,22 @@ One interface constraint sits outside the compiler. A sample above 110 bytes is 
 ### 4.13 Sensor-class conventions
 
 Parameter names are canonical across personalities, so hosts script one vocabulary. Rate is `sample_rate`. On a UART stream personality, whose poll cadence is personality-pinned, the receiver's own epoch rate is `rate`. Full-scale is `accel_fs` / `gyro_fs` / `mag_fs`. Filter bandwidth is `accel_bw` / `gyro_bw`, or `filter_hz` for a single joint knob. A magnetometer's independent rate and resolution are `mag_odr` / `mag_res`.
+
+A sensor whose outputs ride its frame declares the `orientation` row as its facts file's last entry. Accelerometers, gyroscopes and magnetometers are such sensors. The row names the mount rotation of the sensor's frame, a range of the 24 rotation codes of [Interface Description §6.9](nxs-host-interface.md). Its values are applied in place, it carries the id `MOUNT_ORIENTATION`, and its labels are the codes' names in code order. The unit reads the row by its id and composes its value onto the calibration, so `nxs set orientation ROLL_90` turns the frame live. No other personality declares it:
+
+```yaml
+  - name: orientation
+    type: range
+    values: [0, 23]
+    default: 0
+    kind: apply
+    id: MOUNT_ORIENTATION
+    labels: [NONE, YAW_90, YAW_180, YAW_270, PITCH_90, PITCH_180, PITCH_270, ROLL_90, ROLL_180,
+             ROLL_270, PITCH_90_YAW_90, PITCH_90_YAW_180, PITCH_90_YAW_270, PITCH_180_YAW_90,
+             PITCH_180_YAW_270, PITCH_270_YAW_90, PITCH_270_YAW_180, PITCH_270_YAW_270,
+             ROLL_90_YAW_90, ROLL_90_YAW_180, ROLL_90_YAW_270, ROLL_90_PITCH_180,
+             ROLL_270_YAW_90, ROLL_270_YAW_270]
+```
 
 A barometer's oversampling is `osr`, and an environmental part's repeatability mode is the `precision` config key. Parameter values are physical magnitudes (g, dps, Hz), never register codes.
 
@@ -415,7 +481,7 @@ A barometer publishes `pressure` in pascal and its compensation `temperature` in
 
 ### 4.14 Cam personalities
 
-A cam personality compiles the same way, from its `.py`, its `.yaml` and its register tables, into an image of kind CAMERA ([Interface Description §10.1](nxs-host-interface.md)). The unit runs it once per `CAM_RUN` on the pod-side bus and halts, while the click personality keeps running ([Interface Description §6.11](nxs-host-interface.md)). The YAML is the digitized datasheet. It holds the identity and I²C address, the register and value widths, the register vocabulary, and the modes with their geometry and timing. It also holds the law family (`sony_imx`, or `generic` for a table-only part) with its parameters, and the capture facts the host's device tree needs. The Python file is the behaviour, on a fictional part:
+A cam personality compiles the same way, from its `.py`, its `.yaml` and its register tables, into an image of kind CAMERA ([Interface Description §10.1](nxs-host-interface.md)). The unit runs it on the pod-side bus for every commit of its rows and halts, while the click personality keeps running ([Interface Description §6.11](nxs-host-interface.md)). The YAML is the digitized datasheet. It holds the identity and I²C address, the register and value widths, the register vocabulary, and the modes with their geometry and timing. It also holds the law family (`sony_imx`, `native`, or `generic` for a table-only part) with its parameters, and the capture facts the device tree needs. The Python file is the behaviour, on a fictional part:
 
 ```python
 from nxs import CamPersonality, I2cProfile
@@ -437,7 +503,7 @@ class Wide16(CamPersonality):
         self.declare_param("mode", values=[0, 1], default=0)      # 720p, 1080p
         self.declare_param("trigger", values=[0, 1], default=0)   # freerun, fast
         self.declare_param("line_time", values=[9000, 40000], default=9805,
-                           param_type="range", unit="ns", kind="live")
+                           param_type="range", unit="ns", kind="apply")
         self.write_table(INIT)
         self.select("mode", {
             0: lambda: self.write_table(MODE_720P),
@@ -452,15 +518,17 @@ class Wide16(CamPersonality):
         self.store_param("line_time", ticks * 1000 // self.TICKS_PER_US)
 ```
 
-`probe()` is the alive or identity check. `configure()` is the shared init, then one block per value of each enum parameter a `select()` names. The compiler emits a load of the value staged for the parameter and a compare-and-jump chain into the blocks. A run with a staged `mode` value therefore switches modes without a recompile. `select_grouped()` takes groups of values (`{frozenset({a, b}): block, …}`) and emits each block once, every value of a group jumping into it. That is the shape of an action that shares a tail with the whole program.
+`probe()` is the alive or identity check. `configure()` is the shared init, then one block per value of each parameter a `select()` names. The parameter is an enum, or a range whose every value takes a block. The compiler emits a load of the value staged for the parameter and a jump table into the blocks. A run with a staged `mode` value therefore switches modes without a recompile. The values a `select()` names run from 0 to 126, and the compiler refuses one outside.
 
-It is also the shape of a dispatch whose registers are free again inside its blocks, so nested dispatches cost the blocks nothing. A value the program computes from a staged parameter is a run value. `param()` reads it, `write_wide()` writes a result to a register and `store_param()` records what the run achieved. Parameter values are integers on the wire. The descriptor trailer the compiler writes from the YAML maps each mode's name to its value, and the tool stages by name from it ([Interface Description §6.11](nxs-host-interface.md)). There is no measure loop, and configure ends in `HALT`.
+`select_grouped()` takes groups of values (`{frozenset({a, b}): block, …}`) and emits each block once, every value of a group jumping into it. That is the shape of an action that shares a tail with the whole program. It is also the shape of a dispatch whose register is free again inside its blocks, so nested dispatches cost the blocks nothing.
+
+A value the program computes from a staged parameter is a run value. `param()` reads it, `write_wide()` writes a result to a register and `store_param()` records what the run achieved. Parameter values are integers on the wire. The descriptor trailer the compiler writes from the YAML maps each mode's name to its value, and the tool stages by name from it ([Interface Description §6.11](nxs-host-interface.md)). There is no measure loop, and configure ends in `HALT`.
 
 - `poll(reg, mask, value, timeout_ms, poll_ms=20, ne=False, soft=False, dev=None)`: read until the masked value matches (with `ne`, until it differs) or the deadline passes. A NAK counts as not yet. A timeout faults the run, or with `soft` sets the run's soft-miss flag and continues. `dev` polls a declared companion.
 - `check(reg, value, mask=0xFF, dev=None)`: one read of a byte register, faulting the run with `MISMATCH` unless the masked value matches. It is a write's read-back.
 - `retry(times, delay_ms, block, until, timeout_ms, poll_ms=20)`: runs `block` (a callable emitting writes) and waits up to `timeout_ms` for `until`, a `(reg, mask, value)` condition on a byte register. When the wait runs out it waits `delay_ms` and runs the block again, `times` runs in all. The last wait faults with the register's name. That is the shape of a one-shot that has to re-lock before the next write.
 - `write_table(rows)`: writes `(reg, value)` rows in order, and consecutive registers become one burst. `load_table(path)` reads such rows from a table file beside the source at compile time. The file is a YAML list of `[reg, value]` pairs, a `reg: value` mapping, or a CSV, and it is where a vendor setting file goes.
-- `param(name)`: the value staged for a declared parameter in this run, as a run value. An enum parameter reads as its integer. `+ - * //` with another run value or an integer build an expression in unsigned 32-bit arithmetic. The compiler carries the interval the declared ranges allow through every intermediate. It refuses an operation that can leave 0..2³²−1 or divide by zero.
+- `param(name)`: the value staged for a declared parameter in this run, as a run value. An enum parameter reads as its integer. `+ - * //` with another run value or an integer build an expression in unsigned 32-bit arithmetic. The compiler carries the interval the declared ranges allow through every intermediate. It refuses an operation that can leave 0..2³²−1 or divide by zero. `>>` and `&` with an integer take a field out of a packed value.
 - `write_wide(reg, value, width, byte_order="big")`: writes the low `width` bytes (1 to 4) of a run value to the consecutive registers from `reg`. A value that can exceed the width is refused.
 - `store_param(name, value)`: records a run value as the parameter's value, and the host reads it back once the run ends ([Interface Description §6.11](nxs-host-interface.md)). It may sit outside the staged range by the program's rounding.
 - `I2cProfile(addr_bytes=2)` lifts the 8-bit register cap. `data_width` (1, 2, or 4) and `byte_order` frame every value the program moves.
@@ -478,7 +546,7 @@ nxs personality install ./my_sensor
 
 `upload` compiles, uploads, and runs. `store save 0` persists the personality to auto-load at boot, and `-o` compiles to an artifact for fleet provisioning. A cam personality (§4.14) takes the camera form, `nxs <port> <link> upload <name>`. The upload saves the image into a store slot on the link's pod, and the camera verbs run it from there. The sensor runner never runs it, so no `store save` follows.
 
-`personality install` copies the click personality into the personality store, `/opt/aliensense/personalities/<name>/`. There `personality: my_sensor` in suite.yaml and `nxs upload my_sensor` resolve it before the shipped set. The store is root-owned, so the copy goes through `sudo`, which asks for the password at a terminal. `nxs personality check` judges the click personality first. A bare `nxs status` counts the shipped and the installed personalities on its `personalities:` line.
+`personality install` copies the click personality into the personality store, `/opt/aliensense/personalities/<name>/`. There a click node's `type: my_sensor` in suite.yaml and `nxs upload my_sensor` resolve it before the shipped set. The store is root-owned, so the copy goes through `sudo`, which asks for the password at a terminal. `nxs personality check` judges the click personality first. A bare `nxs status` counts the shipped and the installed personalities on its `personalities:` line.
 
 A compiled `.nxs` artifact is bound to the image format it was built for. After a product-MINOR firmware update, rebuild artifacts with the matching tool. The tool refuses a stale artifact and prints the rebuild command.
 

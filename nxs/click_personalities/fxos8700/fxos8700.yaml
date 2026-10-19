@@ -7,3 +7,15 @@ meta:
 params:
   - {name: sample_rate, values: [400, 200, 100, 50, 25], default: 100, unit: Hz}
   - {name: accel_fs, values: [2, 4, 8], default: 4, unit: g}
+  # The mount rotation of the sensor's frame, a Rotation code.
+  - name: orientation
+    type: range
+    values: [0, 23]
+    default: 0
+    kind: apply
+    id: MOUNT_ORIENTATION
+    labels: [NONE, YAW_90, YAW_180, YAW_270, PITCH_90, PITCH_180, PITCH_270, ROLL_90, ROLL_180,
+             ROLL_270, PITCH_90_YAW_90, PITCH_90_YAW_180, PITCH_90_YAW_270, PITCH_180_YAW_90,
+             PITCH_180_YAW_270, PITCH_270_YAW_90, PITCH_270_YAW_180, PITCH_270_YAW_270,
+             ROLL_90_YAW_90, ROLL_90_YAW_180, ROLL_90_YAW_270, ROLL_90_PITCH_180,
+             ROLL_270_YAW_90, ROLL_270_YAW_270]

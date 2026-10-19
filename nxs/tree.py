@@ -147,7 +147,7 @@ def render_scan(as_json: bool = False) -> int:
         return 1
     for entry in payload["buses"]:
         rows = []
-        rows += [f"NXS Hub @0x{h['addr']:02X} ({h['kind']})"
+        rows += [f"{_hub_product(h['kind']) or 'hub'} @0x{h['addr']:02X} ({h['kind']})"
                  for h in entry["hubs"]]
         rows += [f"NXS unit @0x{u['addr']:02X} serial {u['serial']}"
                  for u in entry["units"]]
@@ -166,11 +166,19 @@ def render_scan(as_json: bool = False) -> int:
     return 0 if anything else 1
 
 
+def _hub_product(kind: str):
+    """The product name of the hub a scanned deserializer belongs to, from
+    its `hub <compatible>` kind; None for an id no hub claims."""
+    from nxs.cam.hubs import product_name
+
+    return product_name(kind[len("hub "):]) if kind.startswith("hub ") else None
+
+
 def _closed(swept) -> list:
     """The lines for the buses of a sweep that did not open, which it did not
     sweep: one per reason, and under a permission refusal the group that owns
     the bus nodes, where the host has it."""
-    from nxs.suite.switch_cam import STATE_GROUP, _group_exists
+    from nxs.suite.switch_host import STATE_GROUP, _group_exists
 
     by_errno: dict = {}
     for bus, found in swept:
@@ -226,10 +234,12 @@ def _holds_descriptor(directory: str) -> bool:
 
 def _personality_counts() -> tuple[int, int]:
     """(shipped, installed) in the personality store: the assets' sealed
-    personalities (`<name>.nxs`; the hub's and the serializer's images are
-    the host's programs, not counted), and the ones installed beside them
-    (a directory holding its descriptor, or a `.py`, each)."""
-    from nxs.image import HEADER_SIZE, ImageKind, peek_format
+    personalities (`<name>.nxs`; the hub's and the serializer's images and a
+    graph image are the host's programs, not counted), and the ones
+    installed beside them (a directory holding its descriptor, or a `.py`,
+    each)."""
+    from nxs.dsl.compiled import HOST_KINDS
+    from nxs.image import HEADER_SIZE, peek_format
     from nxs.suite import PERSONALITY_DIR
 
     try:
@@ -249,7 +259,7 @@ def _personality_counts() -> tuple[int, int]:
                     kind = peek_format(fh.read(HEADER_SIZE))[2]
             except (OSError, ValueError):
                 continue
-            shipped += kind != ImageKind.HUB
+            shipped += kind not in HOST_KINDS
     return shipped, installed
 
 
@@ -257,11 +267,70 @@ def _personality_counts() -> tuple[int, int]:
 _VM_NOT_RUNNING = ("idle", "error", "no-probe", "probing")
 
 
+def _daemon_hold():
+    """A finding factory by unit name while the running daemon holds the
+    units, without a ROS 2 environment or after its data plane stopped,
+    None while it serves them or does not run: the hold is the daemon's,
+    and it reads under every unit the daemon would bridge."""
+    from nxs.daemon import NO_ROS2, SOURCE_ROS, hold_reason
+    from nxs.finding import Finding
+
+    reason = hold_reason()
+    if reason is None:
+        return None
+    if reason == NO_ROS2:
+        return lambda name: Finding(f"units.{name}", "nxsd holds it without a ROS 2 environment",
+                                    [SOURCE_ROS])
+
+    return lambda name: Finding(f"units.{name}", f"nxsd holds it: {reason}",
+                                ["journalctl -u nxsd"])
+
+
+def _declared_personality_names(declared) -> set:
+    """The names a declared personality runs under, lowercased: its key, and
+    the class name its image carries (`neo_m9n` runs as `NeoM9n`)."""
+    from nxs.suite.reconcile import ClickPersonalityNotFound, load_click_personality
+
+    names = set()
+    for key in declared:
+        names.add(key.lower())
+        try:
+            names.add(load_click_personality(key).__name__.lower())
+        except ClickPersonalityNotFound:
+            pass
+    return names
+
+
+def _undeclared_personality(unit, row) -> str:
+    """The fact when a unit runs a personality its declaration does not
+    name. A declared panel is total, the empty one included: a unit no
+    click feeds declares its panel empty."""
+    running = str(row.personality or "")
+    if running in ("", "-"):
+        return ""
+    declared = [str(s.personality) for s in unit.sensors]
+    if running.lower() in _declared_personality_names(declared):
+        return ""
+    if declared:
+        return f"runs {running}, and the declaration names {', '.join(declared)}"
+
+    return f"runs {running}, which the declaration does not name"
+
+
+#: The deviation of a unit of the first interface, which answers and runs
+#: nothing this tool drives until `nxs switch` upgrades it.
+_FIRST_INTERFACE = "interface"
+#: What the line of a unit of the first interface reads in place of ok.
+_FIRST_INTERFACE_STATE = "FIRST INTERFACE"
+
+
 def _deviations(row) -> dict:
     """What a present unit reports against its declaration: the drift
     kinds, a VM not measuring, a serial mismatch, a stale calibration, a
     silent declared link. An empty dict is a unit as declared."""
     out = {}
+    if row.first_interface:
+        return {_FIRST_INTERFACE: "version 1, the first interface; nxs switch upgrades it"}
     if row.degraded:
         out["link"] = "degraded (a declared link is silent)"
     if row.vm_state and row.vm_state != "running":
@@ -301,8 +370,9 @@ def _unit_rows(cfg, held_buses, state):
 
 
 def tree_payload(cfg, path):
-    """The `tree` surface: the declaration's verdict, the store, and every
-    declared node, present or absent."""
+    """The `tree` surface: the declaration's verdict, the store, every
+    declared port and unit, present or absent, and the declaration's graph
+    with what the rig answers for each node."""
     from nxs.check import check_manifest, node_findings
     from nxs.finding import Finding, as_data
     from nxs.schemas import CONTRACT
@@ -310,9 +380,10 @@ def tree_payload(cfg, path):
     from nxs.suite.state import SuiteState
 
     findings = check_manifest(path)
-    by_node, rest = node_findings(findings)
+    by_node, rest = node_findings(findings, cfg)
     ok = not findings
     ports = []
+    topologies = {}
     if cfg.ports:
         from nxs.cam import cli as cam_cli
         from nxs.cam import topology as cam_topo
@@ -320,8 +391,10 @@ def tree_payload(cfg, path):
         # The manifest's ports keyed by carrier, to pair a declared port
         # with the live topology behind it. Its own name: `ports` is the
         # rendered list this builds.
-        topologies = {}
-        loaded = cam_topo._ports_from_suite()
+        try:
+            loaded = cam_topo._ports_from_suite()
+        except cam_topo.TopologyError:
+            loaded = None        # the check's finding names the port no bus answers for
         if loaded:
             topologies = {t.carrier.split("/")[-1]: t
                           for t in loaded[0].values()}
@@ -333,8 +406,13 @@ def tree_payload(cfg, path):
             entry = {"name": name, "bus": port.bus,
                      "findings": as_data(by_node.get(f"ports.{name}", []))}
             if port.hub_compatible is not None:
-                # The entry lists the nodes on the port: a hub, with its driver.
+                # The entry lists the nodes on the port: a hub, with its driver
+                # and the node that masters its bus when this host does not.
                 entry.update({"hub": port.hub_compatible, "driver": port.hub_driver})
+                if port.hub_node:
+                    entry["hub_node"] = port.hub_node
+                if port.owner:
+                    entry["owner"] = port.owner
             topology = topologies.get(name)
             if topology is not None:
                 try:
@@ -346,7 +424,7 @@ def tree_payload(cfg, path):
                             and not entry["presence"].get("held")):
                         # The wiring file's hub is gone: the walk that wrote
                         # it down is older than the cabling.
-                        from nxs.suite.schema_ports import WIRING_ALTERNATIVE
+                        from nxs.suite.schema_nodes import WIRING_ALTERNATIVE
                         entry["findings"].append(Finding(
                             f"ports.{name}",
                             f"{port.hub_source} names hub {port.hub_compatible} at "
@@ -371,6 +449,10 @@ def tree_payload(cfg, path):
                 if gap is not None:
                     entry["findings"].append(gap.to_dict())
                     ok = False
+                # A camera node the daemon runs no more is the link's gap.
+                for stopped in cam_cli.camera_node_gap(topology):
+                    entry["findings"].append(stopped.to_dict())
+                    ok = False
             ports.append(entry)
 
     units = []
@@ -383,6 +465,7 @@ def tree_payload(cfg, path):
         if held:
             held = {e["bus"] for e in ports}
         rows = _unit_rows(cfg, held, SuiteState.load(default_state_path()))
+        hold = _daemon_hold()
         for unit, row in zip(cfg.units, rows):
             entry = {"name": unit.name,
                      "routes": [l.describe() for l in unit.links],
@@ -404,27 +487,48 @@ def tree_payload(cfg, path):
                     findings.append(off)
                     entry["findings"].append(off.to_dict())
                     ok = False
+                if fact := _undeclared_personality(unit, row):
+                    # The unit runs what the declaration does not name: the
+                    # panel is total, and `switch` clears the slot.
+                    stray = Finding(f"units.{unit.name}", fact, ["nxs switch"])
+                    findings.append(stray)
+                    entry["findings"].append(stray.to_dict())
+                    ok = False
+                if hold is not None:
+                    # The daemon holds the units without a data plane: no
+                    # topic and no time discipline reach this one.
+                    findings.append(hold(unit.name))
+                    entry["findings"].append(hold(unit.name).to_dict())
+                    ok = False
                 entry.update({"route": row.link, "serial": row.serial,
                               "fw": row.fw_version, "personality": row.personality,
                               "vm": row.vm_state, "sync": row.sync,
                               "cal": row.cal, "drift": row.drift,
                               "samples": row.samples, "outputs": row.outputs,
                               "deviations": _deviations(row)})
+                # A unit of the first interface answers and runs nothing this
+                # tool drives until `nxs switch` upgrades it.
+                ok = ok and not row.first_interface
             units.append(entry)
     shipped, installed = _personality_counts()
-    return {"contract": CONTRACT, "manifest": path, "ok": ok,
-            "declaration": {"in_tune": not findings, "findings": as_data(findings),
-                            "unplaced": as_data(rest)},
-            "personalities": {"dir": PERSONALITY_DIR, "shipped": shipped,
-                              "installed": installed},
-            "ports": ports, "units": units}
+    payload = {"contract": CONTRACT, "manifest": path, "ok": ok,
+               "declaration": {"in_tune": not findings, "findings": as_data(findings),
+                               "unplaced": as_data(rest)},
+               "personalities": {"dir": PERSONALITY_DIR, "shipped": shipped,
+                                 "installed": installed},
+               "ports": ports, "units": units}
+    if cfg.graph is not None:
+        from nxs.status_graph import graph_view
+        payload["graph"] = graph_view(cfg, ports, units, by_node)
+    return payload
 
 
 def _render_port(entry, riders=()):
     owner = ("" if entry.get("driver", "nxs") == "nxs"
+             else f"  (owned by {entry['owner']}: read-only)" if entry.get("owner")
              else f"  ({entry['driver']} — read-only)")
-    hub = f"  hub {entry['hub']}" if "hub" in entry else ""
-    print(f"  {entry['name']}  {entry['bus']}{hub}{owner}")
+    hub = f"  hub {entry['hub_node']} ({entry['hub']})" if "hub" in entry else ""
+    print(f"  {entry['name']}  {entry['bus'] or 'no bus'}{hub}{owner}")
     if "error" in entry:
         print(f"    ({entry['error']})")
     elif "presence" in entry:
@@ -482,14 +586,16 @@ def _render_units(units, indent="  ", personality=True):
         keys = ("fw", "personality") if personality else ("fw",)
         extra = "  ".join(f"{labels[k]} {u[k]}" for k in keys if u.get(k) and u[k] != "-")
         ident = f"serial {serial}  " if serial else ""
+        first = _FIRST_INTERFACE in (u.get("deviations") or {})
+        state = _FIRST_INTERFACE_STATE if first else "ok"
         if len(names) > 1:
             routes = "; ".join(x["route"] for x in units
                                if x["name"] in names and x.get("route"))
-            print(f"{indent}{' + '.join(names)}  {routes}  ok  {ident}{extra}")
+            print(f"{indent}{' + '.join(names)}  {routes}  {state}  {ident}{extra}")
             print(f"{indent}  one board answers all of {', '.join(names)} — "
                   f"declare it once with several links")
         else:
-            print(f"{indent}{u['name']}  {u.get('route', '')}  ok  {ident}{extra}")
+            print(f"{indent}{u['name']}  {u.get('route', '')}  {state}  {ident}{extra}")
         if u.get("outputs"):
             print(f"{indent}  outputs: {' '.join(u['outputs'])}")
         for key, value in (u.get("deviations") or {}).items():

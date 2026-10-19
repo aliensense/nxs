@@ -208,7 +208,7 @@ def refuse_without_row(hub, topology, link, descriptor, mode: str,
     alternatives = []
     if int(geo["bit_depth"]) != depth:
         carried = f"RAW{depth}"
-        alternatives.append(f"ports.{port}.links.{link.name}.camera.mode: {mode_token(descriptor, mode)} "
+        alternatives.append(f"mode: {mode} on the camera node of {port}/{link.name} "
                             f"in suite.yaml (every link of the port), then nxs switch and the reboot")
     else:
         carried = f"RAW{depth} {phase}"
@@ -260,8 +260,8 @@ def _declared_depth(hub, topology, lanes: Optional[int] = None,
     if not cams:
         return None
     declared = {link.name: resolve_mode(hub.descriptor(link.sensor_compatible),
-                                        str(link.mode or topology.camera_mode))
-                for link in cams if link.mode or topology.camera_mode}
+                                        str(link.mode))
+                for link in cams if link.mode}
     modes = _resolve_modes(hub.flows(), hub, cams, declared, topology)
     runs = set()
     for link in cams:
@@ -325,10 +325,10 @@ def control_table(descriptor) -> List[Tuple[str, List[int]]]:
     address, width in bytes, byte order (0 little-endian, 1 big-endian), the
     formula form, and four parameters, from the descriptor's registers and
     its family's law parameters. A control the sensor lacks is absent."""
-    from nxs.cam import chips
+    from nxs.cam import laws
 
     rows: List[Tuple[str, List[int]]] = []
-    for name, reg, form, params in chips.control_rows(descriptor):
+    for name, reg, form, params in laws.control_rows(descriptor):
         spec = descriptor.registers[reg]
         order = 1 if str(spec.get("order", "le")) == "be" else 0
         padded = list(params) + [0] * (CONTROL_PARAMS - len(params))
@@ -356,6 +356,10 @@ def pool_sensors(hub, sensors: Optional[Iterable[str]] = None,
     for compatible in ordered:
         desc = hub.descriptor(by_compatible[compatible])
         meta = desc.raw("meta") or {}
+        if str(meta.get("chip") or "") == "native":
+            # A native head is the camera-map driver's node, never the
+            # universal driver's: it has no register the host writes.
+            continue
         # The clock the driver's frame arithmetic counts a line in: the
         # family's INCK where a frame law states one, else the pixel clock
         # of a table-only part, whose line length counts pixel clocks.

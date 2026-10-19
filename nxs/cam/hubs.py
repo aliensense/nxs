@@ -8,8 +8,9 @@ wiring. The product's hub ships inside the wheel (``nxs/hubs``). Under
 ``nxs --experimental`` the roots on ``$NXS_CAM_HUBS`` come first; without
 the flag they are not read. A port with no hub takes the connector
 (`Connector`): the tool's own flows for one sensor wired straight to the
-host. A hub hands out every installed cam personality beside its own
-chips (`cam_personalities`): no hub owns a head."""
+host. A hub hands out every installed cam personality's facts beside its
+own chips (`cam_personalities`): no hub owns a head, and a head's laws are
+its own (`laws`)."""
 
 from __future__ import annotations
 
@@ -22,7 +23,7 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 
-from . import cam_personalities
+from . import cam_personalities, laws
 from .contracts import Topology
 from .descriptors import Descriptor, to_int
 
@@ -33,7 +34,7 @@ TREE_DIR_NAME = "hubs"
 PACKAGE_HUBS_DIR = Path(__file__).resolve().parents[1] / "hubs"
 MANIFEST = "hub.yaml"
 
-_HUB_KEYS = {"hub", "api", "chips", "flows", "flows_for", "topology", "golden"}
+_HUB_KEYS = {"hub", "api", "product", "chips", "flows", "flows_for", "topology", "golden"}
 #: The hub manifest API this loader speaks; a hub declaring another API
 #: is refused by name.
 HUB_API = 1
@@ -101,8 +102,6 @@ class Hub:
         _check_shape(root / MANIFEST, raw)
         self._raw = raw
         self._modules: Dict[str, ModuleType] = {}
-        # Family surfaces bound to the hub's own chips.
-        self._bound: Dict[str, Any] = {}
         self._descriptors: Dict[str, Descriptor] = {}
         self._chips: List[str] = [str(c) for c in raw["chips"]]
         for chip in self._chips:
@@ -114,6 +113,12 @@ class Hub:
     @property
     def name(self) -> str:
         return str(self._raw["hub"])
+
+    @property
+    def product(self) -> str:
+        """The product name the tool prints for the deserializers the flows
+        drive, "" where the manifest names none."""
+        return str(self._raw.get("product") or "")
 
     @property
     def root(self) -> Path:
@@ -140,12 +145,9 @@ class Hub:
 
     def adopt_descriptor(self, descriptor: Descriptor) -> None:
         """Facts a unit served join this hub's view under their name and
-        compatible, ahead of the registry's: `descriptor()`, `sensors()`
-        and `chip_module()` answer for them. Nothing is written to disk."""
+        compatible, ahead of the registry's: `descriptor()` and `sensors()`
+        answer for them. Nothing is written to disk."""
         self._adopted[descriptor.name] = descriptor
-        for key in [k for k in self._bound
-                    if k == descriptor.name or k.startswith(f"{descriptor.name}@")]:
-            self._bound.pop(key)
 
     def _own(self, name_or_compatible: str) -> Optional[str]:
         """The hub's own chip directory name for `name_or_compatible`, or None."""
@@ -264,37 +266,20 @@ class Hub:
 
     def chip_module(self, name_or_compatible: str,
                     lines: Optional[Dict[str, int]] = None) -> Optional[Any]:
-        """A chip's physics surface (cached): one of the hub's own chips
-        binds the family its facts name or loads its physics module; a cam
-        personality's comes from the registry; facts a unit served bind
-        their family, the behaviour running on the unit. With `lines`, the
-        family binds to the view of a port that runs them."""
+        """The physics surface of one of the hub's own chips: the family its
+        facts name, bound to the view of a port that runs `lines`
+        (`nxs.cam.laws`), else the physics module beside its facts, loaded
+        once with this hub as its `HUB`. None for a chip without either, and
+        for a name that is none of the hub's own chips: a cam personality's
+        laws are `nxs.cam.laws.laws` of its descriptor."""
         own = self._own(name_or_compatible)
-        if own is not None:
-            descriptor = self._own_descriptor(own)
-            if (descriptor.raw("meta") or {}).get("chip"):
-                return self._bind(descriptor, lines)
-            path = self._root / own / f"{own}.py"
-            return self._load_module(own, path) if path.exists() else None
-        adopted = self._adopted_for(name_or_compatible)
-        if adopted is not None:
-            return cam_personalities.registry().bind(adopted, lines)
-        try:
-            return cam_personalities.module(name_or_compatible, lines)
-        except cam_personalities.RegistryError as exc:
-            raise HubError(str(exc)) from None
-
-    def _bind(self, descriptor: Descriptor,
-              lines: Optional[Dict[str, int]] = None) -> Any:
-        key = descriptor.name
-        view = descriptor.at_lines(lines)
-        if view is not descriptor:
-            descriptor = view
-            key = f"{key}@{sorted(lines.items())}"
-        if key not in self._bound:
-            from .chips import bind
-            self._bound[key] = bind(descriptor)
-        return self._bound[key]
+        if own is None:
+            return None
+        descriptor = self._own_descriptor(own)
+        if (descriptor.raw("meta") or {}).get("chip"):
+            return laws.laws(descriptor, lines)
+        path = self._root / own / f"{own}.py"
+        return self._load_module(own, path) if path.exists() else None
 
     def flows(self) -> ModuleType:
         """Load (cached) the hub's flow-assembly module or package."""
@@ -330,7 +315,6 @@ class Connector(Hub):
         self._raw = {"hub": CONNECTOR, "api": HUB_API, "chips": [],
                      "flows": None, "flows_for": []}
         self._modules = {}
-        self._bound = {}
         self._descriptors = {}
         self._chips = []
         self._adopted = {}
@@ -351,9 +335,12 @@ def reset_cache() -> None:
     """Forget discovered hubs and the cam personalities (test seam; also
     after env changes)."""
     global _cache, _connector
+    from nxs import description
+
     _cache = None
     _connector = None
     cam_personalities.reset_cache()
+    description.reset_cache()
 
 
 def prime(roots: List[Path]) -> List[Hub]:
@@ -400,6 +387,15 @@ def _check_api(path: Path, raw: Dict[str, Any]) -> None:
         raise HubError(f"{path}: api must be an integer, got {declared!r}")
     if declared != HUB_API:
         raise HubError(f"{path}: declares hub api {declared}; this nxs speaks api {HUB_API}")
+
+
+def product_name(compatible: str, paths: Optional[List[Path]] = None) -> Optional[str]:
+    """The product name of the hub whose flows drive `compatible`; None
+    without such a hub, or where its manifest names none."""
+    for hub in discover(paths):
+        if compatible in hub.flows_for and hub.product:
+            return hub.product
+    return None
 
 
 def hub_classes(paths: Optional[List[Path]] = None) -> Dict[int, str]:
@@ -506,11 +502,66 @@ def sensor_address(hub: Hub, link) -> int:
     """Where the host reaches a link's sensor: the address the port record
     says the link's serializer translates for it while the port is up,
     else the link's declared address, else its facts' own (meta.i2c_addr;
-    0x1A when the facts are silent)."""
+    0x1A when the facts are silent). Behind a pod the capture node's
+    address is the unit's camera map, not the sensor, which the host
+    reaches only where it straps, through the link's window."""
+    host = getattr(link, "host_addr", None)
+    if host is not None and not getattr(link, "nxs_units", ()):
+        return int(host)
+    return native_sensor_address(hub, link)
+
+
+def control_address(hub: Hub, link) -> int:
+    """The address of a link's capture node on the port's bus, where the
+    kernel's per-frame controls for the link are written: the booted
+    tree's, else the link's camera map behind a pod or on a smart camera,
+    else where the host reaches the sensor."""
     host = getattr(link, "host_addr", None)
     if host is not None:
         return int(host)
-    return native_sensor_address(hub, link)
+    mapped = map_address(hub, link)
+    if mapped is not None:
+        return mapped
+    return sensor_address(hub, link)
+
+
+def is_smart_camera(hub: Hub, link) -> bool:
+    """Whether a link's head is a smart camera: no unit rides the link, and
+    its cam personality is of the `native` family, a head that programs
+    its own sensor and serves the camera map alone."""
+    if getattr(link, "nxs_units", ()) or getattr(link, "sensor_compatible", None) is None:
+        return False
+    try:
+        meta = hub.descriptor(link.sensor_compatible).raw("meta") or {}
+    except HubError:
+        return False
+    return str(meta.get("chip") or "") == "native"
+
+
+def declares_smart_camera(compatible: Optional[str]) -> bool:
+    """Whether a declared camera compatible names a smart camera: an
+    installed cam personality of the `native` family."""
+    if not compatible:
+        return False
+    try:
+        meta = load_descriptor(compatible).raw("meta") or {}
+    except HubError:
+        return False
+    return str(meta.get("chip") or "") == "native"
+
+
+def map_address(hub: Hub, link) -> Optional[int]:
+    """Where a link's camera map answers on the port's bus: one above the
+    unit's alias behind a pod, `RBDevice::NXS_CAM` for a smart camera on
+    the port's own bus, None for a head the host programs."""
+    units = getattr(link, "nxs_units", ())
+    if units:
+        return int(units[0].camera_map_addr)
+    if is_smart_camera(hub, link):
+        from nxs._generated_constants import NxsDevices
+
+        return int(NxsDevices.RBDevice.NXS_CAM)
+    return None
 
 
 def native_sensor_address(hub: Hub, link) -> int:

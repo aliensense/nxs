@@ -1,10 +1,11 @@
 # Copyright (c) 2026 Aliensense.
 # SPDX-License-Identifier: Apache-2.0
 
-"""`nxs personality check|install`: the host half of the personality verb
-group. A click personality is `<name>.py` beside `<name>.yaml`; a cam
+"""`nxs personality check|install|records`: the host half of the personality
+verb group. A click personality is `<name>.py` beside `<name>.yaml`; a cam
 personality is `<name>.yaml`, `<name>.py` and its `blobs/`. Either installs
-flat into the store as `<store>/<name>/`."""
+flat into the store as `<store>/<name>/`; `records` prints the trailer a
+personality compiles to."""
 
 from __future__ import annotations
 
@@ -18,6 +19,7 @@ import sys
 import tarfile
 import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import yaml
@@ -66,12 +68,12 @@ def load_source(module_name: str, path: str):
     return module
 
 
-HOST_VERBS = ('check', 'install')
+HOST_VERBS = ('check', 'install', 'records')
 
 
 def add_host_verbs(ps) -> None:
     """The host verbs of the `personality` group, on its subparsers:
-    `check` and `install` need no unit."""
+    `check`, `install` and `records` need no unit."""
     p_check = ps.add_parser('check', help='Validate a personality before '
                                           'installing it')
     p_check.add_argument('path', help='A personality directory, one file of a '
@@ -80,11 +82,19 @@ def add_host_verbs(ps) -> None:
                               help=f'Copy a personality into the store ({PERSONALITY_DIR})')
     p_install.add_argument('path', help='A personality directory, one file of '
                                         'a pair, or a .tar.gz')
+    p_records = ps.add_parser('records', help='Print the trailer records a '
+                                              'personality compiles to')
+    p_records.add_argument('path', help='A personality directory, one file of a pair, '
+                                        'a compiled .nxs, or an installed name')
+    p_records.add_argument('--hex', action='store_true',
+                           help="Add each record's bytes as hex")
 
 
 def run_host_verb(args) -> int:
     if args.personality_cmd == 'check':
         return cmd_check(args.path)
+    if args.personality_cmd == 'records':
+        return cmd_records(args.path, args.hex)
     return cmd_install(args.path)
 
 
@@ -372,6 +382,168 @@ def cmd_check(path: str) -> int:
         discard(personality)
 
 
+# ── records ──────────────────────────────────────────────────────────
+
+#: Bytes per line of a `--hex` dump.
+_HEX_ROW = 32
+
+
+def _trailer_of(path: str):
+    """`(name, trailer bytes)` of a personality: compiled from its source (a
+    directory, one file of a cam pair, an installed name), or read from a
+    compiled image. PersonalityError names one that does not resolve, does
+    not compile, or is an image that does not read."""
+    from nxs import personality_cli
+    from nxs.image import deserialize, trailer_bytes
+
+    token = path
+    located = None
+    if os.path.isdir(path) or path.endswith((".tar.gz", ".tgz")):
+        located = locate(path)
+        if located.py_path is None:
+            discard(located)
+            raise PersonalityError(f"{located.name}.py: missing beside {located.yaml_path} "
+                                   f"(the behaviour that compiles)")
+        token = located.py_path
+    try:
+        try:
+            source = personality_cli.resolve(token)
+            if source.kind == personality_cli.KIND_IMAGE:
+                return source.name, trailer_bytes(deserialize(source.image).trailer)
+            compiled, _img = personality_cli.compile_source(source, {})
+        except (personality_cli.ResolveError, personality_cli.CompileFailed, ValueError) as e:
+            raise PersonalityError(str(e)) from None
+    finally:
+        if located is not None:
+            discard(located)
+    return source.name, trailer_bytes(compiled.trailer)
+
+
+def _plain(value) -> str:
+    """A decoded value as one line: mappings as `{k: v}`, lists as `[a, b]`,
+    booleans and None as words."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "none"
+    if isinstance(value, dict):
+        return "{" + ", ".join(f"{k}: {_plain(v)}" for k, v in value.items()) + "}"
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_plain(v) for v in value) + "]"
+    return str(value)
+
+
+def _output_line(row) -> str:
+    """One OUTPUTS row as `nxs personality records` prints it: name,
+    semantic, type, position, unit, scale and offset, and the byte order."""
+    from nxs._generated_constants import FieldSemantics
+    from nxs.dsl.fields import FIELD_TYPES
+
+    semantic = FieldSemantics.FieldSemantic._NAMES.get(row.semantic, row.semantic)
+    type_name = FIELD_TYPES[row.type] if row.type < len(FIELD_TYPES) else row.type
+    width = f" {row.count} B" if row.is_string else (f" x{row.count}" if row.count != 1 else "")
+    offset = f", offset {row.offset:g}" if row.offset else ""
+    order = ", big-endian" if row.is_big_endian else ""
+    return (f"{row.name} {semantic} {type_name}{width} at {row.at}"
+            f"{' ' + row.unit if row.unit else ''}, scale {row.scale:g}{offset}{order}")
+
+
+def _port_line(port) -> str:
+    """One PORTS row as `nxs personality records` prints it: name, type and
+    direction."""
+    from nxs.dsl.fields import PortDirection, PortType
+
+    return (f"{port.name} {PortType._NAMES.get(port.type, port.type)} "
+            f"{PortDirection._NAMES.get(port.direction, port.direction)}")
+
+
+def _present_line(name: str, entry) -> str:
+    """One PRESENTATION entry as `nxs personality records` prints it: the
+    row's name, the unit a value shows in, the exponent, and the value
+    names."""
+    line = " ".join([name] + ([entry.unit] if entry.unit else []))
+    if entry.exponent:
+        line += f", exponent {entry.exponent}"
+    if entry.labels is not None:
+        line += " {" + ", ".join(entry.labels) + "}"
+    return line
+
+
+@_refusing
+def cmd_records(path: str, hex_dump: bool = False) -> int:
+    """The trailer of a personality as the unit serves it: every record with
+    its type, its length and its bytes' place in the trailer, the PARAMS,
+    PRESENTATION, OUTPUTS and PORTS rows, the camera law, a graph image's
+    records and a hub program's phases decoded, and with `hex_dump` each
+    record's bytes."""
+    from nxs._generated_constants import NxsMap, NxsDriverImage
+    from nxs.image import parse_trailer
+    from nxs.personality.records import (CAMERA_MAP, OUTPUTS, PARAMS, PORTS, PRESENTATION,
+                                         RecordError)
+    from nxs.personality.records_family import _decode_camera_map
+    from nxs.personality.records_graph import record_lines
+    from nxs.personality.records_outputs import decode_outputs
+    from nxs.personality.records_params import decode_rows
+    from nxs.personality.records_ports import decode_ports
+    from nxs.personality.records_present import decode_presentation
+
+    name, trailer = _trailer_of(path)
+    try:
+        records = parse_trailer(trailer)
+    except ValueError as e:
+        raise PersonalityError(f"{name}: {e}") from None
+    print(f"{name}: {len(records)} records, {len(trailer)} B trailer")
+    ids = NxsMap.ParamId._NAMES
+    kinds = NxsDriverImage.ParamKind._NAMES
+    pos = 1
+    for rec_type, payload in records:
+        start = pos + 3
+        end = start + len(payload)
+        pos = end
+        label = NxsDriverImage.TrailerRecord._NAMES.get(int(rec_type), "unknown")
+        print(f"  {label} ({int(rec_type)})  {len(payload)} B at {start}..{end}")
+        if hex_dump:
+            for row in range(0, len(payload), _HEX_ROW):
+                print(f"    {payload[row:row + _HEX_ROW].hex()}")
+        try:
+            if int(rec_type) == PARAMS:
+                for i, row in enumerate(decode_rows(payload)):
+                    span = (f"{row.values[0]}..{row.values[1]} step {row.values[2]}"
+                            if row.is_range else "{" + ", ".join(map(str, row.values)) + "}")
+                    flags = "".join(text for on, text in (
+                        (row.is_read_only, ", read-only"),
+                        (row.is_set_by_trigger, ", set by the fast trigger"),
+                        (row.is_graph, ", the graph's")) if on)
+                    print(f"    {i} {row.name} {ids.get(row.id, row.id)} "
+                          f"{kinds.get(row.kind, row.kind)} {span}"
+                          f"{' ' + row.unit if row.unit else ''}, default {row.default}{flags}")
+            elif int(rec_type) == PRESENTATION:
+                rows = decode_rows(dict((int(t), p) for t, p in records).get(PARAMS, b""))
+                for i, entry in enumerate(decode_presentation(payload, len(rows))):
+                    print(f"    {i} {_present_line(rows[i].name, entry)}")
+            elif int(rec_type) == OUTPUTS:
+                for i, row in enumerate(decode_outputs(payload)):
+                    print(f"    {i} {_output_line(row)}")
+            elif int(rec_type) == PORTS:
+                for i, port in enumerate(decode_ports(payload)):
+                    print(f"    {i} {_port_line(port)}")
+            elif int(rec_type) == CAMERA_MAP:
+                for key, value in _decode_camera_map(payload).items():
+                    if isinstance(value, list) and value and all(isinstance(v, dict)
+                                                                 for v in value):
+                        print(f"    {key}:")
+                        for entry in value:
+                            print(f"      {_plain(entry)}")
+                    else:
+                        print(f"    {key}: {_plain(value)}")
+            else:
+                for line in record_lines(rec_type, payload, records) or ():
+                    print(f"    {line}")
+        except RecordError as e:
+            print(f"    {e}")
+    return 0
+
+
 # ── install ──────────────────────────────────────────────────────────
 
 @_refusing
@@ -391,19 +563,30 @@ def _install(personality: Personality) -> int:
             print(f"  {problem}")
         return 1
     store = PERSONALITY_DIR
-    dest = os.path.join(store, personality.name)
     # The store is system-wide and root-owned; a store the user cannot
     # write is filled through sudo, staged in a temporary directory.
     escalate = not _store_writable(store) and os.geteuid() != 0
     if not escalate and not _store_writable(store):
         raise PersonalityError(f"{store} is not writable")
-    # Staged beside the destination and swapped in whole, so a reinstall
-    # never merges into what was there.
-    stage = tempfile.mkdtemp(prefix=f".{personality.name}.", dir=None if escalate else store)
+    nxt = f"nxs upload {personality.name}" if personality.kind == CLICK else _bench(personality)
+    # The law family a cam personality names rides along from beside it.
+    family = _family_beside(personality)
+    if family is not None:
+        _place(store, family.name, escalate, lambda stage: shutil.copytree(
+            family, stage, dirs_exist_ok=True, ignore=shutil.ignore_patterns("__pycache__", "*.pyc")))
+    dest = _place(store, personality.name, escalate, lambda stage: _copy_files(personality, stage))
+    beside = f" with the {family.name} law family" if family is not None else ""
+    print(f"installed {personality.name} ({personality.kind}){beside} into {dest}; next: {nxt}")
+    return 0
+
+
+def _place(store: str, name: str, escalate: bool, fill) -> str:
+    """Stage `name` with `fill(stage)` and swap it into the store whole, so a
+    reinstall never merges into what was there; returns its path."""
+    dest = os.path.join(store, name)
+    stage = tempfile.mkdtemp(prefix=f".{name}.", dir=None if escalate else store)
     try:
-        _copy_files(personality, stage)
-        nxt = (f"nxs upload {personality.name}" if personality.kind == CLICK
-               else _bench(personality))
+        fill(stage)
         if escalate:
             _place_as_root(stage, store, dest)
         else:
@@ -412,8 +595,19 @@ def _install(personality: Personality) -> int:
             os.replace(stage, dest)
     finally:
         shutil.rmtree(stage, ignore_errors=True)
-    print(f"installed {personality.name} ({personality.kind}) into {dest}; next: {nxt}")
-    return 0
+    return dest
+
+
+def _family_beside(personality: Personality) -> Optional[Path]:
+    """The law family directory a cam personality's facts name, where it sits
+    beside the personality's own directory in its tree; None otherwise."""
+    from nxs.cam.laws import is_family
+
+    chip = str((personality.doc.get("meta") or {}).get("chip") or "")
+    if personality.kind != CAM or not chip:
+        return None
+    family = Path(personality.yaml_path).resolve().parent.parent / chip
+    return family if is_family(family) else None
 
 
 def _store_writable(store: str) -> bool:

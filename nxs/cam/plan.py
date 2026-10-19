@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import copy
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import yaml
 
@@ -28,9 +28,9 @@ def _int(v: Any) -> int:
     return parse_int(v)
 
 
-#: Step keys that name the device a step addresses (the step grammar:
-#: a write's `device`, a read's `read`, an `expect`/`poll`'s own key).
-_DEVICE_KEYS = ("device", "read", "expect", "poll")
+#: Step keys that name the device a step addresses (the step grammar: a write's `device`, a raw
+#: write's `raw`, a read's `read`, an `expect`/`poll`'s own key).
+_DEVICE_KEYS = ("device", "raw", "read", "expect", "poll")
 
 
 def _remap_devices(steps: List[Any], device_map: Dict[str, str]) -> List[Any]:
@@ -75,6 +75,12 @@ class RawConfig:
         # Marker sequence -> (link, mode, trigger): what the link's unit runs
         # there. A side table: the engine config carries only the marker.
         self._unit_programs: Dict[str, Tuple[str, str, str]] = {}
+        # Marker sequence -> (action, frame length) of a unit program that runs
+        # one action of its personality, the frame fixed in lines or None.
+        self._unit_actions: Dict[str, Tuple[str, Optional[int]]] = {}
+        # Marker sequence -> (link, row, value): the row the link's camera map
+        # commits there, by its standard id (an int) or a custom row's name.
+        self._map_commits: Dict[str, Tuple[str, Union[int, str], int]] = {}
 
     @property
     def unit_programs(self) -> Dict[str, Tuple[str, str, str]]:
@@ -83,21 +89,53 @@ class RawConfig:
         return dict(self._unit_programs)
 
     def add_unit_program(self, name: str, link: str, mode: str,
-                         trigger: str = "freerun") -> str:
+                         trigger: str = "freerun", action: Optional[str] = None,
+                         frame_length: Optional[int] = None) -> str:
         """Append the marker at which `link`'s unit runs its personality with
-        `mode` and `trigger`; returns the (collision-suffixed) sequence
-        name."""
+        `mode` and `trigger`; `action` names one action of it (`records.ACTIONS`)
+        in place of the whole program, `frame_length` the frame its timing
+        fixes, in lines. Returns the (collision-suffixed) sequence name."""
         from .descriptors import unit_program
 
         before = set(self._sequences)
         self.add(name, [unit_program(link, mode, trigger)])
         unique = next(n for n in self._sequences if n not in before)
         self._unit_programs[unique] = (link, mode, trigger)
+        if action is not None:
+            self._unit_actions[unique] = (action, frame_length)
         return unique
+
+    def unit_action(self, name: str) -> Tuple[Optional[str], Optional[int]]:
+        """The action and the frame length a unit-program marker runs; (None,
+        None) for the whole program."""
+        return self._unit_actions.get(name, (None, None))
 
     def is_unit_program(self, name: str) -> bool:
         """Whether a sequence is a unit-program marker."""
         return name in self._unit_programs
+
+    def is_best_effort(self, name: str) -> bool:
+        """Whether a sequence is best effort: a device that does not answer
+        ends it with a note instead of an error."""
+        return name in self._best_effort
+
+    @property
+    def map_commits(self) -> Dict[str, Tuple[str, Union[int, str], int]]:
+        """Marker sequence name -> (link, row, value), in no order; the event
+        list gives the order."""
+        return dict(self._map_commits)
+
+    def add_map_commit(self, name: str, link: str, row: Union[int, str], value: int) -> str:
+        """Append the marker at which `link`'s camera map commits `row` at
+        `value`, in the row's unit. `row` is a standard `ParamId`, or a
+        custom row's name. Returns the (collision-suffixed) sequence name."""
+        from .descriptors import map_commit_step
+
+        before = set(self._sequences)
+        self.add(name, [map_commit_step(link, row, int(value))])
+        unique = next(n for n in self._sequences if n not in before)
+        self._map_commits[unique] = (link, row, int(value))
+        return unique
 
     def subset(self, names: List[str]) -> Dict[str, Any]:
         """The engine config of the named sequences only, in the given
@@ -302,8 +340,9 @@ def flatten(
     keep_sequences: bool = False,
 ) -> List[NormStep] | List[Tuple[str, List[NormStep]]]:
     """Flatten a config into a normalized stream: writes ``("w", dev, reg16, bytes)``,
-    reads ``("r", dev, reg16, len)``, expects ``("e", dev, reg16, mask, op, value)``;
-    waits drop out, retries flatten to their success path. ``keep_sequences`` groups."""
+    raw writes ``("x", dev, bytes)``, reads ``("r", dev, reg16, len)``, expects
+    ``("e", dev, reg16, mask, op, value)``; waits drop out, retries flatten to
+    their success path. ``keep_sequences`` groups."""
     if isinstance(config, RawConfig):
         handler = config.config_handler()
     else:
@@ -321,6 +360,9 @@ def flatten(
                 reg16 = (reg << 8) | (offset & 0xFF)
                 values = tuple(value) if isinstance(value, list) else (value,)
                 norm.append(("w", device, reg16, values))
+            elif call.name == "raw_write":
+                device, data = call.args
+                norm.append(("x", device, tuple(data)))
             elif call.name == "read":
                 device, reg, offset, length = call.args
                 norm.append(("r", device, (reg << 8) | (offset & 0xFF), length))

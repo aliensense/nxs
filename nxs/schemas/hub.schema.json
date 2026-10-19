@@ -17,6 +17,10 @@
       "type": "string",
       "pattern": "^[a-z][a-z0-9_\\-]*$"
     },
+    "product": {
+      "type": "string",
+      "description": "The product name the tool prints for the deserializers these flows drive; without one the deserializer's compatible stands."
+    },
     "api": {
       "type": "integer",
       "enum": [

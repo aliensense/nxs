@@ -6,23 +6,28 @@ import dataclasses
 import struct
 from typing import Any, Dict, List, Optional, Tuple
 
+from nxs._generated_constants import NxsMap
 from nxs.cam.descriptors import Descriptor, to_int
 from nxs.personality.records_fields import (
-    CONTROL_IDS, MAX_COMPATIBLE, MAX_NAME, MODE_PARAM, TRIGGER_PARAM,
-    RecordError, _CONTROL_NAMES, _CONTROL_ROW,
-    _IDENTITY_FLAG_PULSE_EXPOSURE, _IDENTITY_FLAG_TAKES_TRIGGER,
-    _IDENTITY_HEAD, _MODES_HEAD,
+    CONTROL_IDS, MAX_NAME, MODE_PARAM, TRIGGER_PARAM,
+    RecordError, _CONTROL_NAMES, _CONTROL_ROW, _MODES_HEAD,
     _MODE_FLAG_DEFAULT, _MODE_FLAG_SERIALIZER_CSI, _MODE_FLAG_TRIGGERABLE,
-    _MODE_HEAD, _NONE_U16, _NONE_U8, _RETIRED_TIMING, _RUN_PARAM,
-    _RUN_PARAMS_HEAD, _TIMING_FIELDS, _TRIGGERS_HEAD,
+    _MODE_HEAD, _NONE_U16, _NONE_U8, _RETIRED_TIMING,
+    _TIMING_FIELDS, _TRIGGERS_HEAD,
     _family_name, _fixed, _number, _read_text, _register, _register_spec,
     _text, _u, _unit_modes, _unpack)
+from nxs.personality.records_identity import (IdentityHead, decode_identity_head,
+                                              encode_identity_head)
 from nxs.cam.contracts import ContractError
 
 _STATUS_FLAG_INT = 0x01
 _STATUS_FLAG_WARN_NONZERO = 0x02
 _STATUS_FLAG_MASK = 0x04
 _STATUS_FLAG_EXPECT = 0x08
+#: The tail a cam personality appends to the IDENTITY head, the `IdentityCamField` layout: register
+#: and value widths, the identity register, its width and value, the alive register, default mode.
+_IDENTITY_CAM = struct.Struct("<BBHBHHB6x")
+assert _IDENTITY_CAM.size == NxsMap.IDENTITY_CAM_SIZE
 
 
 def mode_values(descriptor: Descriptor) -> Dict[str, int]:
@@ -31,37 +36,36 @@ def mode_values(descriptor: Descriptor) -> Dict[str, int]:
 
 def trigger_values(descriptor: Descriptor) -> Dict[str, int]:
     """Trigger preset name -> the `trigger` enum value that selects its
-    conversion: the presets (`trigger:` entries carrying `trigmode`) in
-    declaration order."""
+    conversion. The presets are the `trigger:` entries carrying `trigmode`.
+    A preset of the registry (`TriggerCode`: freerun, fast, sequential)
+    takes its code, so a driver names the conversion from the row alone;
+    any other takes the next value past the registry, in declaration
+    order."""
     trig = descriptor.raw("trigger") or {}
     presets = [str(k) for k, v in trig.items()
                if isinstance(v, dict) and "trigmode" in v]
-    return {name: i for i, name in enumerate(presets)}
-
-@dataclasses.dataclass(frozen=True)
-class RunParam:
-    """A run parameter a host stages in physical units: its index in the
-    image's parameter table, its unit, the range the unit accepts and the
-    default a run without a stage takes."""
-
-    index: int
-    unit: str
-    min: int
-    max: int
-    default: int
+    registry = {name.lower(): int(code) for code, name in NxsMap.TriggerCode._NAMES.items()}
+    values: Dict[str, int] = {}
+    free = len(registry)
+    for name in presets:
+        if name in registry:
+            values[name] = registry[name]
+        else:
+            values[name] = free
+            free += 1
+    return values
 
 @dataclasses.dataclass(frozen=True)
 class ParamMap:
     """How a personality's params are staged: the `mode` and `trigger`
     params' indices in the image's parameter table (None when the
     personality declares none) with the value behind each mode or
-    conversion name, and the run parameters by name."""
+    conversion name."""
 
     mode_index: Optional[int]
     modes: Dict[str, int]
     trigger_index: Optional[int]
     triggers: Dict[str, int]
-    run_params: Dict[str, RunParam] = dataclasses.field(default_factory=dict)
 
 def _param_index(params, name: str) -> Optional[int]:
     """The index of the param called `name` in a compiled parameter table
@@ -152,6 +156,9 @@ def _alive_register(descriptor: Descriptor) -> Optional[int]:
     return None
 
 def _encode_identity(descriptor: Descriptor, modes: List[str]) -> bytes:
+    """The IDENTITY record of a cam personality: the head every image
+    carries, the head's address and trigger facts under the descriptor's
+    compatible, then the tail of how the head answers."""
     meta = descriptor.raw("meta") or {}
     sync = descriptor.raw("sync") or {}
     timing = (descriptor.raw("trigger") or {}).get("timing") or {}
@@ -163,21 +170,20 @@ def _encode_identity(descriptor: Descriptor, modes: List[str]) -> bytes:
     alive = _alive_register(descriptor)
     flags = 0
     if sync.get("takes_trigger"):
-        flags |= _IDENTITY_FLAG_TAKES_TRIGGER
+        flags |= NxsMap.IDENTITY_FLAG_TAKES_TRIGGER
     if timing.get("pulse_width_is_exposure"):
-        flags |= _IDENTITY_FLAG_PULSE_EXPOSURE
-    head = _IDENTITY_HEAD.pack(
-        _u(meta.get("i2c_addr", 0x1A), 8, "meta.i2c_addr"),
+        flags |= NxsMap.IDENTITY_FLAG_PULSE_EXPOSURE
+    head = IdentityHead(address=_u(meta.get("i2c_addr", 0x1A), 7, "meta.i2c_addr"),
+                        flags=flags, compatible=descriptor.compatible)
+    tail = _IDENTITY_CAM.pack(
         _u(meta.get("reg_bits", 16), 8, "meta.reg_bits"),
         _u(meta.get("val_bits", 8), 8, "meta.val_bits"),
-        flags,
         _NONE_U16 if id_reg is None else _u(id_reg, 16, "meta.device_id_reg"),
         _u(meta.get("device_id_width", 1), 8, "meta.device_id_width"),
         0 if id_reg is None else _u(meta.get("device_id", 0), 16, "meta.device_id"),
         _NONE_U16 if alive is None else _u(alive, 16, "alive register"),
         modes.index(default))
-    return (head + _text(descriptor.name, MAX_NAME, "descriptor name")
-            + _text(descriptor.compatible, MAX_COMPATIBLE, "meta.compatible"))
+    return encode_identity_head(head, f"{descriptor.name} identity") + tail
 
 def _encode_modes(descriptor: Descriptor, modes: List[str], params=None) -> bytes:
     default = str(descriptor.raw("default_mode"))
@@ -258,25 +264,10 @@ def _encode_triggers(descriptor: Descriptor, params=None) -> bytes:
         buf += struct.pack("<B", value) + _text(name, MAX_NAME, "trigger preset")
     return bytes(buf)
 
-def _encode_run_params(params=None) -> bytes:
-    """Every range parameter of the compiled table, in table order; a
-    table of names alone, or none, records no run parameter."""
-    entries = [(i, p) for i, p in enumerate(params or [])
-               if not isinstance(p, str) and p.param_type == "range"]
-    buf = bytearray(_RUN_PARAMS_HEAD.pack(_u(len(entries), 8, "run param count")))
-    for index, p in entries:
-        lo, hi = int(p.values[0]), int(p.values[1])
-        buf += _RUN_PARAM.pack(_u(index, 8, f"{p.name} index"),
-                               _u(lo, 32, f"{p.name} min"), _u(hi, 32, f"{p.name} max"),
-                               _u(p.default, 32, f"{p.name} default"))
-        buf += _text(p.name, MAX_NAME, "run param name")
-        buf += _text(p.unit, MAX_NAME, f"{p.name} unit")
-    return bytes(buf)
-
 def _encode_controls(descriptor: Descriptor) -> bytes:
-    from nxs.cam import chips
+    from nxs.cam import laws
     try:
-        rows = chips.control_rows(descriptor)
+        rows = laws.control_rows(descriptor)
     except (KeyError, ContractError) as e:
         raise RecordError(f"{descriptor.name}: the {_family_name(descriptor)} family "
                           f"cannot derive its control rows: {e}") from None
@@ -298,19 +289,22 @@ def _encode_controls(descriptor: Descriptor) -> bytes:
     return bytes(buf)
 
 def _decode_identity(payload: bytes) -> Dict[str, Any]:
-    if len(payload) < _IDENTITY_HEAD.size:
-        raise RecordError("IDENTITY record truncated")
-    (addr, reg_bits, val_bits, flags, id_reg, id_width, device_id, alive,
-     default) = _IDENTITY_HEAD.unpack_from(payload)
-    name, pos = _read_text(payload, _IDENTITY_HEAD.size)
-    compatible, _ = _read_text(payload, pos)
-    return {"i2c_addr": addr, "reg_bits": reg_bits, "val_bits": val_bits,
-            "takes_trigger": bool(flags & _IDENTITY_FLAG_TAKES_TRIGGER),
-            "pulse_width_is_exposure": bool(flags & _IDENTITY_FLAG_PULSE_EXPOSURE),
+    """A cam personality's IDENTITY record, its head and its tail, as the
+    descriptor's facts. RecordError for a record that is no camera's: a
+    head alone, or a length of another layout."""
+    head = decode_identity_head(payload)
+    if len(payload) != NxsMap.IDENTITY_SIZE + _IDENTITY_CAM.size:
+        raise RecordError(f"IDENTITY record of {len(payload)} B carries no camera's tail")
+    (reg_bits, val_bits, id_reg, id_width, device_id, alive,
+     default) = _IDENTITY_CAM.unpack_from(payload, NxsMap.IDENTITY_SIZE)
+    return {"i2c_addr": head.address, "reg_bits": reg_bits, "val_bits": val_bits,
+            "takes_trigger": bool(head.flags & NxsMap.IDENTITY_FLAG_TAKES_TRIGGER),
+            "pulse_width_is_exposure": bool(head.flags & NxsMap.IDENTITY_FLAG_PULSE_EXPOSURE),
             "device_id_reg": None if id_reg == _NONE_U16 else id_reg,
             "device_id_width": id_width, "device_id": device_id,
             "alive_reg": None if alive == _NONE_U16 else alive,
-            "default_mode": default, "name": name, "compatible": compatible}
+            "default_mode": default, "name": head.name, "compatible": head.compatible,
+            "product": head.product}
 
 def _decode_triggers(payload: bytes) -> Tuple[Optional[int], Dict[str, int]]:
     if len(payload) < _TRIGGERS_HEAD.size:
@@ -325,21 +319,6 @@ def _decode_triggers(payload: bytes) -> Tuple[Optional[int], Dict[str, int]]:
         name, pos = _read_text(payload, pos + 1)
         triggers[name] = value
     return (None if index == _NONE_U8 else index), triggers
-
-def _decode_run_params(payload: bytes) -> Dict[str, RunParam]:
-    if len(payload) < _RUN_PARAMS_HEAD.size:
-        raise RecordError("RUN_PARAMS record truncated")
-    (count,) = _RUN_PARAMS_HEAD.unpack_from(payload)
-    pos = _RUN_PARAMS_HEAD.size
-    run_params: Dict[str, RunParam] = {}
-    for _ in range(count):
-        if pos + _RUN_PARAM.size > len(payload):
-            raise RecordError("RUN_PARAMS record truncated")
-        index, lo, hi, default = _RUN_PARAM.unpack_from(payload, pos)
-        name, pos = _read_text(payload, pos + _RUN_PARAM.size)
-        unit, pos = _read_text(payload, pos)
-        run_params[name] = RunParam(index=index, unit=unit, min=lo, max=hi, default=default)
-    return run_params
 
 def _decode_modes(payload: bytes) -> Tuple[Optional[int], List[Dict[str, Any]]]:
     if len(payload) < _MODES_HEAD.size:

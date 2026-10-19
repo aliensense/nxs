@@ -43,6 +43,20 @@ class DeviceStep:
 
 
 @dataclass(frozen=True)
+class RawWriteStep:
+    """A normalized raw write: ``data`` sent to ``device`` as one transaction
+    with no register framing. The shape of a part whose register address is
+    one byte on a bus of two-byte registers, the carrier's port expander,
+    whose first byte is its register."""
+
+    kind: Literal["raw"]
+    device: int
+    data: List[int]
+    sleep_ms: int = 0
+    comment: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class ReadStep:
     """A normalized device register read step; a ``store`` name collects the
     value into the run's result map. Reads do not feed later steps."""
@@ -90,7 +104,7 @@ class RetryBlockStep:
     comment: Optional[str] = None
 
 
-Step = Union[CmdStep, DeviceStep, ReadStep, ExpectStep, RetryBlockStep]
+Step = Union[CmdStep, DeviceStep, RawWriteStep, ReadStep, ExpectStep, RetryBlockStep]
 
 
 class ExpectFailedError(RuntimeError):

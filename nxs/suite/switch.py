@@ -2,6 +2,7 @@
 transports come from the manifest, which is the topology."""
 import os
 import sys
+from typing import Dict, List
 
 from nxs.suite import default_config_path, default_state_path, stray_declaration, use_config_path
 from nxs.suite.schema import ManifestError, load_suite_config
@@ -60,7 +61,7 @@ def cmd_switch(args) -> int:
 def _switch(args) -> int:
     from nxs.suite.reconcile import switch_suite
     from nxs.suite.switch_cam import (PORT_REFUSED, _owned_ports, _port_is_up, camera_steps,
-                                      ports_again_step, strapped_units)
+                                      ports_again_step)
 
     config_path = default_config_path()
     # The host's steps need no declaration (a fresh host boots no camera bus, and the
@@ -108,11 +109,12 @@ def _switch(args) -> int:
             failed += 1
     rc = 0
     if args.only_unit is None:
-        # A pod that took new firmware restarted behind a port recorded up;
-        # a port whose bring-up refused keeps its verdict.
-        down = [n for n in _owned_ports(cfg) if not _port_is_up(n)] if refused else []
+        # A pod on new firmware restarted behind its port, which comes up again: a port recorded up
+        # runs the old program until then, one the old firmware refused takes the declared image now.
         rc = ports_again_step(cfg, [report.name for report in reports if report.restarted],
-                              dry_run=args.dry_run, config_path=config_path, exclude=down)
+                              dry_run=args.dry_run, config_path=config_path)
+        # A refused port that came up after the units refuses the run no more.
+        refused = refused and not all(_port_is_up(name) for name in _owned_ports(cfg))
     if failed:
         print(f"{failed}/{len(reports)} unit(s) failed", file=sys.stderr)
     return _final_status(rc, refused=refused, failed=bool(failed))
@@ -129,3 +131,55 @@ def _final_status(ports_rc: int, *, refused: bool, failed: bool) -> int:
     if refused or failed or ports_rc == PORT_REFUSED:
         return 1
     return ports_rc
+
+
+def strapped_units(cfg) -> Dict[str, List[str]]:
+    """The declared units whose pod sits where it straps, not at its alias,
+    on an owned port that is not up: the unit steps skip them, with the
+    lines `nxs <port> status` prints for the pod. A pod at its alias is
+    read whatever its port's verdict, since the alias phase ran."""
+    from nxs.cam import port_state
+    from nxs.cam import run as cam_run
+    from nxs.cam.select import _hub_for, select_port_links
+    from nxs.suite.switch_cam import _owned_ports, _pod_at, _port_args, _port_is_up
+
+    skipped: Dict[str, List[str]] = {}
+    for name in _owned_ports(cfg):
+        if _port_is_up(name):
+            continue
+        port = cfg.ports[name]
+        topology, links = select_port_links(_port_args(name), require_port=True)
+        hub = _hub_for(topology)
+        flows = hub.flows()
+        pod_links = [l for l in links if l.nxs_units and l.has_camera]
+        names = {l.name: (l.unit.name if l.unit else None) for l in port.links}
+        if not any(names.get(l.name) for l in pod_links):
+            continue
+        try:
+            lock = port_state.BusLock()
+            with port_state.held_wait():
+                lock.__enter__()
+        except port_state.BusHeld:
+            continue        # the unit steps meet the held bus themselves
+        with lock:
+            i2c = cam_run.CamI2c(addr=hex(topology.des_addr), bus=topology.i2c_bus)
+            try:
+                i2c.open()
+                for link in pod_links:
+                    who = names.get(link.name)
+                    unit = link.nxs_units[0]
+                    alias, strapped = int(unit.alias_addr), int(unit.target_addr)
+                    if who is None or alias == strapped:
+                        continue
+                    hit = _pod_at(flows, hub, i2c, topology, link, (alias, strapped))
+                    if hit is not None and int(hit.link.address) != alias:
+                        skipped[who] = [f"{name}/{link.name}: pod {who} does not answer at its alias "
+                                        f"{alias:#04x}; a pod answers at {int(hit.link.address):#04x}",
+                                        "  - nxs switch"]
+                if not topology.is_direct:
+                    flows.close_windows(hub, i2c, topology)
+            except (OSError, RuntimeError):
+                pass        # a hub that does not answer: the unit steps say so per unit
+            finally:
+                i2c.close()
+    return skipped

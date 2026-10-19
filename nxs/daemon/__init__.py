@@ -5,10 +5,11 @@
 port construction the CLI uses (`nxs <port> on`, which builds the capture
 stack's configuration the booted table lacks once its walk has the heads
 streaming) for every nxs-owned hub port, then owns the data plane: unit
-capture bridged to ROS 2 per the manifest, the followers that keep each
-synced pair at one gain (`nxs.daemon.follow`) and the watch that brings a
-port up again when its pods stop answering at their aliases
-(`nxs.daemon.watch`).
+capture bridged to ROS 2 per the manifest, one camera node per camera link
+that is up (`nxs.daemon.cameras`), the followers that keep each synced pair
+at one gain (`nxs.daemon.follow`), the time discipline while it holds
+(`nxs.daemon.pusher`) and the watch that brings a port up again when its
+pods stop answering at their aliases (`nxs.daemon.watch`).
 A reload (SIGHUP) brings up again every port whose declaration changed and
 every port recorded up under another one, since the declaration is the
 truth: a by-hand `on --mode` override is undone by a reload. Each port's
@@ -26,8 +27,21 @@ import signal
 import sys
 import threading
 import time
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
+from nxs.daemon.build import BUILD_FILE, record_build, running_build, running_since
+from nxs.daemon.environment import (ROS_ENVIRONMENT_KEYS, ROS_ENVIRONMENT_REQUIRED, SOURCE_ROS,  # noqa: F401 (the daemon's surface)
+                                    record_environment, render_systemd_unit, ros_environment,
+                                    running_environment, unit_environment, with_transport_default)
+from nxs.daemon.plane import NO_ROS2, camera_plane, data_plane, hold_reason  # noqa: F401 (the daemon's surface)
+from nxs.daemon.ports import (capture_stack as _capture_stack, hub_silent as _hub_silent,  # noqa: F401 (the daemon's surface)
+                              left_down as _left_down, log_capture_stack as _log_capture_stack,
+                              log_verified as _log_verified, owned as _owned,
+                              runs_another_declaration as _runs_another_declaration)
+from nxs.daemon.residents import Residents
+from nxs.daemon.plane import (clear_camera_plane as _clear_camera_plane,
+                              clear_data_plane as _clear_data_plane, clear_hold as _clear_hold,
+                              record_data_plane as _record_data_plane, record_hold as _record_hold)
 from nxs.daemon.verdict import BRINGING_UP, port_verdict, record_verdict, settle_stale, verdict_of
 
 log = logging.getLogger("nxsd")
@@ -45,10 +59,13 @@ RELOAD_POLL_S = 0.2
 _port_work = threading.RLock()
 
 
-def _port_args(name: str) -> argparse.Namespace:
-    """`nxs <port> on` as the daemon runs it, its lines in the journal."""
-    return argparse.Namespace(topology=None, port=name, links=[], mode=None, fps=None,
-                              dry_run=False, cam_cmd="on", inner=True)
+def _port_args(name: str, links=(), modes=()) -> argparse.Namespace:
+    """`nxs <port> [<links>] on [--mode <mode> ...]` as the daemon runs it,
+    one mode for every link or one per link in order, its lines in the
+    journal."""
+    return argparse.Namespace(topology=None, port=name, links=list(links),
+                              mode=list(modes) or None, fps=None, dry_run=False,
+                              cam_cmd="on", inner=True)
 
 
 class _Reload(BaseException):
@@ -59,7 +76,13 @@ class _Reload(BaseException):
 
 class _Terminate(BaseException):
     """Raised by the SIGTERM handler so the daemon ends through `main`'s
-    cleanup: the followers stop and their heartbeats go."""
+    cleanup: the followers stop and their heartbeats go. `unbuilt` names
+    the ports a construction the stop ended left down, the ones that failed
+    and the ones it skipped; None for a stop outside a construction."""
+
+    def __init__(self, unbuilt: Optional[List[str]] = None) -> None:
+        super().__init__()
+        self.unbuilt = unbuilt
 
 
 class _Tee(io.TextIOBase):
@@ -120,9 +143,39 @@ def _take_reload() -> bool:
     return True
 
 
+#: The port work the main thread is inside (`_deferring_term`), and a SIGTERM held until it ends.
+#: The watch thread's bring-up ends under `_port_work` before the daemon's exit takes the lock.
+_deferrals = 0
+_term_pending = False
+
+
 def _on_term(signum, frame):
-    """SIGTERM: end the daemon through `main`'s cleanup."""
+    """SIGTERM: end the daemon through `main`'s cleanup, after the port work
+    it is on."""
+    global _term_pending
+    if _deferrals:
+        _term_pending = True
+        return
     raise _Terminate()
+
+
+@contextlib.contextmanager
+def _deferring_term():
+    """Port work on the main thread a SIGTERM must not cut short: the stop
+    lands when the work ends."""
+    global _deferrals, _term_pending
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    _deferrals += 1
+    try:
+        yield
+    finally:
+        _deferrals -= 1
+    if _deferrals == 0 and _term_pending:
+        _term_pending = False
+        log.info("SIGTERM: stopping after the port work")
+        raise _Terminate()
 
 
 def _load_checked():
@@ -183,38 +236,6 @@ def resolve_nxsd_path(argv0: str, which=shutil.which) -> Optional[str]:
     return which("nxsd")
 
 
-def render_systemd_unit(exec_path: str, user: Optional[str],
-                        capture_daemon: Optional[str] = None) -> str:
-    """The nxsd unit with an absolute entry point (systemd's PATH lacks ~/.local/bin),
-    ordered after the host's capture daemon. It runs as root: the boot table,
-    the capture stack's configuration and the ports are root's to touch, and
-    the state store under /var/lib is shared with the operator's shell."""
-    user_line = f"User={user}\n" if user else ""
-    after = "network.target" + (f" {capture_daemon}" if capture_daemon else "")
-    return ("[Unit]\n"
-            "Description=Aliensense NXS daemon (port construction + unit data plane)\n"
-            f"After={after}\n"
-            "\n"
-            "[Service]\n"
-            f"{user_line}"
-            f"ExecStart={exec_path}\n"
-            "Restart=on-failure\n"
-            "RestartSec=5\n"
-            "\n"
-            "[Install]\n"
-            "WantedBy=multi-user.target\n")
-
-
-def _owned(port) -> bool:
-    """A port this daemon programs: a hub declared with the nxs driver, or a
-    sensor on the port's own bus. A link there runs its personality on its
-    unit, or on the host when it declares none, so every such port with a
-    link is the daemon's to bring up at boot."""
-    if port.hub_compatible is not None:
-        return port.hub_driver == "nxs"
-    return bool(port.links)
-
-
 def _relinquishes(before, after) -> bool:
     """The new declaration does not own what the old one built: the hub is
     kernel-driven, the port's nodes changed (a hub came or went), or the port
@@ -222,45 +243,6 @@ def _relinquishes(before, after) -> bool:
     return (not _owned(after) or before.bus != after.bus
             or before.hub_compatible != after.hub_compatible
             or before.hub_addr != after.hub_addr)
-
-
-def _runs_another_declaration(port) -> bool:
-    """Whether an owned port is recorded up under a declaration other than
-    `port`: its record carries another digest, or none (a record another
-    build wrote, or an `on` that departed from the declaration). A port
-    the host cannot shape is left to its `on`, which says why."""
-    from nxs.cam import port_state
-    from nxs.cam import topology as cam_topo
-
-    if not _owned(port):
-        return False
-    try:
-        topology = cam_topo.port_topology(port)
-    except Exception:        # noqa: BLE001 (the port's `on` refuses it with the reason)
-        return False
-    if not any(port_state.link_state(topology, link) == port_state.STATE_UP
-               for link in topology.links):
-        return False
-    return port_state.port_record(topology).get("declared") != topology.declared
-
-
-def _left_down(port) -> bool:
-    """Whether an owned port has a link a step recorded this boot neither up
-    nor parked: a bring-up that did not verify, or a port `nxs switch`
-    recorded down to come up again (a pod took a new build, its hub lost
-    the aliases, or the port was parked). A port `off` parked is the
-    operator's, and one no step recorded is the construction's."""
-    from nxs.cam import port_state
-    from nxs.cam import topology as cam_topo
-
-    if not _owned(port):
-        return False
-    try:
-        topology = cam_topo.port_topology(port)
-    except Exception:        # noqa: BLE001 (the port's `on` refuses it with the reason)
-        return False
-    states = set(port_state.recorded_states(topology).values())
-    return port_state.STATE_UNKNOWN in states and port_state.STATE_PARKED not in states
 
 
 def _stopped_short(name: str) -> bool:
@@ -278,7 +260,7 @@ def _converge(cfg, previous) -> List[str]:
     whose last `on` stopped short and the ports left down, and park the
     ports the new manifest does not declare; returns the names of the
     ports that did not converge, retained and retried on the next reload."""
-    from nxs.suite.schema_ports import port_signature
+    from nxs.suite.schema_nodes import changed_nodes, port_signature
 
     changed = [n for n in sorted(cfg.ports)
                if previous is None
@@ -324,6 +306,9 @@ def _converge(cfg, previous) -> List[str]:
         for name in changed:
             port = cfg.ports[name]
             before = previous.ports.get(name) if previous is not None else None
+            # The journal names the nodes whose declaration moved.
+            if moved := (changed_nodes(before, port) if before is not None else []):
+                log.info("port %s reconverges: %s changed", name, ", ".join(moved))
             if before is not None and _owned(before) and _relinquishes(before, port):
                 # The port built under the old declaration is not the new one's:
                 # park it so nothing keeps streaming behind the change.
@@ -367,53 +352,14 @@ def _retained(fresh, previous, failed: List[str]):
     return fresh
 
 
-def _capture_stack(name: str, port) -> Tuple[Optional[str], int]:
-    """The port's capture-stack state for the booted table (`ready`,
-    `preparing`, `missing`) with the table's mode count; (None, 0) for a
-    port that streams no video, or one the host cannot shape (its `on`
-    says why). A missing configuration is the port's `on` to build, once
-    its walk has the heads streaming."""
-    from nxs import host as host_layer
-    from nxs.cam import topology as cam_topo
-    from nxs.host.cli import _table_rows, capture_stack_state
-
-    if not _owned(port) or not any(link.camera for link in port.links):
-        return None, 0
-    try:
-        topology = cam_topo.port_topology(port)
-    except Exception:        # noqa: BLE001 (the port's `on` refuses it with the reason)
-        return None, 0
-    host = host_layer.current()
-    return capture_stack_state(host, name, topology), len(_table_rows(host, topology.i2c_bus))
-
-
-def _log_capture_stack(name: str, port) -> None:
-    """After the `on` of a port whose capture stack had no configuration
-    for the booted table: the one it built, in the journal, or that none
-    was (the verb's refusal above it says why)."""
-    state, modes = _capture_stack(name, port)
-    if state == "ready":
-        log.info("port %s: capture stack built (%d modes)", name, modes)
-    else:
-        log.error("port %s: the capture stack's configuration was not built", name)
-
-
-def _log_verified(name: str, port) -> None:
-    """The delivery check the port's `on` passed, in the journal."""
-    from nxs.cam import port_state
-    from nxs.cam import topology as cam_topo
-    from nxs.cam.verbs import verify
-
-    topology = cam_topo.port_topology(port)
-    seen = port_state.verified(topology)
-    if seen:
-        log.info("port %s: verified %s", name, verify.summary(topology, seen["rates"]))
-
-
-def _bring_up(name: str, done: str, failed: str) -> int:
-    """The port's `on`, as `nxs <port> on` runs it: its lines go to the
-    journal, the outcome is logged as `port <name>: <done> ok` (or `rc=N`),
-    and the verdict is recorded for `nxs switch` (`port_verdict`)."""
+def _bring_up(name: str, done: str, failed: str, args: Optional[argparse.Namespace] = None,
+              kept: Optional[dict] = None) -> int:
+    """The port's `on`, as `nxs <port> on` runs it (`args` names another
+    form, a link at a row): its lines go to the journal, the outcome is
+    logged as `port <name>: <done> ok` (or `rc=N`), and the verdict is
+    recorded for `nxs switch` (`port_verdict`). `kept`, a recorded verdict,
+    stands in place of `up` when the run comes up: a walk back to a link's
+    recorded row leaves the refusal of the walk it undoes."""
     from nxs.cam import cli as cam_cli
     from nxs.cam.contracts import InfeasibleConfig
 
@@ -424,7 +370,7 @@ def _bring_up(name: str, done: str, failed: str) -> int:
     record_verdict(name, BRINGING_UP, [])
     try:
         with contextlib.redirect_stdout(printed):
-            rc = cam_cli.cmd_up(_port_args(name))
+            rc = cam_cli.cmd_up(args if args is not None else _port_args(name))
         # The verb's lines reach the journal before the line that sums them up.
         printed.flush()
         if rc == 0:
@@ -444,7 +390,10 @@ def _bring_up(name: str, done: str, failed: str) -> int:
         rc = 1
         lines = [f"{name}: {failed} ({exc})", "  - journalctl -u nxsd"]
         log.exception("port %s: %s", name, failed)
-    record_verdict(name, *verdict_of(rc, lines or printed.lines()))
+    if rc == 0 and kept is not None:
+        record_verdict(name, kept["verdict"], kept["lines"])
+    else:
+        record_verdict(name, *verdict_of(rc, lines or printed.lines()))
     return rc
 
 
@@ -455,44 +404,28 @@ CONSTRUCT_WAIT_S = 60.0
 CONSTRUCT_RETRY_S = 5.0
 
 
-def _hub_silent(port) -> bool:
-    """Whether the port declares a hub and it does not answer its first
-    register; a bus that does not open is a silent hub too."""
-    from nxs.cam import hubs
-    from nxs.cam import run as cam_run
-    from nxs.cam import topology as cam_topo
-    from nxs.cam.descriptors import to_int
-    from nxs.cam.verbs.status import _hub_answers
-
-    if port.hub_compatible is None:
-        return False
-    try:
-        topology = cam_topo.port_topology(port)
-        registers = hubs.for_topology(topology).descriptor(topology.des_compatible).registers
-    except Exception:        # noqa: BLE001 (the port's `on` refuses it with the reason)
-        return False
-    i2c = cam_run.CamI2c(addr=hex(topology.des_addr), bus=topology.i2c_bus)
-    try:
-        i2c.open()
-        return not _hub_answers(i2c, to_int(registers.get("REG0", {}).get("addr", 0)),
-                                topology.des_addr)
-    except (OSError, RuntimeError):
-        return True
-    finally:
-        i2c.close()
-
-
 def _construct(name: str, port) -> int:
     """The port's first bring-up, tried again every CONSTRUCT_RETRY_S while
-    it fails on a hub that does not answer, CONSTRUCT_WAIT_S at most."""
+    it fails on a hub that does not answer, CONSTRUCT_WAIT_S at most; a
+    stop ends the tries."""
     deadline = time.monotonic() + CONSTRUCT_WAIT_S
     while True:
         rc = _bring_up(name, "construction", "construction failed")
-        if rc == 0 or time.monotonic() >= deadline or not _hub_silent(port):
+        if rc == 0 or _term_pending or time.monotonic() >= deadline or not _hub_silent(port):
             return rc
         log.info("port %s: the hub does not answer; constructing again in %g s",
                  name, CONSTRUCT_RETRY_S)
-        time.sleep(CONSTRUCT_RETRY_S)
+        if _stop_waited(CONSTRUCT_RETRY_S):
+            return rc
+
+
+def _stop_waited(seconds: float) -> bool:
+    """Sleep `seconds`, ended early by a SIGTERM held for the port work;
+    whether one is held."""
+    deadline = time.monotonic() + seconds
+    while not _term_pending and time.monotonic() < deadline:
+        time.sleep(max(0.0, min(RELOAD_POLL_S, deadline - time.monotonic())))
+    return _term_pending
 
 
 def _construct_ports(cfg) -> List[str]:
@@ -504,28 +437,45 @@ def _construct_ports(cfg) -> List[str]:
     from nxs.cam import port_state
 
     failed: List[str] = []
-    # A bus another run holds is waited for, as `status` waits.
-    with _port_work, port_state.held_wait():
-        for name in sorted(cfg.ports):
-            port = cfg.ports[name]
-            if not _owned(port):
-                continue
-            unbuilt = _capture_stack(name, port)[0] == "missing"
-            rc = _construct(name, port)
-            if unbuilt:
-                _log_capture_stack(name, port)
-            if rc != 0:
-                failed.append(name)
-            else:
-                _log_verified(name, port)
+    try:
+        # A bus another run holds is waited for, as `status` waits.
+        with _deferring_term(), _port_work, port_state.held_wait():
+            for name in sorted(cfg.ports):
+                port = cfg.ports[name]
+                if not _owned(port):
+                    continue
+                if _term_pending:
+                    log.info("SIGTERM: port %s waits for the next start", name)
+                    failed.append(name)
+                    continue
+                unbuilt = _capture_stack(name, port)[0] == "missing"
+                rc = _construct(name, port)
+                if unbuilt:
+                    _log_capture_stack(name, port)
+                if rc != 0:
+                    failed.append(name)
+                else:
+                    _log_verified(name, port)
+    except _Terminate as stop:
+        stop.unbuilt = failed
+        raise
     return failed
 
 
-def _ros2_available() -> bool:
-    """Whether the bridge's ROS 2 client library imports in this process."""
-    import importlib.util
+def _ros2_available(importer=None) -> bool:
+    """Whether the bridge's ROS 2 client library imports in this process,
+    with the message types it publishes. The import itself, not a lookup:
+    an rclpy the path finds but whose libraries it does not would exit the
+    bridge into the unit's restart loop, a port construction each time."""
+    import importlib
 
-    return importlib.util.find_spec("rclpy") is not None
+    importer = importer or importlib.import_module
+    try:
+        importer("rclpy")
+        importer("sensor_msgs.msg")
+    except Exception:  # noqa: BLE001 (a broken install holds, never exits)
+        return False
+    return True
 
 
 def _reload(fresh, cfg, followers=None):
@@ -534,18 +484,69 @@ def _reload(fresh, cfg, followers=None):
     reprograms the heads they write, and start again on what the daemon
     holds; the port work is held throughout, so the watch's own bring-up
     never interleaves."""
-    from nxs.daemon import watch
+    with _deferring_term():
+        from nxs.daemon import watch
 
-    with _port_work:
-        if followers is not None:
-            followers.stop("nxsd reloads")
-        try:
-            cfg = _retained(fresh, cfg, _converge(fresh, cfg))
-        finally:
+        with _port_work:
             if followers is not None:
-                followers.start(cfg)
-    watch.serve(cfg)
+                followers.stop("nxsd reloads")
+            try:
+                cfg = _retained(fresh, cfg, _converge(fresh, cfg))
+            finally:
+                if followers is not None:
+                    followers.start(cfg)
+        watch.serve(cfg)
+        return cfg
+
+
+#: How long a daemon whose data plane stopped holds before it tries the plane again: a unit that
+#: restarts its personality after a camera run serves its descriptors seconds later.
+DATA_PLANE_RETRY_S = 30.0
+
+
+def _hold_then_retry(cfg, residents, wait=_reload_wait, retry_s: float = DATA_PLANE_RETRY_S):
+    """Hold the ports, the units disciplined by the daemon's own pusher,
+    until a reload lands or `retry_s` passes, and return the configuration
+    the data plane tries again with."""
+    from nxs.daemon.pusher import Pusher
+
+    pusher = Pusher()
+    _join(residents, pusher, cfg)
+    try:
+        deadline = time.monotonic() + retry_s
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            wait(remaining)
+            if not _take_reload():
+                continue
+            fresh = _load_checked()
+            if fresh is None:
+                log.error("keeping the previous configuration")
+                continue
+            cfg = _reload(fresh, cfg, residents)
+            break
+    finally:
+        _leave(residents, pusher, "the data plane tries again")
     return cfg
+
+
+def _join(residents, member, cfg) -> None:
+    """`member` added to the residents and started, under the port work: a
+    walk of the modes resident stops and starts the other members, and
+    meets this one either before it joins or after."""
+    with _port_work:
+        residents.add(member)
+        member.start(cfg)
+
+
+def _leave(residents, member, reason: str) -> None:
+    """`member` stopped and taken out of the residents, under the port work,
+    so a walk never starts it again once it left."""
+    with _port_work:
+        member.stop(reason)
+        residents.remove(member)
 
 
 def _hold_for_reload(cfg, wait=_reload_wait, followers=None) -> int:
@@ -572,7 +573,7 @@ def _await_in_tune(cfg=None, findings=(), wait=_reload_wait):
     from nxs.suite import default_config_path
     from nxs.suite.switch import manifest_present
 
-    _record_build()
+    record_build()
     why = f"no manifest at {default_config_path()}" if cfg is None else "the manifest is out of tune"
     while True:
         if cfg is not None:
@@ -604,32 +605,6 @@ def _refuse_owned(cfg, findings) -> None:
             record_verdict(name, f"refused: {lines[0]}", lines)
 
 
-#: Where a running daemon records the build it runs, beside the port record.
-BUILD_FILE = "nxsd.build"
-def running_build() -> Optional[str]:
-    """The build the running daemon recorded at start, None when none did."""
-    from nxs.cam import port_state
-
-    try:
-        return (port_state.state_dir() / BUILD_FILE).read_text().strip() or None
-    except OSError:
-        return None
-
-
-def _record_build() -> None:
-    """Record this daemon's build once its ports are constructed, or once it
-    holds for a manifest in tune: `nxs switch` restarts a daemon that a
-    newer wheel left running (a reload changes the manifest only) and
-    waits for the record to say so."""
-    from nxs.cam import port_state
-    from nxs.cli import _git_version
-
-    try:
-        (port_state.state_dir() / BUILD_FILE).write_text(_git_version() + "\n")
-    except OSError as exc:
-        log.warning("the build record was not written: %s", exc)
-
-
 def main(argv=None) -> int:
     from nxs.suite import default_config_path
     from nxs.suite.switch import manifest_present
@@ -644,28 +619,43 @@ def main(argv=None) -> int:
     logging.basicConfig(level=logging.INFO,
                         format="%(name)s: %(message)s")
 
+    global _term_pending
+    _term_pending = False
     signal.signal(signal.SIGHUP, _on_hup)
-    for name in settle_stale():
-        log.info("port %s: the daemon restarted during its bring-up; recorded stopped", name)
-    cfg = _loaded()
-    if cfg is None:
-        # A rejected manifest is the service's failure and the oneshot's; with
-        # none yet (a fresh host before `nxs generate`) the service holds for one.
-        if args.construct_only or manifest_present(default_config_path()):
-            return 1
-        cfg = _await_in_tune()
-    else:
-        findings = _out_of_tune(cfg)
-        if findings:
-            # The oneshot's status is the manifest's; the service holds for one in tune.
-            if args.construct_only:
+    signal.signal(signal.SIGTERM, _on_term)
+    _clear_hold()
+    try:
+        for name in settle_stale():
+            log.info("port %s: the daemon restarted during its bring-up; recorded stopped", name)
+        cfg = _loaded()
+        if cfg is None:
+            # A rejected manifest is the service's failure and the oneshot's; with
+            # none yet (a fresh host before `nxs generate`) the service holds for one.
+            if args.construct_only or manifest_present(default_config_path()):
                 return 1
-            cfg = _await_in_tune(cfg, findings)
-
-    failed = _construct_ports(cfg) if not args.no_construct else []
+            cfg = _await_in_tune()
+        else:
+            findings = _out_of_tune(cfg)
+            if findings:
+                # The oneshot's status is the manifest's; the service holds for one in tune.
+                if args.construct_only:
+                    return 1
+                cfg = _await_in_tune(cfg, findings)
+        failed = _construct_ports(cfg) if not args.no_construct else []
+    except _Terminate as stop:
+        log.info("SIGTERM: stopping")
+        # The oneshot's status is the construction's: a stop before it, or
+        # one that left a port down, is no success.
+        if args.construct_only and stop.unbuilt is None:
+            log.error("SIGTERM before the construction: no port was built")
+            return 1
+        if args.construct_only and stop.unbuilt:
+            log.error("construction stopped short for: %s", ", ".join(stop.unbuilt))
+            return 1
+        return 0
     # The record lands after the construction: `nxs switch` reads it as the
     # restarted daemon's readiness before its pod steps reach through the ports.
-    _record_build()
+    record_build()
     if args.construct_only:
         # The oneshot's status is the construction's: a deploy flashing
         # units behind these ports must not proceed on a false success.
@@ -676,61 +666,105 @@ def main(argv=None) -> int:
 
     from nxs.daemon import watch
     from nxs.daemon.follow import Followers
+    from nxs.daemon.modes import Modes
 
-    followers = Followers()
-    followers.start(cfg)
-    signal.signal(signal.SIGTERM, _on_term)
+    residents = Residents(Followers())
+    # A walk of the modes resident is a bring-up: the other residents stop for its length.
+    residents.add(Modes(residents=residents))
+    with _port_work:
+        residents.start(cfg)
     # The ports are up: the watch brings one whose pods lost their aliases up again.
-    watch.start(cfg, followers)
+    watch.start(cfg, residents)
     try:
-        return _serve(cfg, followers)
+        return _serve(cfg, residents)
     except _Terminate:
         log.info("SIGTERM: stopping")
         return 0
     finally:
         watch.stop()
-        followers.stop()
+        # A bring-up the watch or a walk runs ends before the residents stop,
+        # and none starts while they do.
+        with _port_work:
+            residents.stop()
+        _clear_hold()
+        _clear_data_plane()
+        _clear_camera_plane()
 
 
-def _serve(cfg, followers) -> int:
+def _serve(cfg, residents) -> int:
     """The daemon past construction: the unit data plane, or a hold for
-    the reloads that reconverge the ports."""
+    the reloads that reconverge the ports. The units are disciplined
+    either way: by the bridge while it serves them, by the daemon's own
+    pusher while it holds."""
+    from nxs.daemon.pusher import Pusher
+
+    ros2 = _ros2_available()
+    if ros2:
+        # One camera node runs per up camera link, beside the bridge or a unitless hold, reconciled
+        # against the port records; the resident records the links it serves, so a launch adds none.
+        from nxs.daemon.cameras import Cameras
+
+        _join(residents, Cameras(), cfg)
     if not cfg.units:
         log.info("no units declared; holding for SIGHUP (port reconvergence)")
-        return _hold_for_reload(cfg, followers=followers)
-    if not _ros2_available():
-        # The ports are up; the bridge has no ROS 2 to publish on. Hold
-        # them rather than exit into a restart loop that rebuilds them.
-        log.error("no ROS 2 environment for the unit bridge (nxs ros2 needs: pip install "
-                  "'aliensense-nxs[ros2]', inside a sourced ROS 2 environment); "
-                  "holding the ports for SIGHUP")
-        return _hold_for_reload(cfg, followers=followers)
+        return _hold_for_reload(cfg, followers=residents)
+    if not ros2:
+        # The ports are up and the bridge has no ROS 2 to publish on: hold them rather than exit
+        # into a restart loop that rebuilds them, and say so where `nxs status` reads it.
+        log.error("no ROS 2 environment for the unit bridge (the unit carries none: "
+                  "source the distribution, then nxs switch); holding the ports for SIGHUP")
+        _record_hold(NO_ROS2)
+        _join(residents, Pusher(), cfg)
+        return _hold_for_reload(cfg, followers=residents)
+    _clear_hold()
+
     # The data plane is the existing suite->ROS2 bridge, run in-process;
     # a SIGHUP between bridge exits reconverges changed ports only.
     from nxs.cli import build_parser, cmd_ros2
     global _data_plane_running
     while True:
         ros2_args = build_parser().parse_args(["ros2"])
-        _data_plane_running = True
+        stopped = None
         try:
+            # The record names the units this daemon bridges: an operator's bridge or launch
+            # defers to it instead of doubling every node.
+            _record_data_plane([unit.name for unit in cfg.units])
+            # A SIGHUP interrupts the bridge from here on; before, the handler only sets the flag
+            # read after the bridge, since a reload raised out of the record above ends the daemon.
+            _data_plane_running = True
             # The bridge serves the configuration this process validated: after
             # a rejected reload it restarts on the retained one.
             rc = cmd_ros2(ros2_args, cfg=cfg)
+            if rc:
+                stopped = f"exit {rc}"
         except _Reload:
             rc = 0
             log.info("data plane interrupted for the reload")
         except SystemExit as e:
             rc = e.code if isinstance(e.code, int) else 1
+            stopped = str(e) or f"exit {rc}"
             log.error("data plane exited: %s", e)
+        except Exception as e:  # noqa: BLE001 (any bridge failure holds the ports)
+            rc = 1
+            stopped = f"{type(e).__name__}: {e}"
+            log.exception("data plane failed")
         finally:
             _data_plane_running = False
+            _clear_data_plane()
         if not _take_reload():
-            return rc
+            if stopped is None:
+                return rc
+            # An exit would restart the unit into a construction of every
+            # port: hold them instead, disciplined, say why, and try again.
+            _record_hold(f"the data plane stopped: {stopped.splitlines()[0]}")
+            cfg = _hold_then_retry(cfg, residents)
+            _clear_hold()
+            continue
         fresh = _load_checked()
         if fresh is None:
             log.error("keeping the previous configuration")
             continue
-        cfg = _reload(fresh, cfg, followers)
+        cfg = _reload(fresh, cfg, residents)
 
 
 if __name__ == "__main__":

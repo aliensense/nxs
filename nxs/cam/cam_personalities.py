@@ -10,15 +10,13 @@ and no hub owns it. Under ``nxs --experimental`` the roots on
 (``cam_personalities-experimental/`` beside the source tree, or
 ``$NXS_CAM_EXPERIMENTAL``) layers its overlays over the shipped facts and
 adds the heads the product does not ship; without the flag neither is
-read."""
+read. The law families the facts name live beside the personalities on
+the same roots, and `nxs.cam.laws` binds them."""
 
 from __future__ import annotations
 
-import importlib.util
 import os
-import sys
 from pathlib import Path
-from types import ModuleType
 from typing import Any, Dict, List, Optional
 
 import yaml
@@ -45,6 +43,11 @@ def _tree_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
+def tree_dir() -> Path:
+    """The source tree's cam personality directory, beside `nxs/`."""
+    return _tree_root() / TREE_DIR_NAME
+
+
 def search_paths() -> List[Path]:
     """Where cam personality directories are read from, most specific
     first: the roots ``$NXS_CAM_PERSONALITIES`` names (under the flag only,
@@ -67,7 +70,7 @@ def search_paths() -> List[Path]:
                     f"unset it to run the shipped cam personalities")
             named.append(root)
     paths = named + [Path(PERSONALITY_DIR), Path(EARLIER_PERSONALITY_DIR)]
-    tree = _tree_root() / TREE_DIR_NAME
+    tree = tree_dir()
     if not named and tree.is_dir():
         paths.append(tree)
     return paths
@@ -142,8 +145,6 @@ class Registry:
         self._dirs: Dict[str, Path] = {}
         self._overlays: Dict[str, Path] = {}
         self._descriptors: Dict[str, Descriptor] = {}
-        self._modules: Dict[str, ModuleType] = {}
-        self._bound: Dict[str, Any] = {}
         self._images: Optional[List[Descriptor]] = None
         for root in roots:
             if not root.is_dir():
@@ -274,72 +275,6 @@ class Registry:
         path = directory / f"{directory.name}.py"
         return path if path.exists() else None
 
-    def module(self, name_or_compatible: str,
-               lines: Optional[Dict[str, int]] = None) -> Optional[Any]:
-        """A cam personality's physics surface (cached): the law family its
-        facts name (`meta.chip`), whatever sits beside the yaml (a behaviour
-        class is the compiler's, never a law module); else its own physics
-        module; else None for a yaml-only head. A behaviour class beside
-        facts naming no family is refused by file. With `lines`, the family
-        binds to the view of a port that runs them."""
-        descriptor = self.find(name_or_compatible)
-        if (descriptor.raw("meta") or {}).get("chip") or descriptor.from_unit:
-            return self._bind(descriptor, lines)
-        path = self.source(descriptor.name)
-        if path is None:
-            return None
-        module = self._load_module(descriptor, path)
-        from nxs.compiler import CamPersonality, HubDevice
-        if any(isinstance(obj, type) and issubclass(obj, CamPersonality)
-               and not issubclass(obj, HubDevice)
-               and obj is not CamPersonality for obj in vars(module).values()):
-            raise RegistryError(
-                f"{path}: a cam personality's behaviour class needs its "
-                f"laws — name the law family in {descriptor.name}.yaml "
-                f"meta.chip (sony_imx or generic)")
-        return module
-
-    def bind(self, descriptor: Descriptor,
-             lines: Optional[Dict[str, int]] = None) -> Any:
-        """The law family of facts a unit served, bound to the view."""
-        return self._bind(descriptor, lines)
-
-    def _bind(self, descriptor: Descriptor,
-              lines: Optional[Dict[str, int]] = None) -> Any:
-        key = descriptor.name
-        view = descriptor.at_lines(lines)
-        if view is not descriptor:
-            descriptor = view
-            key = f"{key}@{sorted(lines.items())}"
-        if key not in self._bound:
-            from .chips import bind
-            self._bound[key] = bind(descriptor)
-        return self._bound[key]
-
-    def _load_module(self, descriptor: Descriptor, path: Path) -> ModuleType:
-        name = descriptor.name
-        if name in self._modules:
-            return self._modules[name]
-        parent = "nxs_cam_personality"
-        if parent not in sys.modules:
-            stub = ModuleType(parent)
-            stub.__path__ = []
-            sys.modules[parent] = stub
-        module_name = f"{parent}.{name}"
-        spec = importlib.util.spec_from_file_location(module_name, path)
-        if spec is None or spec.loader is None:
-            raise RegistryError(f"cannot load {path}")
-        module = importlib.util.module_from_spec(spec)
-        module.FACTS = descriptor  # the head's own facts, for its physics
-        sys.modules[module_name] = module
-        try:
-            spec.loader.exec_module(module)
-        except Exception as exc:
-            sys.modules.pop(module_name, None)
-            raise RegistryError(f"error loading {path}: {exc}") from exc
-        self._modules[name] = module
-        return module
-
     def _unknown(self, name: str) -> RegistryError:
         searched = ", ".join(str(p) for p in self._roots)
         return RegistryError(
@@ -352,9 +287,12 @@ _cache: Optional[Registry] = None
 
 
 def reset_cache() -> None:
-    """Forget the registry (test seam; also after env changes)."""
+    """Forget the registry and the laws loaded from its roots (test seam;
+    also after env changes)."""
     global _cache
     _cache = None
+    from . import laws
+    laws.reset_cache()
 
 
 def registry(roots: Optional[List[Path]] = None, experimental: bool = False) -> Registry:
@@ -371,9 +309,12 @@ def registry(roots: Optional[List[Path]] = None, experimental: bool = False) -> 
 def prime(roots: List[Path], experimental: bool = False) -> Registry:
     """Make `roots` the registry: what a build compiles is what its
     program classes compose from, whatever the interpreter's search path
-    holds; the experimental tree stays out unless asked for."""
+    holds; the experimental tree stays out unless asked for. The laws
+    loaded from the earlier roots are forgotten."""
     global _cache
     _cache = Registry(roots, experimental)
+    from . import laws
+    laws.reset_cache()
     return _cache
 
 
@@ -391,10 +332,6 @@ def shipped(name_or_compatible: str) -> Descriptor:
 
 def source(name_or_compatible: str) -> Optional[Path]:
     return registry().source(name_or_compatible)
-
-
-def module(name_or_compatible: str, lines: Optional[Dict[str, int]] = None) -> Optional[Any]:
-    return registry().module(name_or_compatible, lines)
 
 
 def overlays() -> Dict[str, str]:

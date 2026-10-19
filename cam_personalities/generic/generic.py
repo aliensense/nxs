@@ -14,6 +14,11 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from nxs.cam.contracts import InfeasibleConfig, MipiContract
 from nxs.cam.descriptors import SEN, Descriptor, expect, to_int, w
+from nxs.cam.laws import ApplyLaw, RegSpec, camera_options
+
+#: The controls the apply writes; a table without all three derives no
+#: apply law.
+APPLY_CONTROLS = ("exposure", "frame_length", "gain")
 
 #: Controls the kernel scales rather than writes verbatim: gain is register
 #: steps per dB (form 1), given by a control's `num`/`den`.
@@ -141,36 +146,75 @@ class Generic:
         gate = self._stream_gate()
         return self._write(str(gate["reg"]), to_int(gate["standby"]), comment="stream off")
 
-    def _knob(self, name: str, control: Dict[str, Any]) -> Callable[[int], List[Dict[str, Any]]]:
-        low, high = to_int(control["min"]), to_int(control["max"])
-        reg = str(control["reg"])
+    def _line_times_ns(self) -> Tuple[int, ...]:
+        """One line period per unit mode, from the capture row of the
+        mode's geometry: `line_length` pixel clocks at `pix_clk_hz`. A
+        mode without such a row gets 0, which the camera map record
+        refuses."""
+        cap = self._d.raw("capture") or {}
+        pix_clk_hz = to_int(cap.get("pix_clk_hz", 0))
+        rows = {(to_int(r["width"]), to_int(r["height"]), to_int(r["bit_depth"])): r
+                for r in cap.get("table") or []}
+        times = []
+        for name in self._d.program_modes():
+            geo = self._d.modes[name]["geometry"]
+            row = rows.get((to_int(geo["width"]), to_int(geo["height"]), to_int(geo["bit_depth"])), {})
+            length = row.get("line_length")
+            times.append(round(to_int(length) * 1e9 / pix_clk_hz) if length and pix_clk_hz else 0)
+        return tuple(times)
 
-        def knob(value: int) -> List[Dict[str, Any]]:
-            if not low <= int(value) <= high:
-                raise InfeasibleConfig(
-                    f"{name} {value} outside {low}..{high}",
-                    alternatives=[f"{name} {min(max(int(value), low), high)}"])
-            return self._write(reg, int(value), comment=f"{name} {value}")
+    def apply_law(self) -> ApplyLaw:
+        """The constants of the personality's `apply` action for a
+        table-only part: the exposure, frame-length and gain controls
+        written as the table clamps them, the gain scaled by its num/den
+        over the capture stack's factor, under the group-hold control when
+        the table declares one. The exposure register counts whatever the
+        datasheet says it counts, so the frame itself is the exposure's
+        ceiling. The line times are the capture rows' (`_line_times_ns`)."""
+        controls = self._controls()
+        regs = self._d.registers
+        exposure, frame, gain = (controls[name] for name in APPLY_CONTROLS)
+        cap_gain = (self._d.raw("capture") or {}).get("gain") or {}
+        num, den = to_int(gain.get("num", 1)), to_int(gain.get("den", 1))
+        # The staged gain is in the capture stack's unit, `factor` per dB, and
+        # `num/den` is register steps per dB: reg = value x num / (den x factor).
+        factor = to_int(cap_gain.get("factor", 1))
+        reg_max = to_int(gain["max"])
+        hold = controls.get("group_hold")
+        return ApplyLaw(
+            hold=RegSpec.of(regs, str(hold["reg"])) if hold else None,
+            frame_length=RegSpec.of(regs, str(frame["reg"])),
+            shutter=RegSpec.of(regs, str(exposure["reg"])),
+            gain=RegSpec.of(regs, str(gain["reg"])),
+            frame_length_min=to_int(frame["min"]), frame_length_max=to_int(frame["max"]),
+            frame_length_floors=(to_int(frame["min"]),), line_times_ns=self._line_times_ns(),
+            exposure_min=to_int(exposure["min"]), exposure_margin=0, shs_floor=0,
+            shutter_inverted=False,
+            gain_num=num, gain_den=den * factor, gain_reg_max=reg_max,
+            gain_min=max(0, to_int(cap_gain.get("min", 0))),
+            gain_max=(to_int(cap_gain["max"]) if "max" in cap_gain
+                      else reg_max * den * factor // num),
+            gain_step=max(1, to_int(cap_gain.get("step", 1))),
+            gain_factor=factor,
+            stream_gate=self._stream_gate() is not None)
 
-        knob.__name__ = f"knob_{name}"
-        knob.__doc__ = f"Direct {reg} write, {low}..{high}."
-        return knob
+    def options(self, view) -> Dict[str, Any]:
+        """What the family narrows on its camera's rows: the rate row takes
+        the one rate the declared mode's table sets (`camera_options`)."""
+        return camera_options(view, self._d, lambda mode: (self.fps_ceiling(mode),) * 2)
 
     def surface(self) -> Dict[str, Callable[..., Any]]:
         names = ["descriptor", "default_mode", "export_mipi_contract",
                  "fps_ceiling", "fps_floor", "sync_capability", "derive_status",
-                 "knob_readback"]
+                 "knob_readback", "options"]
         if self._alive_reg() is not None:
             names.append("expect_alive")
         gate = self._stream_gate()
         if gate is not None:
             names += ["start", "stop"]
-        offered: Dict[str, Callable[..., Any]] = {n: getattr(self, n) for n in names}
-        for name, control in self._controls().items():
-            if gate is not None and name == STREAM_GATE:
-                continue        # the gate is the flows', never a live knob
-            offered[f"knob_{name}"] = self._knob(name, control)
-        return offered
+        if set(APPLY_CONTROLS) <= set(self._controls()):
+            names.append("apply_law")
+        return {n: getattr(self, n) for n in names}
 
     def control_rows(self) -> List[Tuple[str, str, int, Tuple[int, ...]]]:
         """One kernel row per declared control: gain scaled by its
@@ -191,3 +235,8 @@ class Generic:
             else:
                 rows.append((kernel, str(control["reg"]), 0, ()))
         return rows
+
+
+def bind(descriptor: Descriptor) -> Generic:
+    """The family bound to a descriptor's facts."""
+    return Generic(descriptor)

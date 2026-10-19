@@ -208,6 +208,16 @@ class _Emitter:
         self._fixups.append((fixup_pos, label, offset, len(placeholder)))
         self._instructions.append((None, placeholder))
 
+    def emit_select(self, reg: int, labels: list):
+        """Emit `SELECT reg` over `labels`: one 16-bit offset per label, each
+        a fixup relative to the instruction's start, as the jumps are."""
+        self._on_emit(Op.SELECT)
+        offset = self._current_offset()
+        placeholder = struct.pack("<BBB", Op.SELECT, reg, 2 * len(labels)) + bytes(2 * len(labels))
+        for i, label in enumerate(labels):
+            self._fixups.append((offset + 3 + 2 * i, label, offset, len(placeholder)))
+        self._instructions.append((None, placeholder))
+
     def _on_emit(self, opcode: int):
         for name in self._pending_labels:
             self._label_op[name] = opcode

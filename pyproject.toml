@@ -4,19 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aliensense-nxs"
-version = "1.1.0"
+# The product version, read from the generated constants ([tool.setuptools.dynamic]).
+dynamic = ["version"]
 description = "NXS sensor VM compiler, suite manager, and command-line tool"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
 authors = [{name = "Aliensense"}]
-# The I2C install: smbus2 for the bus, ruamel.yaml to edit the manifest round-trip,
+# The I2C install: ruamel.yaml to edit the manifest round-trip,
 # pyyaml to read every other YAML, argcomplete for the shell.
 dependencies = [
     "argcomplete",
     "pyyaml",
     "ruamel.yaml",
-    "smbus2",
 ]
 
 # The Cyphal wires are the library's; the extra adds pyserial for the serial
@@ -43,6 +43,11 @@ nxsd = "nxs.daemon:main"
 [tool.setuptools.packages.find]
 include = ["nxs*"]
 exclude = ["nxs.tests*"]
+
+# NXS_VERSION is a module-level string literal, which setuptools reads
+# without importing the package.
+[tool.setuptools.dynamic]
+version = {attr = "nxs._generated_constants.NXS_VERSION"}
 
 # The vendored DSDL ships in the wheel so `aliensense-nxs[cyphal]` is self-contained; the
 # ros2/ data (launch file, RViz config) ships too, found via `nxs ros2 --launch-file`.

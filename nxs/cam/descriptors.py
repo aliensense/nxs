@@ -27,23 +27,25 @@ def to_int(value: Any) -> int:
         return value
     return parse_int(value)
 
-# Canonical device codenames and their corpus alias names.
+# Canonical device codenames and their corpus alias names; EXP is the
+# carrier's port expander, which takes raw writes alone.
 DES = "DES"
 SER = "SER"
 SEN = "SEN"
+EXP = "EXP"
 
 ROLE_TO_ALIAS: Dict[str, str] = {
     DES: "ADR_DESERIALIZER",
     SER: "ADR_SERIALIZER",
     SEN: "ADR_SENSOR",
+    EXP: "ADR_EXPANDER",
 }
 ALIAS_TO_ROLE: Dict[str, str] = {v: k for k, v in ROLE_TO_ALIAS.items()}
 
-#: Default alias block for composed configs. `CMD_UNIT_PROGRAM` marks the
-#: point where a link's unit runs its cam personality; the engine
-#: never executes it (the CLI splits the plan there).
+#: Default alias block for composed configs. The engine runs neither marker: the CLI splits a plan
+#: at `CMD_UNIT_PROGRAM` (a unit runs its personality) and `CMD_MAP_COMMIT` (a map commits a row).
 STANDARD_ALIASES: Dict[str, Dict[str, Any]] = {
-    "commands": {"CMD_WAIT_MILLIS": 2, "CMD_UNIT_PROGRAM": 3},
+    "commands": {"CMD_WAIT_MILLIS": 2, "CMD_UNIT_PROGRAM": 3, "CMD_MAP_COMMIT": 4},
     "addresses": {
         "ADR_SENSOR": "0x1A",
         "ADR_SERIALIZER": "0x42",
@@ -64,9 +66,22 @@ def unit_program(link: str, mode: str, trigger: str = FREERUN) -> Dict[str, Any]
             "comment": f"link {link}: unit program mode {mode}, trigger {trigger}"}
 
 
-def is_unit_program(step: Any) -> bool:
-    """Whether a raw step is the unit-program marker."""
-    return isinstance(step, dict) and step.get("cmd") == "CMD_UNIT_PROGRAM"
+def is_marker(step: Any) -> bool:
+    """Whether a raw step is a marker the engine does not run: a unit
+    program or a camera-map commit."""
+    return isinstance(step, dict) and step.get("cmd") in ("CMD_UNIT_PROGRAM", "CMD_MAP_COMMIT")
+
+
+def map_commit_step(link: str, row, value: int) -> Dict[str, Any]:
+    """Build the marker step at which `link`'s camera map commits `row` (a
+    standard `ParamId` or a custom row's name) at `value`, in the row's
+    unit; the facts ride the plan's side table (`RawConfig.map_commits`),
+    the step only names them."""
+    from nxs._generated_constants import NxsMap
+
+    label = row if isinstance(row, str) else NxsMap.ParamId._NAMES.get(int(row), str(row)).lower()
+    return {"cmd": "CMD_MAP_COMMIT", "comment": f"link {link}: {label} {value} on its camera map"}
+
 
 
 def _split_reg16(reg16: int) -> tuple[str, str]:
@@ -93,6 +108,26 @@ def w(
             if isinstance(value, list)
             else f"0x{value & 0xFF:02X}"
         ),
+    }
+    if sleep_ms:
+        step["sleep_ms"] = sleep_ms
+    if comment:
+        step["comment"] = comment
+    return step
+
+
+def raw(
+    role: str,
+    data: List[int],
+    sleep_ms: int = 0,
+    comment: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build a raw write step for ``role``: ``data`` sent as one transaction
+    with no register framing, the first byte a one-byte register's address
+    on a part such as the port expander."""
+    step: Dict[str, Any] = {
+        "raw": ROLE_TO_ALIAS[role],
+        "value": [f"0x{v & 0xFF:02X}" for v in data],
     }
     if sleep_ms:
         step["sleep_ms"] = sleep_ms
@@ -449,7 +484,7 @@ class Descriptor:
         """Why the unit program does not offer `name` (a declared mode)."""
         mode = self.modes.get(name) or {}
         if mode.get("host_only"):
-            return "no unit program for it yet; the laws still judge it"
+            return "the unit program does not offer it; the laws still judge it"
         return "not a declared mode"
 
     def program_triggers(self) -> List[str]:

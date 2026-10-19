@@ -5,15 +5,18 @@ from __future__ import annotations
 import argparse
 import sys
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 from nxs import term
+from nxs._generated_constants import NxsMap
 
 from nxs.cam.contracts import InfeasibleConfig, Topology
+from nxs.cam.engine.i2c import I2CHandlerError
 from nxs.cam.plan import flatten
 from nxs.cam import port_state
-from nxs.cam import hubs, unit_source
+from nxs.cam import hubs, pods, unit_source
+from nxs.cam import laws as cam_laws
 from nxs.cam import run as cam_run
 from nxs.cam import timing as cam_timing
 from nxs.cam.identity import _require_nxs_hub
@@ -24,29 +27,6 @@ from nxs.cam.verbs import verify
 from nxs.cam.verbs.caps import _camera_knobs, _hub_fsync_rate
 from nxs.cam.verbs.sync import (LOOP_EXPOSURE, _fsync_plan, _record_hints, _record_sync, pair_gain_fact,
                                 plan_text, pulse_exposure_fact, pulse_sets_exposure, sync_text)
-
-
-def _sensor_readings(hub, topology: Topology, link) -> Dict[str, int]:
-    """Live sensor status readings through the link's window ({} when the bus
-    is unavailable); the vmax/hmax context knob builders need."""
-    from nxs.cam.diag import run_probes
-
-    flows = hub.flows()
-    i2c = cam_run.CamI2c(addr=hex(topology.des_addr), bus=topology.i2c_bus)
-    try:
-        i2c.open()
-    except Exception:
-        return {}
-    try:
-        flows.open_window(hub, i2c, topology, link)
-        send = hub.descriptor(link.sensor_compatible)
-        results = run_probes(i2c, hubs.sensor_address(hub, link), send)
-        flows.close_windows(hub, i2c, topology)
-        return {r.name: r.raw for r in results if r.raw is not None}
-    except Exception:
-        return {}
-    finally:
-        i2c.close()
 
 
 def cmd_set(args: argparse.Namespace) -> int:
@@ -67,10 +47,12 @@ def cmd_set(args: argparse.Namespace) -> int:
 
 
 def _set(args: argparse.Namespace, topology: Topology, hub, flows) -> int:
-    """`set` on the port: the sync, a link's camera knob, else the link's
-    unit's parameter."""
+    """`set` on the port: the sync, the mode, a link's camera knob, else the
+    link's unit's parameter."""
     if args.knob == "sync":
         return _set_sync(args, topology, hub, flows)
+    if args.knob == "mode":
+        return _set_mode(args, topology)
     if args.knob == "exposure" and pulse_sets_exposure(topology, args.link or topology.links[0].name):
         # A synced link's exposure is its trigger pulse's; a link the trigger
         # leaves free-running keeps its own.
@@ -84,7 +66,7 @@ def _set(args: argparse.Namespace, topology: Topology, hub, flows) -> int:
         # A gain set by hand leaves the pair's one gain: the leader's loop or
         # the follower moves it back, or it breaks the declared lock.
         raise InfeasibleConfig(pair_gain, alternatives=[
-            f"ports.{_port_name(topology)}.camera.gain_db: <dB> in suite.yaml, then nxs switch"])
+            f"{topology.hub_param_path('gain')}: <dB> in suite.yaml, then nxs switch"])
     if args.link is None and len(topology.links) > 1:
         names = "|".join(l.name for l in topology.links)
         raise _refuse(
@@ -97,49 +79,105 @@ def _set(args: argparse.Namespace, topology: Topology, hub, flows) -> int:
         return _set_unit_param(topology, link_spec, args)
     if not link_spec.has_camera:
         raise _refuse_pod_only(topology, link_spec, f"set {args.knob} {args.value}")
-    import inspect
-
-    # The running port's mode judges the knob; a hub whose knob planner
-    # takes none keeps its own default.
-    extra: Dict[str, Any] = {}
-    if "mode" in inspect.signature(flows.build_knob).parameters:
-        extra["mode"] = port_state.port_mode(topology, link_spec)
-
-    def compose(readings, value=args.value):
-        try:
-            return flows.build_knob(
-                hub, topology, args.knob, value,
-                link=args.link, readings=readings, **extra,
-            )
-        except KeyError as exc:
-            raise SystemExit(f"nxs: {exc}")
-
+    mode = port_state.port_mode(topology, link_spec)
     if args.dry_run:
-        # Inert by contract: compose from descriptor defaults, no bus IO.
-        print_stream(flatten(compose({})))
+        # Inert by contract: the knob judged and named, no bus IO.
+        print(_would(hub, topology, link_spec, args.knob, args.value, mode))
         return 0
     targets = [link_spec] if args.link else list(topology.links)
     _require_up(topology, targets, "set")
-    # CTRL0's low bits are link enables: isolating one link's sensor
-    # powers down its live sibling (and nothing re-arms the pipes).
-    others_up = [l for l in topology.links
-                 if l.name != link_spec.name
-                 and port_state.link_state(topology, l)
-                 == port_state.STATE_UP]
-    if args.link and others_up:
-        names = ", ".join(l.name for l in others_up)
-        raise _refuse(
-            f"nxs: set to link {link_spec.name} would drop live video on {names}",
-            "set before stream", f"nxs {_port_name(topology)} off (park first)")
-    # One lock spans the live readings, composition, and execution so a
-    # concurrent run cannot move the window between read and write.
-    with port_state.BusLock():
-        cfg = compose(_sensor_readings(hub, topology, link_spec))
-        ok = cam_run._execute(cfg.to_dict(), topology.i2c_bus, f"set-{args.knob}",
-                      guard=(hub, topology))
+    ok = _set_knob(hub, topology, link_spec, args.knob, args.value, mode)
     if ok and args.knob == "fps":
-        _hold_rate(args, topology, hub, flows, link_spec, compose)
+        _hold_rate(args, topology, hub, flows, link_spec, mode)
     return 0 if ok else 1
+
+
+def _door_commit(hub, topology: Topology, link, knob: str, value: str,
+                 mode: Optional[str]) -> Optional[Tuple[Any, int]]:
+    """The knob judged by the hub's laws as they plan it (`build_knob`): the
+    row and the value its camera door commits, a pod's or a smart camera's;
+    None for a bare head, whose apply stages the knob instead.
+
+    Raises:
+        InfeasibleConfig: The laws' refusal of the knob or its value.
+        SystemExit: A knob the link's head does not have.
+    """
+    flows = hub.flows()
+    extra: Dict[str, Any] = {"mode": mode} if "mode" in _accepted(flows.build_knob) else {}
+    try:
+        plan = flows.build_knob(hub, topology, knob, value, link=link.name, **extra)
+    except KeyError as exc:
+        raise SystemExit(f"nxs: {exc}")
+    commits = [(row, staged) for _link, row, staged in plan.map_commits.values()]
+    return commits[0] if commits else None
+
+
+def _bare(hub, topology: Topology, link, knob: str, value: str, mode: Optional[str]):
+    """A bare head's knob as its apply stages it (`compose_heads.bare_knob`):
+    the port's composition, the head, the run parameter, its value in the
+    parameter's unit and the value in the knob's words."""
+    from nxs.cam import compose_heads, graph
+
+    composition = graph.compose_port(hub, topology)
+    head = composition.heads[link.name]
+    row = next(r for r in composition.links if r.name == link.name)
+    index, staged, text = compose_heads.bare_knob(hub, topology, link, head, knob, value, mode,
+                                                  line_ns=row.line_time_ns)
+    return composition, head, index, staged, text
+
+
+def _would(hub, topology: Topology, link, knob: str, value: str, mode: Optional[str]) -> str:
+    """The line a dry run of the knob prints: the commit on the link's camera
+    door, else the bare head's apply on the host."""
+    where = f"{_port_name(topology)}/{link.name}"
+    commit = _door_commit(hub, topology, link, knob, value, mode)
+    if commit is not None:
+        row, staged = commit
+        name = row if isinstance(row, str) else NxsMap.ParamId._NAMES[int(row)].lower()
+        return f"{where}: would commit {name} {staged} on its camera door"
+    _composition, head, _index, _staged, text = _bare(hub, topology, link, knob, value, mode)
+    return f"{where}: would run {head.name}'s apply on the host with {knob} {text}"
+
+
+def _set_knob(hub, topology: Topology, link, knob: str, value: str, mode: Optional[str]) -> bool:
+    """One knob on the link's head, judged by the laws (`_door_commit`) and
+    run by the library's set (`nxs_graph_set`) under the bus lock: a pod or
+    a smart camera commits the row on its camera door, a bare head runs its
+    apply on the host with the knob's run parameter staged. True when the
+    knob took, else False after the line that says why."""
+    from nxs.cam import graph, map_commit
+
+    where = f"{_port_name(topology)}/{link.name}"
+    commit = _door_commit(hub, topology, link, knob, value, mode)
+    if commit is not None:
+        row, staged = commit
+        composition = graph.compose_port(hub, topology)
+        with port_state.BusLock():
+            failed = map_commit.door_set(topology, composition, link.name, row, staged)
+        if failed is not None:
+            term.err(failed)
+        return failed is None
+    composition, head, index, staged, text = _bare(hub, topology, link, knob, value, mode)
+    with port_state.BusLock():
+        failed = graph.set_head(topology, composition, link.name, index, staged)
+    if failed is not None:
+        term.err(f"{where}: {knob} {text}: {failed}")
+        return False
+    term.info(f"link {link.name}: {knob} {text} by {head.name}'s apply on the host")
+    return True
+
+
+def _set_mode(args: argparse.Namespace, topology: Topology) -> int:
+    """`set mode <row>`: the chain `on --mode` walks for the link (the whole
+    port with no link named): the booted table's row, the hub's pipes for
+    the row's data type, the pod's run at the row, then the delivery
+    check. A row the table does not boot is refused there."""
+    from nxs.cam.verbs.on import cmd_up
+
+    links = [args.link] if args.link else []
+    return cmd_up(argparse.Namespace(topology=getattr(args, "topology", None), port=args.port,
+                                     links=links, sensor=None, mode=[args.value], fps=None,
+                                     dry_run=bool(args.dry_run), cam_cmd="on"))
 
 
 def _camera_knob(hub, link, topology: Topology, knob: str) -> bool:
@@ -169,10 +207,10 @@ def _set_unit_param(topology: Topology, link, args: argparse.Namespace) -> int:
     from nxs.cam.verbs.status import _pod_names
     from nxs.cli import cmd_set as unit_set, suite_managed_note
     from nxs.personality.records_fields import (ACTION_PARAM, FRAME_LENGTH_PARAM, FRAME_PERIOD_PARAM,
-                                                LINE_TIME_PARAM, MODE_PARAM, TRIGGER_PARAM)
+                                                LINE_TIME_PARAM, TRIGGER_PARAM)
 
     port = _port_name(topology)
-    if args.knob in (MODE_PARAM, TRIGGER_PARAM, ACTION_PARAM, LINE_TIME_PARAM, FRAME_PERIOD_PARAM,
+    if args.knob in (TRIGGER_PARAM, ACTION_PARAM, LINE_TIME_PARAM, FRAME_PERIOD_PARAM,
                      FRAME_LENGTH_PARAM):
         raise _refuse(f"{port}/{link.name}: {args.knob} is the cam personality's run parameter, "
                       f"which the port's bring-up sets", f"nxs {port} {link.name} on --mode <mode>")
@@ -197,12 +235,12 @@ def _record_rate(hub, flows, topology: Topology, link, fps: float) -> None:
 
 
 def _hold_rate(args: argparse.Namespace, topology: Topology, hub, flows, link,
-               compose) -> None:
+               mode: Optional[str]) -> None:
     """`set fps` holds the link to the rate it asked. The rate and the caps
     are recorded before the count, since the capture stack's driver sets
     the frame from the caps' rate when a session starts; a rate the link
-    does not deliver is refused with the previous rate written back and
-    recorded."""
+    does not deliver is refused with the previous rate written back the
+    way the knob went and recorded."""
     port = _port_name(topology)
     previous = port_state.port_rate(topology, link)
     _record_rate(hub, flows, topology, link, float(args.value))
@@ -210,14 +248,9 @@ def _hold_rate(args: argparse.Namespace, topology: Topology, hub, flows, link,
     try:
         verify.check(hub, topology, [link], retry=f"nxs {port}{at} set fps {{fps}}")
     except InfeasibleConfig:
-        if previous is not None:
-            with port_state.BusLock():
-                cfg = compose(_sensor_readings(hub, topology, link), str(previous))
-                back = cam_run._execute(cfg.to_dict(), topology.i2c_bus, "set-fps",
-                                        guard=(hub, topology))
-            if back:
-                _record_rate(hub, flows, topology, link, previous)
-                term.info(f"{port}/{link.name}: back at {previous:g} fps")
+        if previous is not None and _set_knob(hub, topology, link, "fps", f"{previous:g}", mode):
+            _record_rate(hub, flows, topology, link, previous)
+            term.info(f"{port}/{link.name}: back at {previous:g} fps")
         raise
 
 
@@ -285,9 +318,7 @@ def apply_sync(topology: Topology, hub, flows, action: str, fps: Optional[float]
         print_stream(flatten(cfg))
         return 0
     previous = port_state.port_sync(topology)
-    with port_state.BusLock():
-        ok = cam_run._execute_split(cfg, topology, f"set-sync-{action}",
-                            guard=(hub, topology))
+    ok = _run_sync(hub, topology, action, fps)
     if not ok:
         # The program stopped part way: the heads hold what it wrote so far,
         # and the record must not claim the sync it ran before.
@@ -323,6 +354,23 @@ class SyncNotRestored(Exception):
     message is the fact line with its next command."""
 
 
+def _run_sync(hub, topology: Topology, action: str, fps: Optional[float]) -> bool:
+    """Put the port on `action`: the sync walk of its graph image composed
+    at `fps`, or its free-run walk. A port whose image carries no such walk
+    (no generator stands on it) runs free already, with nothing to switch.
+    A walk that stops prints why."""
+    from nxs.cam import graph
+
+    composition = graph.compose_port(hub, topology, fsync=fps if action == "fsync" else None)
+    which = graph.Walk.SYNC if action == "fsync" else graph.Walk.FREE
+    if not composition.steps(which):
+        return True
+    report = graph.run(hub, topology, which, composition)
+    if not report.ok:
+        term.err(f"{_port_name(topology)}: {report}")
+    return report.ok
+
+
 def _sync_program(hub, flows, topology: Topology, action: str, fps: Optional[float]):
     """The program that puts the port on `action`, the generator at `fps`
     under fsync, and the frame-sync plan it runs (None in free run)."""
@@ -344,10 +392,8 @@ def _restore_sync(hub, flows, topology: Topology, previous: Optional[Dict[str, A
     fps = (previous or {}).get("fps")
     action = "fsync" if (previous or {}).get("source") == "fsync" and fps is not None else "free_run"
     rate = float(fps) if action == "fsync" else None
-    cfg, plan = _sync_program(hub, flows, topology, action, rate)
-    with port_state.BusLock():
-        ok = cam_run._execute_split(cfg, topology, f"set-sync-{action}", guard=(hub, topology))
-    if not ok:
+    _cfg, plan = _sync_program(hub, flows, topology, action, rate)
+    if not _run_sync(hub, topology, action, rate):
         port_state.mark_unknown(topology, list(topology.links))
         raise SyncNotRestored(f"{port}: the sync it ran before did not come back\n  - nxs {port} on")
     _record_sync(hub, flows, topology, action, rate, plan=plan)
@@ -368,6 +414,83 @@ def _fastest(hub, topology: Topology, modes: Dict[str, str],
     if not rates or (fps is not None and max(rates) <= float(fps)):
         return []
     return [f"nxs {_port_name(topology)} set sync fsync --fps {max(rates)}"]
+
+
+#: The standard row each host form of a knob reads.
+_FORM_ROWS = {"fps": NxsMap.ParamId.FRAME_RATE_MFPS, "gain_db": NxsMap.ParamId.GAIN_MDB,
+              "gain": NxsMap.ParamId.GAIN_MDB, "exposure": NxsMap.ParamId.EXPOSURE_US,
+              "mode": NxsMap.ParamId.MODE}
+
+
+def _open(i2c, topology: Topology) -> None:
+    """Open the port's bus for a read: a bus this user may not open goes on
+    as its permission refusal, any other failure is the refusal naming the
+    bus."""
+    try:
+        i2c.open()
+    except I2CHandlerError as exc:
+        if isinstance(exc.__cause__, PermissionError):
+            raise
+        port = _port_name(topology)
+        raise _refuse(f"{port}: {topology.i2c_bus} does not open ({exc.__cause__ or exc})",
+                      f"nxs {port} status") from exc
+
+
+def _silent_map(hub, topology: Topology, link, exc: OSError) -> SystemExit:
+    """The refusal for a camera map that does not answer a read: a pod as
+    the error table names one that answers at neither its alias nor where
+    it straps, else the map's own silence beside a pod that answers, or a
+    smart camera's."""
+    port = _port_name(topology)
+    if link.nxs_units:
+        silent = pods._unanswered(topology, link, exc)
+        if silent is not None:
+            return _refuse(silent, "check the pod")
+    fact = f"{port}/{link.name}: no camera door answers at {hubs.map_address(hub, link):#04x}"
+    if link.nxs_units:
+        return _refuse(fact, f"nxs {port} status")
+    return _refuse(fact, f"check the cable and power on link {link.name}")
+
+
+def _get_map(hub, topology: Topology, link, knob: str) -> int:
+    """`get` on a link whose head serves the camera map: the row's value in
+    effect read from the map under the bus lock, in the row's unit, the
+    rate in frames a second, the gain in decibels and the mode by its name
+    for their forms. Under frame sync the port's rate is the hub
+    generator's. A map that does not answer is the error table's line."""
+    from nxs._libnxs_map import MapRefused, open_door
+
+    with port_state.BusLock():
+        if knob == "fps" and not topology.is_direct:
+            i2c = cam_run.CamI2c(addr=hex(topology.des_addr), bus=topology.i2c_bus)
+            _open(i2c, topology)
+            try:
+                hub_rate = _hub_fsync_rate(hub, i2c, topology)
+            finally:
+                i2c.close()
+            if hub_rate is not None:
+                print(f"{hub_rate:.2f}")
+                return 0
+        try:
+            with open_door(topology.i2c_bus, hubs.map_address(hub, link)) as door:
+                live, row = door.live(_FORM_ROWS.get(knob, knob))
+        except (LookupError, MapRefused) as exc:
+            raise SystemExit(f"nxs: {exc}")
+        except PermissionError:
+            raise
+        except OSError as exc:
+            raise _silent_map(hub, topology, link, exc) from exc
+    if knob == "fps":
+        print(f"{live / 1000:.2f}")
+    elif knob == "gain_db":
+        print(f"{live / 1000:g}")
+    elif knob == "mode":
+        # The MODE row's value is the mode's index among the personality's program modes.
+        modes = hub.descriptor(link.sensor_compatible).program_modes()
+        print(modes[live] if 0 <= live < len(modes) else live)
+    else:
+        print(f"{live} {row.unit}".rstrip())
+    return 0
 
 
 def cmd_get(args: argparse.Namespace) -> int:
@@ -400,10 +523,12 @@ def cmd_get(args: argparse.Namespace) -> int:
             # register is not what the sensor runs.
             print(pulse_exposure_fact((port_state.port_sync(topology) or {}).get("fps")))
             return 0
+        if hubs.map_address(hub, link) is not None and pods.camera_map_knobs(hub, link) is not None:
+            return _get_map(hub, topology, link, args.knob)
         i2c = cam_run.CamI2c(addr=hex(topology.des_addr), bus=topology.i2c_bus)
         hub_rate = None
         with port_state.BusLock():
-            i2c.open()
+            _open(i2c, topology)
             try:
                 flows.open_window(hub, i2c, topology, link)
                 send = hub.descriptor(link.sensor_compatible)
@@ -413,6 +538,11 @@ def cmd_get(args: argparse.Namespace) -> int:
                 flows.close_windows(hub, i2c, topology)
                 if args.knob == "fps":
                     hub_rate = _hub_fsync_rate(hub, i2c, topology)
+            except I2CHandlerError as exc:
+                # The window writes are the hub's: a hub that takes none does not answer.
+                port = _port_name(topology)
+                raise _refuse(f"{port}: the hub does not answer at {topology.des_addr:#04x}",
+                              f"check power and the coax on {port}") from exc
             finally:
                 i2c.close()
         # Under frame sync the hub's generator paces the frames, not the
@@ -420,7 +550,7 @@ def cmd_get(args: argparse.Namespace) -> int:
         if hub_rate is not None:
             print(f"{hub_rate:.2f}")
             return 0
-        module = hub.chip_module(link.sensor_compatible)
+        module = cam_laws.laws(hub.descriptor(link.sensor_compatible))
         hook = getattr(module, "knob_readback", None) if module else None
         derived = hook({k: r.raw for k, r in results.items()
                         if r.raw is not None}) if hook else {}

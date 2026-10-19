@@ -9,3 +9,15 @@ params:
   - {name: accel_fs, values: [2, 4, 8, 16], default: 8, unit: g}
   - {name: mag_odr, values: [10, 20, 100], default: 100, unit: Hz}
   - {name: mag_res, values: [14, 15], default: 15, unit: bit}
+  # The mount rotation of the sensor's frame, a Rotation code.
+  - name: orientation
+    type: range
+    values: [0, 23]
+    default: 0
+    kind: apply
+    id: MOUNT_ORIENTATION
+    labels: [NONE, YAW_90, YAW_180, YAW_270, PITCH_90, PITCH_180, PITCH_270, ROLL_90, ROLL_180,
+             ROLL_270, PITCH_90_YAW_90, PITCH_90_YAW_180, PITCH_90_YAW_270, PITCH_180_YAW_90,
+             PITCH_180_YAW_270, PITCH_270_YAW_90, PITCH_270_YAW_180, PITCH_270_YAW_270,
+             ROLL_90_YAW_90, ROLL_90_YAW_180, ROLL_90_YAW_270, ROLL_90_PITCH_180,
+             ROLL_270_YAW_90, ROLL_270_YAW_270]

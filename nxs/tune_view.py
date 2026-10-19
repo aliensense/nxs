@@ -12,7 +12,9 @@ Span = Tuple[str, str]
 Row = List[Span]
 
 ROLES = ("text", "muted", "dim", "rule", "accent", "ok", "warn", "err")
-NAME_WIDTH = 12
+NAME_WIDTH = 20
+#: The panel's words for the declaring knobs; every other knob reads its token.
+LABELS = {"CAM": "cam personality", "CLICK": "click personality"}
 BLOCK_ROWS = 6
 HINTS = (("↑↓", "move"), ("←→", "tune"), ("s", "save"), ("f", "freeze"),
          ("i", "identify"), ("r", "refresh"), ("q", "quit"))
@@ -90,13 +92,21 @@ def node_row(node: Node, prefix: str, focused: bool) -> Row:
     return row
 
 
+def knob_label(name: str) -> str:
+    """A knob's row word: the token lowered, the declaring knobs by their kind."""
+    base, _, nth = name.partition("-")
+    label = LABELS.get(base, name.lower())
+    return f"{label} {nth}" if nth else label
+
+
 def knob_row(knob: Knob, prefix: str, focused: bool) -> Row:
-    """A knob's name and value; a shipped value (a detent) reads `· shipped`."""
+    """A knob's name and value; a rate knob shows its ladder's ends."""
     row: Row = [("→ " if focused else "  ", "accent"), (prefix, "rule"),
-                (f"{knob.name.lower():<{NAME_WIDTH}} ", "dim"),
+                (f"{knob_label(knob.name):<{NAME_WIDTH}} ", "dim"),
                 (knob.value, "accent" if focused else "text")]
-    if knob.field.value in knob.field.detents:
-        row += [(" · ", "muted"), ("shipped", "muted")]
+    if knob.field.unit == "fps" and len(knob.field.options) > 1:
+        lo, hi = knob.field.options[0], knob.field.options[-1]
+        row += [(" · ", "muted"), (f"{lo:g}–{hi:g}", "muted")]
     return row
 
 

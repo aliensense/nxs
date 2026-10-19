@@ -15,6 +15,7 @@ import contextvars
 import fcntl
 import functools
 import os
+import stat
 import threading
 import time
 from pathlib import Path
@@ -35,6 +36,48 @@ STATE_PATH: Optional[str] = None
 SYSTEM_STATE_DIR = "/var/lib/aliensense"
 
 
+#: A directory of the store: setgid for the store's group, which writes it
+#: (nxsd makes them as root, the operator as itself).
+STORE_DIR_MODE = 0o2775
+
+
+def ensure_dir(path: Path) -> Path:
+    """Make `path` and its parents, and give every one of them under the
+    store `STORE_DIR_MODE`, so a directory one user made stays writable to
+    the group. A directory this user does not own keeps its mode."""
+    path.mkdir(parents=True, exist_ok=True)
+    store = Path(SYSTEM_STATE_DIR)
+    for made in [path, *path.parents]:
+        if store not in made.parents:
+            break
+        try:
+            os.chmod(made, STORE_DIR_MODE)
+        except OSError:
+            pass
+    return path
+
+
+def write_store_file(path: Path, data) -> None:
+    """Land a store file whole: a private temporary beside the target,
+    renamed over it, readable and writable to the owner and the group. A
+    file another user wrote is replaced, never opened, so what nxsd wrote
+    as root the operator writes next. `data` is text or bytes. A file this
+    user cannot replace raises `PermissionError`."""
+    import tempfile
+    ensure_dir(path.parent)
+    fd, staged = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data.encode("utf-8") if isinstance(data, str) else data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(staged, stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o664)
+        os.replace(staged, path)
+    except BaseException:
+        Path(staged).unlink(missing_ok=True)
+        raise
+
+
 def state_dir() -> Path:
     """The state store: `/var/lib/aliensense/cam` on a provisioned host (the
     directory exists and is writable), else the operator's own
@@ -43,9 +86,7 @@ def state_dir() -> Path:
     realized derivations live here."""
     system = Path(SYSTEM_STATE_DIR)
     if system.is_dir() and os.access(system, os.W_OK):
-        path = system / "cam"
-        path.mkdir(parents=True, exist_ok=True)
-        return path
+        return ensure_dir(system / "cam")
     base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
     path = Path(base) / "nxs"
     path.mkdir(parents=True, exist_ok=True)
@@ -90,6 +131,12 @@ def _write_capture(port: str, ids: Dict[str, Any], viewers: Dict[str, Dict[str, 
         rate = hints.get("framerate")
         if rate:
             lines += [f"fps_num={int(rate[0])}", f"fps_den={int(rate[1])}"]
+        if hints.get("triggered"):
+            # The chart's timing facts a frame consumer stamps by.
+            lines.append("triggered=1")
+            for key in ("readout_delay_ns", "exposure_offset_ns"):
+                if hints.get(key) is not None:
+                    lines.append(f"{key}={int(hints[key])}")
         pinned = hints.get("exposure_us")
         if pinned is not None and hints.get("exposure_max_us") is None:
             # A trigger's pulse fixes the exposure: the session pins both ends.
@@ -106,7 +153,7 @@ def _write_capture(port: str, ids: Dict[str, Any], viewers: Dict[str, Dict[str, 
         if role:
             lines += ["isp_gain_unity=1", "isp_filters_off=1"]
         path = capture_path(port, link)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_dir(path.parent)
         staged = path.with_name(path.name + ".tmp")
         staged.write_text("\n".join(lines) + "\n")
         os.replace(staged, path)
@@ -117,58 +164,15 @@ def _remove_capture(port: str, links: List[str]) -> None:
         capture_path(port, link).unlink(missing_ok=True)
 
 
-#: The heartbeat of the follower nxsd runs on a port's synced pair, one
-#: `key=value` file per port beside the record.
-FOLLOW_DIR = "follow"
-
-
-def follow_path(port: str) -> Path:
-    return state_dir() / FOLLOW_DIR / port
-
-
-def write_follow(port: str, fields: Dict[str, Any]) -> None:
-    """Write a port's follower heartbeat whole, a `key=value` line per field
-    in order, for the owner and the store's group (nxsd writes it as root,
-    `status` reads it as the operator)."""
-    path = follow_path(port)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    staged = path.with_name(path.name + ".tmp")
-    staged.unlink(missing_ok=True)
-    with _open_private(str(staged), os.O_EXCL) as fh:
-        fh.write("".join(f"{key}={value}\n" for key, value in fields.items()))
-    os.replace(staged, path)
-
-
-def read_follow(port: str) -> Optional[Dict[str, str]]:
-    """A port's follower heartbeat as written; None when nothing follows there."""
-    try:
-        text = follow_path(port).read_text()
-    except OSError:
-        return None
-    return dict(line.split("=", 1) for line in text.splitlines() if "=" in line)
-
-
-def follow_gain_db(port: str) -> Optional[float]:
-    """The leader's gain a port's follower heartbeat names, in dB: the gain
-    the following link's capture session starts at. None without a
-    heartbeat, or before the follower takes a gain."""
-    try:
-        return float((read_follow(port) or {})["gain_db"])
-    except (KeyError, ValueError):
-        return None
-
-
-def remove_follow(port: str) -> None:
-    follow_path(port).unlink(missing_ok=True)
-
-
-def _open_private(path: str, flags: int = 0):
+def open_private(path: str, flags: int = 0):
     """A file of the tool's own, opened without following a symlink and
     created for the owner and the store's group (the daemon writes the
     record as root, the operator reads it); a planted link at the name is
-    refused."""
+    refused. A file another user made keeps its mode: the open through the
+    store's group is what the caller needs, and only the owner may chmod."""
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | flags, 0o660)
-    os.fchmod(fd, 0o660)
+    if os.fstat(fd).st_uid == os.getuid():
+        os.fchmod(fd, 0o660)
     return os.fdopen(fd, "w")
 
 STATE_UP = "up"
@@ -177,6 +181,8 @@ STATE_UNKNOWN = "unknown"
 
 #: The port section's key for the delivery check that last passed on it.
 VERIFIED = "verified"
+#: A port section's key for what each bare head's last run on the host left, by link.
+HEADS = "heads"
 
 #: How long a command waits for another's hold on the bus before it
 #: refuses: longer than a gate write holds the lock (half a second behind
@@ -228,7 +234,7 @@ class BusLock:
     first like any other run's."""
 
     def __init__(self) -> None:
-        self._fh = _open_private(lock_path())
+        self._fh = open_private(lock_path())
 
     def __enter__(self) -> "BusLock":
         wait_s, poll_s = _WAIT.get() or (BUS_LOCK_WAIT_S, BUS_LOCK_POLL_S)
@@ -246,6 +252,19 @@ class BusLock:
     def __exit__(self, *exc: Any) -> None:
         fcntl.flock(self._fh, fcntl.LOCK_UN)
         self._fh.close()
+
+    def acquire_now(self) -> bool:
+        """Take the lock in one attempt, no wait: False while another run
+        holds it. The descriptor stays open for `release` and the next
+        attempt."""
+        try:
+            fcntl.flock(self._fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        return True
+
+    def release(self) -> None:
+        fcntl.flock(self._fh, fcntl.LOCK_UN)
 
 
 def bus_holder(unnamed: Optional[str] = None) -> Optional[str]:
@@ -296,10 +315,11 @@ def _load() -> Dict[str, Any]:
         return {}
     # The states and every delivery check hold for one boot: after a reboot
     # the hub is unprogrammed on every port at once, whatever the record said.
-    if record.get("boot") != _boot_id():
+    if record.get("boot") != boot_id():
         record.pop("states", None)
         for section in (record.get("ports") or {}).values():
             section.pop(VERIFIED, None)
+            section.pop(HEADS, None)
     return record
 
 
@@ -307,11 +327,11 @@ def _store(record: Dict[str, Any]) -> None:
     """Write the record whole: a temporary file beside it (created fresh,
     never through a link left at its name) and an atomic replace, so a
     reader never sees a truncated document."""
-    record["boot"] = _boot_id()
+    record["boot"] = boot_id()
     target = Path(state_path())
     tmp = target.with_name(target.name + ".tmp")
     tmp.unlink(missing_ok=True)
-    with _open_private(str(tmp), os.O_EXCL) as fh:
+    with open_private(str(tmp), os.O_EXCL) as fh:
         fh.write(yaml.safe_dump(record))
     os.replace(tmp, target)
 
@@ -319,7 +339,7 @@ def _store(record: Dict[str, Any]) -> None:
 BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
 
 
-def _boot_id() -> Optional[str]:
+def boot_id() -> Optional[str]:
     """The kernel's id for this boot; None where the kernel publishes none."""
     try:
         return Path(BOOT_ID_PATH).read_text().strip() or None
@@ -340,7 +360,7 @@ class _StateLock:
         global _depth, _lock_fh
         _guard.acquire()
         if _depth == 0:
-            _lock_fh = _open_private(state_path() + ".lock")
+            _lock_fh = open_private(state_path() + ".lock")
             fcntl.flock(_lock_fh, fcntl.LOCK_EX)
         _depth += 1
         return self
@@ -584,6 +604,31 @@ def recorded_states(topology: Topology) -> Dict[str, str]:
     return dict((record.get("states") or {}).get(port_name(topology)) or {})
 
 
+def head_values(topology: Topology, link: str, crc: int) -> Optional[Tuple[int, ...]]:
+    """What the bare head on `link`'s last run of the image at `crc` left
+    this boot, its run values by graph parameter; None for a head no run
+    left anything for, or whose image was built since."""
+    kept = (_port(_load(), topology).get(HEADS) or {}).get(link)
+    if not kept or int(kept.get("crc", -1)) != int(crc):
+        return None
+    return tuple(int(v) for v in kept["values"])
+
+
+@_locked
+def set_head_values(topology: Topology, heads: Dict[str, Tuple[int, ...]],
+                    crcs: Dict[str, int]) -> None:
+    """Record what each bare head's last run on the host left, by link,
+    with the build of the image that ran (`crcs`, by link)."""
+    if not heads:
+        return
+    record = _load()
+    port = record.setdefault("ports", {}).setdefault(port_name(topology), {})
+    kept = port.setdefault(HEADS, {})
+    for link, values in heads.items():
+        kept[link] = {"crc": int(crcs[link]), "values": [int(v) for v in values]}
+    _store(record)
+
+
 def link_state(topology: Topology, link: LinkSpec) -> str:
     """The recorded state of one link (`up` / `parked` / `unknown`); a
     record written under another boot carries no states, so it reads as
@@ -601,14 +646,6 @@ def port_capture_id(topology: Topology, link: LinkSpec) -> Optional[int]:
     if link.name in ids and ids[link.name] is not None:
         return int(ids[link.name])
     return link.capture_id
-
-
-def port_pipes(topology: Topology) -> Dict[str, str]:
-    """The deserializer pipe each link rides in the port's current port
-    (link name -> pipe); {} when the builder did not say."""
-    record = _load()
-    section = _port(record, topology)
-    return dict((section or {}).get("pipes") or {})
 
 
 @_locked

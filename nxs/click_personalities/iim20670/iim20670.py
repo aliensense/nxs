@@ -111,7 +111,7 @@ class Iim20670(RegisterClickPersonality):
     def configure(self, config):
         trigger = config.get('trigger', 'drdy')
 
-        # Reload params; each tags a write_modify below, and the SI scale
+        # Run params; each tags a write_modify below, and the SI scale
         # tracks the live range via scale_param.
         self.declare_params_from_descriptor()
 

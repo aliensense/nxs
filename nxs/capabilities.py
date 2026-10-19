@@ -1,17 +1,15 @@
 """The optional contracts a transport declares, with the validators and the records their calls take."""
 
 import struct
-import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Optional, Tuple
 
 from nxs._generated_constants import Calibration as CalConstants
 from nxs._generated_constants import FieldSemantics
 from nxs._generated_constants import NxsRegisters
 from nxs._generated_constants import Personality
 from nxs.click_facts import IDENTITY_M
-from nxs.device_errors import CAM_VERDICT_REASON, DeviceRefused, err_reason
 
 
 class SupportsRecovery(ABC):
@@ -54,17 +52,18 @@ class SupportsIdentify(ABC):
 
 class SupportsSlotPeek(ABC):
     """Transports that can read a stored slot's metadata without loading
-    it (Cyphal `GetDriverInfo(slot)`; I2C `Cmd::PEEK_SLOT`)."""
+    it (Cyphal `GetDriverInfo(slot)`; I2C the slot's `STORE_DIRECTORY` entry)."""
 
     @abstractmethod
     def read_slot_info(self, slot: int):
         """Personality metadata for a stored slot, or None if empty.
         `slot == ACTIVE_SLOT` (0xFF) returns the active personality instead
-        of a stored slot."""
+        of a stored slot. Its `kind` is the image kind's name, None where
+        the transport serves no kind (Cyphal)."""
 
 class SupportsFaultCounters(ABC):
     """Transports that read the runner's fault counters (the Cyphal
-    `aliensense.nxs.*_count` registers, or the I2C diag view); each saturates at 65535."""
+    `aliensense.nxs.*_count` registers, or the I2C `DIAG` region); each saturates at 65535."""
 
     @abstractmethod
     def read_io_err_count(self) -> int:
@@ -83,6 +82,18 @@ class SupportsFaultCounters(ABC):
     def read_ingress_reject_count(self) -> int:
         """Host commands dropped because another transport held a live
         session."""
+
+    @abstractmethod
+    def read_io_errno(self) -> int:
+        """The positive errno of the latest absorbed I/O error, 0 before the first."""
+
+    @abstractmethod
+    def read_bus_heal_count(self) -> int:
+        """Resets of the host-bus peripheral after a transfer the bus cut; 0 on a unit without a pod bus."""
+
+    @abstractmethod
+    def read_bus_heal_errno(self) -> int:
+        """The positive errno of the failed transfer that preceded the latest heal, 0 before the first."""
 
 class SupportsEgressDecimation(ABC):
     """Marker: the transport's stream is device-pushed, so `stream --hz` writes the
@@ -208,7 +219,11 @@ class SupportsBitTiming(ABC):
 # each a row-major 3x3 M and a bias b, plus the encoder zero-offset and tags.
 CAL_VECTORS = ("acceleration", "angular_velocity", "magnetic_field")
 
-_CAL_STRUCT = struct.Struct("<BB2x27f9ff4I")
+# The record's blocks: the header, then one per vector bucket.
+_CAL_HEAD = struct.Struct("<BB2xfI")
+_CAL_BUCKET = struct.Struct("<9f3fI")
+assert CalConstants.RECORD_SIZE == 4 * CalConstants.RECORD_BLOCK_SIZE
+assert _CAL_BUCKET.size <= CalConstants.RECORD_BLOCK_SIZE
 
 # Every valid `orientation` code name, sorted: the vocabulary for CLI choices
 # and shell completion.
@@ -229,8 +244,10 @@ def rotation_code(name: str) -> int:
 @dataclass
 class CalibrationRecord:
     """The device's per-unit calibration record, host view. ``m``/``b`` are
-    sensor-frame affines indexed like ``CAL_VECTORS``, ``orientation`` is a
-    ROTATION_* code composed on top, and a personality tag gates its bucket."""
+    sensor-frame affines indexed like ``CAL_VECTORS``, and a personality tag
+    gates its bucket. ``orientation`` is the ROTATION_* code the running IMU
+    personality's `orientation` row holds, composed on top: the record
+    carries no rotation of its own."""
     orientation: int = 0
     m: Tuple[Tuple[float, ...], ...] = (IDENTITY_M,) * 3
     b: Tuple[Tuple[float, ...], ...] = ((0.0, 0.0, 0.0),) * 3
@@ -251,31 +268,33 @@ class CalibrationRecord:
         return guard.BOUND if tag == active_tag else guard.STALE
 
     def pack(self) -> bytes:
-        """Wire/flash layout, little-endian (`Calibration.RECORD_SIZE` bytes)."""
-        flat_m = [v for row in self.m for v in row]
-        flat_b = [v for row in self.b for v in row]
-        return _CAL_STRUCT.pack(CalConstants.RECORD_VERSION, self.orientation,
-                                *flat_m, *flat_b, self.encoder_zero,
-                                *self.personality_tags, self.encoder_tag)
+        """The wire record, `Calibration.RECORD_SIZE` bytes of little-endian blocks."""
+        raw = bytearray(CalConstants.RECORD_SIZE)
+        # Byte 1 is reserved: the mount rotation is the personality's row.
+        _CAL_HEAD.pack_into(raw, 0, CalConstants.RECORD_VERSION, 0,
+                            self.encoder_zero, self.encoder_tag)
+        for v in range(3):
+            _CAL_BUCKET.pack_into(raw, CalConstants.RECORD_BLOCK_SIZE * (v + 1),
+                                  *self.m[v], *self.b[v], self.personality_tags[v])
+        return bytes(raw)
 
     @classmethod
     def unpack(cls, data: bytes) -> "CalibrationRecord":
         """Decode a wire record; raises ValueError on a bad size or version."""
-        if len(data) < _CAL_STRUCT.size:
+        if len(data) < CalConstants.RECORD_SIZE:
             raise ValueError(f"calibration record too short: {len(data)} B")
-        fields = _CAL_STRUCT.unpack_from(data)
-        version = fields[0]
+        version, _reserved, encoder_zero, encoder_tag = _CAL_HEAD.unpack_from(data, 0)
         if version != CalConstants.RECORD_VERSION:
             raise ValueError(f"calibration record version {version} "
                              f"(expected {CalConstants.RECORD_VERSION})")
-        flat_m = fields[2:29]
-        flat_b = fields[29:38]
-        return cls(orientation=fields[1],
-                   m=tuple(tuple(flat_m[v * 9:v * 9 + 9]) for v in range(3)),
-                   b=tuple(tuple(flat_b[v * 3:v * 3 + 3]) for v in range(3)),
-                   encoder_zero=fields[38],
-                   personality_tags=tuple(fields[39:42]),
-                   encoder_tag=fields[42])
+        buckets = [_CAL_BUCKET.unpack_from(data, CalConstants.RECORD_BLOCK_SIZE * (v + 1))
+                   for v in range(3)]
+        return cls(orientation=0,
+                   m=tuple(tuple(bucket[0:9]) for bucket in buckets),
+                   b=tuple(tuple(bucket[9:12]) for bucket in buckets),
+                   encoder_zero=encoder_zero,
+                   personality_tags=tuple(bucket[12] for bucket in buckets),
+                   encoder_tag=encoder_tag)
 
     def replace_vector(self, vec: int, m: Tuple[float, ...],
                        b: Tuple[float, ...], tag: int) -> "CalibrationRecord":
@@ -293,7 +312,8 @@ class CalibrationRecord:
 
 class SupportsCalibration(ABC):
     """The device stores and applies a per-unit calibration record: one affine per
-    vector bucket, the mounting orientation, and the encoder zero-offset."""
+    vector bucket and the encoder zero-offset. The mounting orientation it
+    composes on top is the IMU personality's `orientation` row."""
 
     @abstractmethod
     def read_calibration(self) -> CalibrationRecord:
@@ -311,9 +331,11 @@ class SupportsCalibration(ABC):
         the device's store so it survives a reboot."""
 
     @abstractmethod
-    def set_orientation(self, rotation: int, persist: bool = True) -> None:
-        """Set the mounting-orientation code, leaving the solved affines
-        untouched."""
+    def set_orientation(self, rotation: int) -> None:
+        """Commit the mounting-orientation code to the running IMU
+        personality's `orientation` row, leaving the solved affines
+        untouched. The row is live until a save of the personality's slot
+        keeps it, or until `nxs switch` converges the declared rotation."""
 
     @abstractmethod
     def cal_gyro(self) -> None:
@@ -347,105 +369,17 @@ class SupportsCalibration(ABC):
 
 CamRunState = Personality.CamRunState
 
-#: The states a camera run ends in; DONE is the one success.
-CAM_RUN_TERMINAL = (CamRunState.DONE, CamRunState.PROBE_FAILED,
-                    CamRunState.FAULTED, CamRunState.ABORTED)
-
-def cam_run_state_name(code: int) -> str:
-    """The `CamRunState` name, or the bare code for one this SDK does not know."""
-    return CamRunState._NAMES.get(code, str(code))
-
 class SupportsCameraRun(ABC):
-    """The unit runs a stored cam personality once on its pod-side bus
-    (`Cmd::CAM_RUN`) while the host stays off the sensor, and serves the
-    personality's descriptor trailer back page by page."""
-
-    @abstractmethod
-    def cam_stage_params(self, slot: int, values) -> None:
-        """Stage run parameters for the cam personality in store slot
-        `slot`: `values` maps a parameter index to the value the next
-        `cam_run(slot)` applies to its RAM copy of the program (nothing on
-        the unit is patched). The stage holds one value per index, is armed
-        by peeking the slot, and is dropped by a peek of another slot, so
-        stage then run without a `store ls` between. DeviceRefused with
-        `CAM_RUN_ERR_REASON` on an empty slot or a click personality's; a value the
-        parameter does not accept refuses the run itself with EINVAL."""
-
-    @abstractmethod
-    def cam_read_params(self, slot: int, indices) -> Dict[int, int]:
-        """Read run parameters of the cam personality in store slot
-        `slot` by index, under its peek view: for each index the staged
-        value, else the value the slot's last completed run ended with,
-        else the compiled default. DeviceRefused with `CAM_RUN_ERR_REASON`
-        on an empty slot or a click personality's."""
-
-    @abstractmethod
-    def cam_run(self, slot: int) -> None:
-        """Start the cam personality in store slot `slot`; returns on
-        the accept (DeviceRefused with `CAM_RUN_ERR_REASON` on ENOEXEC /
-        ENOENT / EBUSY / EINVAL). Progress and the verdict come from
-        `read_cam_state`."""
-
-    @abstractmethod
-    def cam_abort(self) -> None:
-        """Stop the live run within `Personality.CAM_ABORT_LATENCY_MS`;
-        raises DeviceRefused(ENOENT) when none is live."""
-
-    @abstractmethod
-    def read_cam_state(self) -> Tuple[int, int]:
-        """`(state, error)`: the `CamRunState` of the last or live run and
-        the positive errno of its terminal state (0 after DONE)."""
+    """The unit runs a stored cam personality on its pod-side bus by the
+    commits of its rows through the unit door, while the host stays off
+    the sensor (a port's graph image walks it, `nxs.cam.graph`), and serves
+    the personality's descriptor trailer back."""
 
     @abstractmethod
     def read_personality_info(self, slot: int) -> bytes:
         """The descriptor trailer of the personality in store slot `slot`,
         count byte included (`nxs.image.parse_trailer` splits it); a slot
         holding no descriptors serves the one-byte empty trailer."""
-
-#: Consecutive unanswered state polls tolerated before a run is declared
-#: lost: the unit's I²C target is deaf while it masters the pod bus, so a
-#: poll landing mid-transaction NAKs.
-def await_cam_run(client, timeout_s: float, poll_s: float = 0.05) -> Tuple[int, int]:
-    """Poll a started run to its terminal edge and return the `(state,
-    error)` read there. PROBE_FAILED, FAULTED and ABORTED raise
-    DeviceRefused with the verdict's reason; a run that has not reached a
-    terminal state by `timeout_s` raises TimeoutError.
-
-    A run masters the sensor bus the unit answers on, and the two roles
-    share one peripheral. The caller has already held off while the run
-    had the bus (`cam_run`), so by the time this polls, the run is
-    normally over and the register map is answering again. A poll that
-    still refuses is the run running long: it is the run's normal sound,
-    not evidence of a unit in trouble, and the only clock here is the
-    run's deadline.
-
-    Polls are spaced by `poll_s` rather than issued back to back for the
-    same reason the caller held off: each one is a second master on the
-    segment the run may still be driving."""
-    deadline = time.monotonic() + timeout_s
-    last = None
-    while True:
-        try:
-            state, error = client.read_cam_state()
-            last = state
-        except OSError as exc:
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"camera run: the unit did not answer a state poll within "
-                    f"{timeout_s:g} s ({exc})") from exc
-            time.sleep(poll_s)
-            continue
-        if state in CAM_RUN_TERMINAL:
-            if state != CamRunState.DONE:
-                raise DeviceRefused(
-                    error, f"camera run {cam_run_state_name(state)}: "
-                           f"{err_reason(error, CAM_VERDICT_REASON)}")
-            return state, error
-        if time.monotonic() >= deadline:
-            raise TimeoutError(
-                f"camera run still {cam_run_state_name(last)} after "
-                f"{timeout_s:g} s")
-        time.sleep(poll_s)
 
 class SupportsCommissioning(ABC):
     """The device persists a Cyphal node-ID and per-topic subject-IDs,

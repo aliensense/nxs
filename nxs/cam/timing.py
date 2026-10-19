@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import List, Optional
 
+from . import laws
 from .contracts import InfeasibleConfig, LinkSpec, RateRange, Topology
 
 
@@ -53,7 +54,7 @@ def free_run_refusal(hub, link: LinkSpec, mode: str, fps: float,
             label = mode_label(hub.descriptor(link.sensor_compatible), mode)
             return (f"{fps:g} fps is outside {label}'s {rates.text()} "
                     f"(the {rates.binds} law's range)")
-    module = hub.chip_module(link.sensor_compatible.split(",")[-1])
+    module = laws.laws(hub.descriptor(link.sensor_compatible.split(",")[-1]))
     validate = getattr(module, "validate_vmax", None)
     vmax_for_fps = getattr(module, "vmax_for_fps", None)
     if validate is None or vmax_for_fps is None:

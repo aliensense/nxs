@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 from nxs.client import exc_detail
+from nxs.suite.drift import declared_values, live_values, rows_drift
 from nxs.suite.reconcile import load_click_personality
 from nxs.suite.schema import (ManifestError, SuiteConfig, UnitSpec,
                               device_proves_patch, parse_device_version,
@@ -26,11 +27,11 @@ class FreezeReport:
     ok: bool = True
     changed: bool = False
     sensor_index: int = -1
+    #: The running click's rows, each in its display form, by row name.
     config: dict = field(default_factory=dict)
-    egress_decimation: Optional[int] = None
-    egress_subjects: dict = field(default_factory=dict)
+    #: The unit's own declared rows at the values it serves, by row name.
+    rows: dict = field(default_factory=dict)
     firmware: Optional[str] = None
-    orientation: Optional[str] = None
     actions: List[str] = field(default_factory=list)
     error: str = ""
 
@@ -59,7 +60,7 @@ def _freeze_unit(unit: UnitSpec, *, pin_firmware: bool, opener,
     report = FreezeReport(name=unit.name)
     try:
         panel = [(spec, load_click_personality(spec.personality, personalities_dir)().compile(spec.config))
-                 for spec in (unit.sensors or [])]
+                 for spec in unit.sensors]
     except Exception as e:
         report.ok = False
         report.error = str(e) or type(e).__name__
@@ -110,9 +111,9 @@ def _freeze_unit(unit: UnitSpec, *, pin_firmware: bool, opener,
                             f"freezing")
             return report
 
-        live = {p["name"]: p["current"] for p in transport.read_capabilities()}
         _, compiled = panel[index]
-        desired = {p.name: p.current for p in compiled.params}
+        live = live_values(transport.read_capabilities(), compiled)
+        desired = declared_values(compiled)
         if set(live) != set(desired):
             # A same-named personality serving a different parameter set is a different
             # revision; adopting its values would not reproduce.
@@ -129,28 +130,24 @@ def _freeze_unit(unit: UnitSpec, *, pin_firmware: bool, opener,
                             f"`nxs switch` before freezing")
             return report
         report.sensor_index = index
-        report.config = live
+        shown = _shown(unit.sensors[index].personality, live)
+        report.config = shown
         for name in sorted(desired.keys() & live.keys()):
             if desired[name] != live[name]:
                 report.changed = True
-                report.actions.append(f"{name}: {desired[name]}→{live[name]}")
+                report.actions.append(f"{name}: {_shown(unit.sensors[index].personality, desired)[name]}"
+                                      f"→{shown[name]}")
 
-        if unit.egress is not None:
-            # The unit declares an egress section, so freeze adopts the live
-            # factors into it: the same device-wins rule as config.
-            if unit.egress.decimation is not None:
-                live = transport.read_decimation()
-                report.egress_decimation = live
-                if live != unit.egress.decimation:
-                    report.changed = True
-                    report.actions.append(
-                        f"egress decimation: {unit.egress.decimation}→{live}")
-            for subject, want in sorted(unit.egress.subjects.items()):
-                live = transport.read_decimation(subject=subject)
-                report.egress_subjects[subject] = live
-                if live != want:
-                    report.changed = True
-                    report.actions.append(f"egress[{subject}]: {want}→{live}")
+        # The unit's own declared rows: the live values, the same
+        # device-wins rule as the click's.
+        drift = rows_drift(unit, transport)
+        if drift:
+            for name, (want, live) in sorted(drift.items()):
+                if live is None:
+                    continue
+                report.rows[name] = live
+                report.changed = True
+                report.actions.append(f"{name}: {want}→{live}")
 
         if pin_firmware:
             version = transport.read_fw_version()
@@ -182,34 +179,6 @@ def _freeze_unit(unit: UnitSpec, *, pin_firmware: bool, opener,
                     report.changed = True
                     report.actions.append(f"firmware: {unit.firmware}→{pin}")
 
-        # Adopt a hand-set mounting orientation into the manifest, declared
-        # intent like the firmware pin. The solved affines stay on-device.
-        from nxs.client import SupportsCalibration, rotation_name
-        if isinstance(transport, SupportsCalibration):
-            try:
-                code = transport.read_calibration().orientation
-            except Exception:
-                # The connected firmware may predate the surface; an optional adoption
-                # must not fail the freeze of everything else.
-                code = None
-                report.actions.append("calibration surface unavailable; "
-                                      "orientation not adopted")
-            live = rotation_name(code) if code is not None else None
-            if live is not None and live.isdigit():
-                # rotation_name preserves an unknown code as its number; the manifest
-                # vocabulary cannot hold it, and writing it would corrupt the file.
-                report.ok = False
-                report.error = (f"device reports orientation code {live}, "
-                                "which this tool's vocabulary does not name "
-                                "— update the nxs tool, then freeze again")
-                return report
-            if live is not None and unit.orientation != live \
-                    and (unit.orientation or live != "NONE"):
-                report.orientation = live
-                report.changed = True
-                report.actions.append(f"orientation: "
-                                      f"{unit.orientation or 'NONE'}→{live}")
-
         if not report.changed:
             report.actions.append("no tuning to adopt")
     except Exception as e:
@@ -222,6 +191,33 @@ def _freeze_unit(unit: UnitSpec, *, pin_firmware: bool, opener,
             except Exception:
                 pass
     return report
+
+
+def _shown(personality: str, values: dict) -> dict:
+    """A click's served values as its rows show them, by row name: a name
+    where the row names its values, else the number in the row's unit."""
+    from nxs import description
+
+    try:
+        block = description.of_type(personality)
+    except (description.UnknownType, description.DescriptionError):
+        return dict(values)
+    out = {}
+    for name, raw in values.items():
+        try:
+            out[name] = _plain_value(description.display(block.row(name), int(raw)))
+        except (KeyError, TypeError, ValueError):
+            out[name] = raw
+    return out
+
+
+def _plain_value(text: str):
+    """A display text as YAML spells it: a number as a number, a name as text."""
+    try:
+        number = float(text)
+    except ValueError:
+        return text
+    return int(number) if number.is_integer() and "." not in text else number
 
 
 def _round_trip_yaml():
@@ -238,40 +234,52 @@ def _round_trip_yaml():
 def _reject_mangled_serials(doc):
     """Refuse a round-trip write when a serial loaded as a number: a bare
     `<digits>e<digits>` UID resolves as a YAML float and its digits are gone."""
-    for entry in doc.get("units", []) or []:
-        serial = entry.get("serial")
+    for name, node in (doc.get("nodes") or {}).items():
+        params = node.get("parameters") if isinstance(node, dict) else None
+        serial = params.get("serial") if isinstance(params, dict) else None
         if serial is not None and not isinstance(serial, str):
             raise ManifestError(
-                f"unit {entry.get('name', '?')!r}: serial is unquoted and "
-                f"parsed as a number — quote it in the manifest "
+                f"nodes.{name}.parameters.serial: unquoted and parsed as a number; quote it "
                 f"(serial: \"<24 hex digits>\") before freezing")
 
 
-def _apply_frozen(entry, report: FreezeReport):
-    """Write a report's frozen values into a unit's manifest entry, updating the
-    `config` mapping in place so surviving keys keep their comments and position."""
+def _clicks_of(doc, unit: str) -> list:
+    """The click nodes wired into a unit's socket in a declaration's
+    document, as (name, node), in the file's order: the order the loader
+    derives the unit's panel in."""
+    clicks = []
+    for source, targets in (doc.get("connections") or {}).items():
+        if f"{unit}.click" in (targets or []):
+            name = str(source).split(".", 1)[0]
+            clicks.append((name, (doc.get("nodes") or {}).get(name)))
+    return clicks
+
+
+def _apply_frozen(doc, report: FreezeReport):
+    """Write a report's frozen values into the declaration: the click's rows
+    into the click node on the unit's socket, the unit's own rows and the
+    firmware pin into the unit node, each mapping updated in place so
+    surviving keys keep their comments and position."""
+    unit = doc["nodes"][report.name]
     if report.sensor_index >= 0:
-        sensor = entry["sensors"][report.sensor_index]
-        existing = sensor.get("config")
+        _name, click = _clicks_of(doc, report.name)[report.sensor_index]
+        existing = click.get("parameters")
         if not isinstance(existing, dict):
-            sensor["config"] = dict(report.config)
+            click["parameters"] = dict(report.config)
         else:
             for key, value in report.config.items():
                 existing[key] = value
             for key in [k for k in existing if k not in report.config]:
                 del existing[key]
-    if report.egress_decimation is not None or report.egress_subjects:
-        egress = entry.setdefault("egress", {})
-        if report.egress_decimation is not None:
-            egress["decimation"] = report.egress_decimation
-        if report.egress_subjects:
-            subjects = egress.setdefault("subjects", {})
-            for subject, live in report.egress_subjects.items():
-                subjects[subject] = live
+    params = unit.get("parameters")
+    if not isinstance(params, dict):
+        params = unit["parameters"] = {}
+    for name, live in report.rows.items():
+        params[name] = live
     if report.firmware is not None:
-        entry["firmware"] = report.firmware
-    if report.orientation is not None:
-        entry["orientation"] = report.orientation
+        params["firmware"] = report.firmware
+    if not params:
+        del unit["parameters"]
 
 
 def _write_manifest(config_path: str, reports: List[FreezeReport]):
@@ -281,12 +289,9 @@ def _write_manifest(config_path: str, reports: List[FreezeReport]):
     with open(config_path, encoding="utf-8") as f:
         doc = yaml_rt.load(f)
     _reject_mangled_serials(doc)
-
-    by_name = {r.name: r for r in reports}
-    for entry in doc.get("units", []):
-        report = by_name.get(entry.get("name"))
-        if report is not None:
-            _apply_frozen(entry, report)
+    for report in reports:
+        if report.name in (doc.get("nodes") or {}):
+            _apply_frozen(doc, report)
 
     tmp = config_path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -295,18 +300,19 @@ def _write_manifest(config_path: str, reports: List[FreezeReport]):
 
 
 def render_frozen_block(config_path: str, report: FreezeReport) -> str:
-    """The unit's would-be manifest block, for --dry-run review."""
+    """The unit's would-be nodes, the unit and the clicks on its socket, for
+    --dry-run review."""
     import io
 
     yaml_rt = _round_trip_yaml()
     with open(config_path, encoding="utf-8") as f:
         doc = yaml_rt.load(f)
     _reject_mangled_serials(doc)
-    entry = next(u for u in doc.get("units", [])
-                 if u.get("name") == report.name)
-    _apply_frozen(entry, report)
+    _apply_frozen(doc, report)
+    block = {report.name: doc["nodes"][report.name]}
+    block.update(_clicks_of(doc, report.name))
     out = io.StringIO()
-    yaml_rt.dump([entry], out)
+    yaml_rt.dump(block, out)
     return out.getvalue()
 
 
@@ -351,7 +357,6 @@ def _link_sensor(topology, name: str) -> str:
 #: and gain. The booted tree's other facts (the capture ids, the addresses
 #: the wiring translates) are the report's alone.
 _CARRIED_PORT_KEYS = ("bus", "csi_lanes")
-_CARRIED_LINK_KEYS = ("inck_hz",)
 _CARRIED_CAMERA_KEYS = ("exposure_us", "gain_db")
 HUB_ADDR_DEFAULT = 0x6A
 POD_TARGET_DEFAULT = 0x30
@@ -359,14 +364,16 @@ POD_TARGET_DEFAULT = 0x30
 
 def port_block(topology, sync=None, modes=None, rates=None, gain_db=None, units=None,
                sensors=None, viewers=None, declared=None, viewer=None) -> dict:
-    """One `ports:` entry in the declaration's one spelling: per port `hub`,
+    """One `ports:` entry of the port view (`port_view`), the shape the
+    converter writes into api 3: per port `hub`,
     `sync: {source, fps}` and `camera: {gain_db}`; per link `camera:
     {sensor, mode, fps}` and `unit: {name, alias}`. `modes` names the mode
-    each link runs and `rates` its free-run rate; `units` the pod on each
-    link ({name, alias}); `viewers` (a geometry per link, `viewer` the
-    port's) stands in for a mode no record names. `declared` is the entry
-    the file holds: its host facts, its pods where `units` is silent, and
-    a link's clock are carried, and nothing else of it."""
+    each link runs and `rates` its free-run rate, written where the
+    camera's block has an `fps` row; `units` the pod on each link
+    ({name, alias}); `viewers` (a geometry per link, `viewer` the port's)
+    stands in for a mode no record names. `declared` is the entry the file
+    holds: its host facts and its pods where `units` is silent are carried,
+    and nothing else of it."""
     from nxs.cam import hubs
 
     declared = declared if isinstance(declared, dict) else {}
@@ -422,7 +429,7 @@ def port_block(topology, sync=None, modes=None, rates=None, gain_db=None, units=
             mode = _mode_name(hub, sensor, _geometry_token(viewers.get(link.name)), modes.get(link.name))
             if mode:
                 cam["mode"] = mode
-            if not synced and link.name in rates:
+            if not synced and link.name in rates and _has_rate_row(sensor):
                 cam["fps"] = _rate_value(rates[link.name])
             entry["camera"] = cam
         unit = (units or {}).get(link.name)
@@ -435,9 +442,6 @@ def port_block(topology, sync=None, modes=None, rates=None, gain_db=None, units=
             if unit.get("target") is not None and int(unit["target"]) != POD_TARGET_DEFAULT:
                 ref["target"] = hex_address(int(unit["target"]))
             entry["unit"] = ref
-        for key in _CARRIED_LINK_KEYS:
-            if key in old:
-                entry[key] = old[key]
         if entry:
             links[link.name] = entry
     if links:
@@ -445,19 +449,27 @@ def port_block(topology, sync=None, modes=None, rates=None, gain_db=None, units=
     return block
 
 
+def _has_rate_row(sensor: str) -> bool:
+    """Whether a camera's block declares its rate, an `fps` row; a head
+    whose rate is its mode's has none."""
+    from nxs import description
+
+    try:
+        description.of_type(sensor).row("fps")
+    except (KeyError, description.UnknownType, description.DescriptionError):
+        return False
+    return True
+
+
 def port_intent(port) -> dict:
     """What a parsed port declares, as `port_block` takes it: its sync, the
     mode and free-run rate of each link, the pod on each link and the
-    port's gain. A port-level mode, rate or sync (the shorthand a file may
-    still carry) folds onto every camera link, so the next save writes the
-    one spelling."""
+    port's gain."""
     synced = port.sync_source == "fsync"
-    fps = port.sync_fps if port.sync_fps is not None else (port.camera_fps if synced else None)
     return {
-        "sync": {"source": port.sync_source, "fps": fps},
-        "modes": {l.name: l.camera_mode or port.camera_mode for l in port.links},
-        "rates": {l.name: l.camera_fps if l.camera_fps is not None
-                  else (None if synced else port.camera_fps) for l in port.links},
+        "sync": {"source": port.sync_source, "fps": port.sync_fps},
+        "modes": {l.name: l.camera_mode for l in port.links},
+        "rates": {l.name: None if synced else l.camera_fps for l in port.links},
         "units": {l.name: {"name": l.unit.name, "alias": l.unit.alias, "target": l.unit.target}
                   for l in port.links if l.unit is not None},
         "gain_db": port.camera_gain_db,
@@ -466,7 +478,8 @@ def port_intent(port) -> dict:
 
 def _declared_owner(topology, declared: dict):
     """`topology` with the hub's owner as the declaration names it: the booted
-    tree does not say whether a kernel driver or the tool runs the hub."""
+    tree does not say whether a kernel driver, the tool or a module runs the
+    hub."""
     hub = declared.get("hub")
     driver = hub.get("driver") if isinstance(hub, dict) else None
     if not driver or topology.is_direct:
@@ -504,8 +517,9 @@ def freeze_ports(config_path: str, dry_run: bool = False,
                  only_port: Optional[str] = None) -> str:
     """Write every camera port (or `only_port` alone) into the manifest as the
     booted tree and the live port have it; create the manifest when there is
-    none. Returns the rendered `ports:` block. A scoped freeze leaves the
-    wiring report to `generate`."""
+    none. Returns the rendered camera chains: the host, the nodes on a chain
+    into one of its connectors and the connections among them. A scoped
+    freeze leaves the wiring report to `generate`."""
     import io
 
     from nxs.cam.hubs import HubError
@@ -535,6 +549,10 @@ def freeze_ports(config_path: str, dry_run: bool = False,
         if only_port not in candidates:
             raise ValueError(f"no camera port named {only_port} answers on this host")
         candidates = {only_port: candidates[only_port]}
+    from nxs.suite.nodes import parse_graph
+    from nxs.suite.port_view import chain_scope, merge, nodes_from_view
+    from nxs.tune_write import _camera_buses, _plain, declared_view
+
     yaml_rt = _round_trip_yaml()
     if os.path.exists(config_path) and os.path.getsize(config_path) > 0:
         with open(config_path, encoding="utf-8") as f:
@@ -542,8 +560,9 @@ def freeze_ports(config_path: str, dry_run: bool = False,
         _reject_mangled_serials(doc)
     else:
         doc = {}
-    existing = doc.setdefault("ports", {}) or {}
-    wiring, merged = {}, {}
+    previous, view = declared_view(doc)
+    existing = view.setdefault("ports", {})
+    wiring = {}
     for name, topology in sorted(candidates.items()):
         own = port_state.port_record(topology)      # this port only
         # The block is the whole declaration of the port: what the operator
@@ -553,19 +572,22 @@ def freeze_ports(config_path: str, dry_run: bool = False,
         if not isinstance(declared, dict):
             declared = {}
         topology = _declared_owner(topology, declared)
-        block = port_block(topology, sync=own.get("sync"), viewer=own.get("viewer"),
-                           viewers=own.get("viewers"), sensors=own.get("sensors"),
-                           modes=own.get("modes"), rates=own.get("rates"), declared=declared)
-        existing[name] = block
-        merged[name] = dict(block)
+        existing[name] = port_block(topology, sync=own.get("sync"), viewer=own.get("viewer"),
+                                    viewers=own.get("viewers"), sensors=own.get("sensors"),
+                                    modes=own.get("modes"), rates=own.get("rates"),
+                                    declared=declared)
         wiring[name] = port_wiring(topology, sensors=own.get("sensors"))
-    doc["ports"] = {n: existing[n] for n in existing if existing[n]}
-    if not doc["ports"]:
-        doc.pop("ports", None)
+    view["ports"] = {n: existing[n] for n in existing if existing[n]}
+    emitted = nodes_from_view(view, previous=previous, buses=_camera_buses())
+    _adopt(emitted, previous)
+    merge(doc, emitted, previous)
     out = io.StringIO()
-    # What is rendered is what is (or would be) written: the merged
-    # entries, with the operator-owned fields the freeze preserved.
-    yaml_rt.dump({"ports": merged}, out)
+    # What is rendered is what is (or would be) written: the camera chains.
+    chains = chain_scope(parse_graph(_plain(doc), config_path), set(candidates))
+    yaml_rt.dump({"nodes": {n: e for n, e in doc["nodes"].items() if n in chains},
+                  "connections": {s: [t for t in ts if str(t).split(".", 1)[0] in chains]
+                                  for s, ts in doc["connections"].items()
+                                  if str(s).split(".", 1)[0] in chains}}, out)
     if not dry_run:
         os.makedirs(os.path.dirname(config_path) or ".", exist_ok=True)
         _write_atomic(config_path, lambda f: yaml_rt.dump(doc, f))
@@ -573,6 +595,28 @@ def freeze_ports(config_path: str, dry_run: bool = False,
             hw = hardware_path(config_path)
             _write_atomic(hw, lambda f: f.write(_render_hardware(wiring)))
     return out.getvalue()
+
+
+#: The rows a port freeze adopts from the live port: a hub's frame sync and
+#: each camera's mode and rate. A node's other rows stay as the file has them.
+_ADOPTED = ("sync_source", "sync_fps", "mode", "fps")
+
+
+def _adopt(emitted: dict, previous) -> None:
+    """Each emitted node the file already names keeps the parameters the
+    file gives it, the adopted rows taken from the live port."""
+    if previous is None:
+        return
+    for name, entry in emitted["nodes"].items():
+        node = previous.nodes.get(name)
+        if node is None or node.type != entry.get("type"):
+            continue
+        params = {k: v for k, v in node.parameters.items() if k not in _ADOPTED}
+        params.update({k: v for k, v in (entry.get("parameters") or {}).items() if k in _ADOPTED})
+        if params:
+            entry["parameters"] = params
+        else:
+            entry.pop("parameters", None)
 
 
 def _render_hardware(ports: dict) -> str:
@@ -591,7 +635,7 @@ def _render_hardware(ports: dict) -> str:
 
 def hex_address(value: int) -> HexInt:
     """An I²C address as the declaration files write it, in hex as every
-    line the tool prints names it (`alias: 0x31`); it reads back as the int.
+    line the tool prints names it (`alias: 0x32`); it reads back as the int.
     The round-trip writer `nxs tune` saves through prints it as it is."""
     return HexInt(int(value), width=2)
 
@@ -621,7 +665,7 @@ def _write_atomic(path: str, render) -> None:
         try:
             os.makedirs(directory, exist_ok=True)
         except PermissionError:
-            from nxs.suite.switch_cam import make_group_dir
+            from nxs.suite.switch_host import make_group_dir
             make_group_dir(directory)
     if os.access(directory, os.W_OK):
         tmp = path + ".tmp"

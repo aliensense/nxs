@@ -3,14 +3,16 @@
 import sys
 import time
 
-from nxs._generated_constants import CyphalDefaults, RunnerStates, VmStates
+from nxs._generated_constants import CyphalDefaults, NxsMap, RunnerStates, VmStates
 from nxs.client import (
     ACTIVE_SLOT, op_error_name, peek_slot,
     SupportsBitTiming, SupportsCameraRun, SupportsCanTermination, SupportsCommissioning,
-    SupportsFaultCounters, SupportsIdentify, SupportsRecovery,
+    SupportsIdentify, SupportsRecovery,
     SupportsSlotPeek, SupportsTimeSync)
+from nxs import description
 from nxs import params as device_params
 from nxs.compiler import SEMANTIC_NAMES
+from nxs.faults import print_faults
 from nxs.click_facts import sample_width
 from nxs.stream_cli import _get_output_fields
 from nxs.term import status_line
@@ -79,6 +81,10 @@ TID_COLLISION_HINT = (
     "discarded this one as a repeated transfer-ID — leave more than 2 s "
     "between commands.")
 
+#: What holds an I²C unit by its `SESSION` cell, as `status` names it.
+_SESSIONS = {NxsMap.Session.UPLOAD: "personality upload", NxsMap.Session.DFU: "firmware push",
+             NxsMap.Session.PROCEDURE: "calibration procedure"}
+
 def _not_found_hint(args) -> str:
     """The transfer-ID collision note, on Cyphal/CAN only: the deduplication
     lives in libcanard's RX subscriptions, which the serial node does not
@@ -96,14 +102,17 @@ def cmd_probe(t, args):
         ver = None  # don't touch the bus after a failed probe
     if ver is not None:
         from nxs.client import SUPPORTED_PROTO_VERSION
+        from nxs.firmware import FIRST_PROTO_VERSION
         if ver == 0:
-            print("register map: unversioned (firmware predates "
+            print("interface version: unversioned (firmware predates "
                   "PROTO_VERSION)")
         elif ver > SUPPORTED_PROTO_VERSION:
-            print(f"register map: v{ver} — newer than this tool supports "
-                  f"(v{SUPPORTED_PROTO_VERSION}); update nxs")
+            print(f"interface version {ver}: newer than this tool speaks "
+                  f"({SUPPORTED_PROTO_VERSION}); update nxs")
+        elif ver == FIRST_PROTO_VERSION:
+            print(f"interface version {ver}: the first interface; nxs switch upgrades it")
         else:
-            print(f"register map: v{ver}")
+            print(f"interface version {ver}")
     if ok:
         from nxs.client import firmware_too_old
         stale = firmware_too_old(t, target=_target_flags(args))
@@ -188,10 +197,10 @@ def cmd_caps(t, args):
         print("  (no tunable parameters)")
     else:
         for p in tunable:
-            live = "  [live]" if p.get('kind') == 'live' else ""
+            applies = "  [apply]" if p.get('kind') == 'apply' else ""
             unit = f"  unit={p['unit']}" if p['unit'] else ""
             print(f"  {p['name']}: {_format_allowed(p)}  "
-                  f"current={p['current']}  default={p['default']}{unit}{live}")
+                  f"current={p['current']}  default={p['default']}{unit}{applies}")
 
     if fixed:
         summary = ', '.join(f"{p['name']}={p['current']}" for p in fixed)
@@ -220,44 +229,54 @@ def _no_parameter(t, name: str) -> int:
     return 1
 
 def cmd_get(t, args):
-    """`nxs get <name>`: the personality's parameter, else the device's."""
-    try:
-        p = t.get_param(args.param)
-    except KeyError:
+    """`nxs get <name>`: the device's parameter, else the personality's,
+    a row that names its values shown by name too."""
+    if _is_device_param(args.param):
         try:
             print(device_params.read(t, args.param))
         except device_params.ParamError as e:
-            if str(e).startswith("no parameter"):
-                return _no_parameter(t, args.param)
             print(f"nxs get: {e}", file=sys.stderr)
             return 1
         return 0
-    print(f"{p['name']} = {p['current']}  "
+    try:
+        p = t.get_param(args.param)
+    except KeyError:
+        return _no_parameter(t, args.param)
+    row = description.running_row(t, args.param)
+    shown = (f" ({description.display(row, int(p['current']))})"
+             if row is not None and description.present(row).labels else "")
+    print(f"{p['name']} = {p['current']}{shown}  "
           f"(valid: {_format_allowed(p)}  default: {p['default']}  "
           f"unit: {p['unit']})")
     return 0
 
 def cmd_set(t, args):
-    """`nxs set <name> <value>`: the personality's parameter, else the
-    device's."""
-    try:
-        p = t.get_param(args.param)
-    except KeyError:
+    """`nxs set <name> <value>`: the device's parameter, else the
+    personality's (`cmd_get`)."""
+    if _is_device_param(args.param):
         try:
             print(device_params.write(t, args.param, args.value))
         except device_params.ParamError as e:
-            if str(e).startswith("no parameter"):
-                return _no_parameter(t, args.param)
             print(f"nxs set: {e}", file=sys.stderr)
             return 1
         return 0
+    try:
+        p = t.get_param(args.param)
+    except KeyError:
+        return _no_parameter(t, args.param)
 
     try:
         value = int(args.value, 0)
     except ValueError:
-        print(f"nxs set: {args.param} takes an integer, not {args.value!r}",
-              file=sys.stderr)
-        return 1
+        row = description.running_row(t, args.param)
+        try:
+            value = description.parse(row, args.value) if row is not None else None
+        except description.DescriptionError:
+            value = None
+        if value is None:
+            print(f"nxs set: {args.param} takes an integer or a name its row gives a value, "
+                  f"not {args.value!r}", file=sys.stderr)
+            return 1
     if p.get('type') == 'range' and len(p['values']) >= 2:
         ok = p['values'][0] <= value <= p['values'][-1]
     else:
@@ -273,6 +292,12 @@ def cmd_set(t, args):
     new = t.get_param(args.param)['current']
     print(f"{args.param}: {old} → {new}")
     return 0
+
+def _is_device_param(name: str) -> bool:
+    """Whether `name` is a device parameter's, `decimation.<subject>`
+    included."""
+    return name.partition(".")[0] in device_params.names()
+
 
 def _print_outputs(t, name: str) -> None:
     """The output fields the loaded personality emits, under `status`."""
@@ -311,8 +336,8 @@ def _print_outputs(t, name: str) -> None:
 
 def _camera_line(t):
     """The `Camera:` value of an addressed status: the cam personality the
-    store holds, its slot and the last run the unit reports (`never run`
-    before its first), or `(none)`.
+    store holds, its slot and what the unit door says, its state with the
+    mode in effect or the errno of a fault, or `(none)`.
     None on a wire that serves no camera run, or when the store cannot be
     read; an unreadable slot is named by slot."""
     from nxs.cam import unit_source
@@ -323,18 +348,32 @@ def _camera_line(t):
         found = unit_source.read_unit_personality(t)
         if found is None:
             return "(none)"
-        state, _ = t.read_cam_state()
+        door = unit_source.door_state(t)
     except unit_source.UnreadableSlot as exc:
         return str(exc)
     except (OSError, RuntimeError, ValueError):
         return None
-    return f"{found.name} (slot {found.slot}, {unit_source.last_run_text(state)})"
+    return f"{found.name} (slot {found.slot}, {unit_source.door_text(*door)})"
+
+def _first_interface(t) -> bool:
+    """Whether the unit serves the first host interface, its 8-bit map, which
+    this tool reads no further than its version: `nxs switch` upgrades it."""
+    from nxs.firmware import FIRST_PROTO_VERSION
+
+    try:
+        return getattr(t, "interface_version", lambda: None)() == FIRST_PROTO_VERSION
+    except (OSError, RuntimeError, NotImplementedError):
+        return False
 
 def cmd_status(t, args):
     ok = t.probe()
     if not ok:
         print(f"NXS @ {_describe_target(args)}: NOT FOUND{_probe_detail(t)}"
               f"{_not_found_hint(args)}")
+        return 1
+    if _first_interface(t):
+        print(f"NXS @ {_describe_target(args)}: interface version 1, the first interface; "
+              f"nxs switch upgrades it")
         return 1
 
     status = t.read_status()
@@ -360,13 +399,16 @@ def cmd_status(t, args):
     runner_str = runner_names.get(runner_state, f"?({runner_state})")
 
     # The latched mikroBUS I²C address rides the slot-peek capability
-    # (GetDriverInfo over Cyphal, the SEL peek view over I²C).
+    # (GetDriverInfo over Cyphal, `CLICK_ADDR` over I²C).
     i2c_str = None
-    session_held = False
+    held = None
     if isinstance(t, SupportsSlotPeek):
-        info, session_held = peek_slot(t, ACTIVE_SLOT)
+        info, refused = peek_slot(t, ACTIVE_SLOT)
+        held = "calibration procedure or firmware push" if refused else None
         if info is not None and info.i2c_addr != 0:
             i2c_str = f"0x{info.i2c_addr:02X}"
+    session = getattr(t, "read_session", lambda: None)()
+    held = _SESSIONS.get(session, held)
 
     print(f"NXS @ {_describe_target(args)}")
     if serial and any(serial):
@@ -383,8 +425,8 @@ def cmd_status(t, args):
     camera = _camera_line(t)
     if camera is not None:
         print(f"  Camera:       {camera}")
-    if session_held:
-        print("  Session:      held (calibration procedure or firmware push)")
+    if held:
+        print(f"  Session:      held ({held})")
     print(f"  Store:        {store_count} populated")
     print(f"  Samples:      {count}")
     if isinstance(t, SupportsTimeSync):
@@ -407,29 +449,7 @@ def cmd_status(t, args):
                       f"source {src})")
             else:
                 print("  Sync:         -")
-    if isinstance(t, SupportsFaultCounters):
-        # Firmware without the fault-counter surface refuses the
-        # read; status stays useful without the lines.
-        overflow_read = getattr(t, "read_cmd_queue_overflow_count", None)
-        try:
-            io_err = t.read_io_err_count()
-            probe_failed = t.read_probe_failed_count()
-            drdy = t.read_drdy_coalesced_count()
-            rejects = t.read_ingress_reject_count()
-            overflows = overflow_read() if overflow_read else None
-        except (RuntimeError, OSError, TimeoutError):
-            pass
-        else:
-            # A healthy device stays quiet: the block appears only when a
-            # counter is nonzero, so a Faults line always means something.
-            if any((io_err, probe_failed, drdy, rejects, overflows)):
-                print(f"  Faults:       {io_err} I/O errors absorbed, "
-                      f"{probe_failed} probe failures")
-                print(f"                {drdy} samples missed (VM busy at DRDY), "
-                      f"{rejects} commands rejected (bus contention)")
-                if overflows is not None:
-                    print(f"                {overflows} writes dropped "
-                          f"(device queue full)")
+    print_faults(t)
     if error:
         print(f"  Error:        {op_error_name(error)}")
     if name:
@@ -478,10 +498,9 @@ def cmd_identify(t, args):
 
 def _bare_timesync(args) -> bool:
     """`nxs timesync` with no unit addressed disciplines the whole bench
-    from the manifest (or prints its systemd unit)."""
-    return bool(getattr(args, 'systemd', False)) or (
-        args.transport == 'i2c' and args.bus is None and args.port is None
-        and not getattr(args, 'unit', None) and not args.only_units)
+    from the manifest."""
+    return (args.transport == 'i2c' and args.bus is None and args.port is None
+            and not getattr(args, 'unit', None) and not args.only_units)
 
 def cmd_timesync(t, args):
     """Refresh the estimator and push the discipline on a fixed cadence. The
@@ -547,8 +566,11 @@ def cmd_commission(t, args):
                      and bitrate is None and term is None):
         ident = t.read_identity()
         print(f"node-id  {ident['node_addr']}")
-        for name, sid in ident['topics'].items():
-            print(f"  {name:<18} {sid}")
+        # The subject ids are Cyphal registers: the I2C door serves the node
+        # id and the CAN link as device rows and no subject.
+        if args.transport != 'i2c':
+            for name, sid in ident['topics'].items():
+                print(f"  {name:<18} {sid}")
         if isinstance(t, SupportsBitTiming):
             print(f"  {'can-bitrate':<18} {device_params.bitrate_line(t)}")
         if isinstance(t, SupportsCanTermination):
@@ -566,6 +588,10 @@ def cmd_commission(t, args):
             print(f"commission: --subject value must be an integer, got '{val}'",
                   file=sys.stderr)
             return 1
+    if topics and args.transport == 'i2c':
+        print("commission: the subject ids are Cyphal registers; commission them over the "
+              "cyphal-can or cyphal-serial transport", file=sys.stderr)
+        return 1
     try:
         t.commission(node_addr=args.node_id, topics=topics or None,
                      can_bitrate=bitrate, can_term=term)
@@ -727,6 +753,9 @@ def add_unit_parsers(sub) -> None:
     p_set = sub.add_parser('set', help="Set a parameter of either family")
     p_set.add_argument('param', help='Parameter name')
     p_set.add_argument('value', help='New value')
+    from nxs.map_cli import add_map_parser
+
+    add_map_parser(sub)
 
 
 def add_timesync_parser(sub) -> None:
@@ -745,16 +774,13 @@ def add_timesync_parser(sub) -> None:
                       default=None,
                       help='Bare form: discipline only the named unit '
                            '(repeatable)')
-    p_ts.add_argument('--systemd', action='store_true',
-                      help='Print a systemd unit running the bare pusher '
-                           'resident, then exit')
 
 
 def add_commission_parser(sub) -> None:
     """Register `nxs commission`."""
     p_comm = sub.add_parser('commission',
                             help='Read/set the persisted node-ID and subject-IDs')
-    p_comm.add_argument('--node-id', type=int, default=None,
+    p_comm.add_argument('--node-id', type=lambda v: int(v, 0), default=None,
                         help='Set the Cyphal node-ID (0-125, 255 for anonymous, or 0xFFFF '
                              'to revert to the default); applies on reboot')
     p_comm.add_argument('--subject', action='append', metavar='NAME=ID', default=[],

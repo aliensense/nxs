@@ -7,7 +7,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from nxs.tune_model import _token, load_model
+from nxs.tune_model import ROWS, hub_product, load_model
 from nxs.tune_sweep import sweep as _sweep
 from nxs.tune_fields import (NONE, _platform_port_buses,
                              refresh)
@@ -91,7 +91,7 @@ def gather_facts(cfg, buses, sweep) -> Facts:
         facts.stacks[name] = _stack(name, topology)
         for link in port.links:
             facts.states[(name, link.name)] = _state(topology, link.name)
-            token = _mode_token(facts.records[name], port, link)
+            token = _mode_token(facts.records[name], link)
             if token and link.camera:
                 facts.labels[(name, link.name)] = _label(topology, link.camera, token)
     return facts
@@ -134,15 +134,15 @@ def _stack(name, topology) -> Optional[str]:
         return None
 
 
-def _mode_token(record, port, link) -> Optional[str]:
-    return (record.get("modes") or {}).get(link.name) or link.camera_mode or port.camera_mode
+def _mode_token(record, link) -> Optional[str]:
+    return (record.get("modes") or {}).get(link.name) or link.camera_mode
 
 
-def _rate(facts, name, port, link) -> Optional[float]:
+def _rate(facts, name, link) -> Optional[float]:
     from nxs.cam import port_state
     rate = port_state.running_rate(facts.records.get(name) or {}, link.name)
     if rate is None:
-        rate = link.camera_fps or port.camera_fps
+        rate = link.camera_fps
     return float(rate) if rate is not None else None
 
 
@@ -185,7 +185,8 @@ def _port_node(channel, cfg, by_name, by_unit, facts, seen) -> Node:
     port = cfg.ports.get(name) if channel.declared else None
     parts = [name]
     if port is not None and port.hub_compatible:
-        parts.append(f"NXS Hub {port.hub_compatible}")
+        product = hub_product(port.hub_compatible)
+        parts.append(f"{product} {port.hub_compatible}" if product else port.hub_compatible)
     if STACK_WORDS.get(facts.stacks.get(name)):
         parts.append(STACK_WORDS[facts.stacks[name]])
     bus = facts.buses.get(name) or (port.bus if port is not None else None)
@@ -218,9 +219,9 @@ def _link_node(link, port, bus, by_name, by_unit, facts, seen) -> Node:
     spec = next((l for l in port.links if l.name == letter), None) if port is not None else None
     state = facts.states.get((name, letter))
     told = (facts.sweep.get(bus) or {}).get("links", {}).get(letter) or {}
-    figure = _camera_figure(facts, name, port, spec) if spec is not None else []
+    figure = _camera_figure(facts, name, spec) if spec is not None else []
     sensor = spec.camera if spec is not None else told.get("sensor")
-    pod_token = _token(link.knobs().get("POD", NONE))
+    pod_token = link.knobs().get("POD", NONE)
     pod = by_name.get(pod_token) if pod_token != NONE else None
     if pod is None:
         # A bare link: the head on the line, its knobs with the link's. A pod
@@ -228,7 +229,8 @@ def _link_node(link, port, bus, by_name, by_unit, facts, seen) -> Node:
         head = ([sensor] if sensor else
                 [f"head @{told['head_addr']:#04x}"] if told.get("head") and told.get("head_addr") is not None
                 else [])
-        node = Node("link", key, [letter] + head + figure, state=state, port=name, knobs=_knobs(link))
+        node = Node("link", key, [letter] + head + figure, state=state, port=name, knobs=_knobs(link),
+                    note=link.note)
         found = by_name.get(_pod_name(name, letter))
         if found is not None and not found.declared:
             node.children.append(_unit_node(found, None, facts, seen))
@@ -239,18 +241,20 @@ def _link_node(link, port, bus, by_name, by_unit, facts, seen) -> Node:
     suffix = ("new" if not pod.declared else _pod_suffix(facts, bus, letter))
     node = Node("link", key, [letter, f"{pod.name} @{alias:#04x}" if alias is not None else pod.name],
                 state=state, suffix=suffix, unit=pod.name, port=name,
-                knobs=_knobs(link, kinds=("declare",)) + _knobs(pod, kinds=("declare", "mount", "egress", "firmware")),
-                route=pod.template[0] if not pod.declared and pod.template else None, note=pod.note)
+                knobs=_knobs(link, kinds=("declare",)) + _knobs(pod, kinds=("declare",))
+                + _unit_knobs(pod),
+                route=pod.template[0] if not pod.declared and pod.template else None,
+                note=link.note or pod.note)
     if sensor:
         node.children.append(Node("personality", key + ("camera",), [sensor] + figure,
-                                  knobs=_knobs(link, kinds=("camera",)), unit=pod.name, port=name))
+                                  knobs=_knobs(link, kinds=(ROWS,)), unit=pod.name, port=name))
     node.children.extend(_personalities(key, pod, unit=pod.name, port=name))
     return node
 
 
-def _camera_figure(facts, name, port, link) -> List[str]:
+def _camera_figure(facts, name, link) -> List[str]:
     label = facts.labels.get((name, link.name))
-    rate = _rate(facts, name, port, link)
+    rate = _rate(facts, name, link)
     if label is None and rate is None:
         return []
     words = [w for w in (label, f"{rate:g} fps" if rate is not None else None) if w]
@@ -261,7 +265,7 @@ def _pod_suffix(facts, bus, letter) -> str:
     """absent for a declared pod whose link the hub walked and found none on."""
     swept = facts.sweep.get(bus)
     link = (swept["links"].get(letter) if swept and swept["hub"] else None)
-    if link is None or not link["walked"]:
+    if link is None or link["unwalked"]:
         return ""
     return "" if link["pod"] else "absent"
 
@@ -298,7 +302,7 @@ def _unit_node(channel, spec, facts, seen, route=None) -> Node:
     unit's own; its personalities hang under it."""
     seen.add(channel.name)
     key = ("unit", channel.name)
-    knobs = _knobs(channel, kinds=("declare", "mount", "egress", "firmware"))
+    knobs = _knobs(channel, kinds=("declare",)) + _unit_knobs(channel)
     if not channel.declared:
         link, _serial = channel.template
         parts = ([f"{channel.name} @{link.address:#04x}"] if link.transport == "i2c"
@@ -316,12 +320,18 @@ def _unit_node(channel, spec, facts, seen, route=None) -> Node:
     return node
 
 
+def _unit_knobs(channel) -> List[Knob]:
+    """The knobs of a unit's own rows section: its firmware pin."""
+    return [Knob(channel, section, f) for section in channel.sections
+            if section.kind == ROWS and section.role[0] == "unit" for f in section.fields]
+
+
 def _personalities(key, channel, unit, port) -> List[Node]:
-    """One node per click personality the unit declares, its parameters as
-    knobs; a click personality freezes with its unit."""
+    """One node per click personality the unit declares, its rows as knobs;
+    a click personality freezes with its unit."""
     nodes = []
     for section in channel.sections:
-        if section.kind != "sensor":
+        if section.kind != ROWS or section.role[0] != "click":
             continue
         knobs = _knobs(channel, labels=(section.label,))
         personality = section.label.rsplit("/", 1)[-1]

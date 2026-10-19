@@ -52,12 +52,19 @@ omitted parameters).
 ## Step 1: Read the Reference Materials
 
 **ALWAYS start here.** Read the personality authoring reference to understand
-the exact APIs, patterns, and constraints — whichever of these exists in
-your checkout:
+the exact APIs, patterns, and constraints. A source checkout keeps it
+beside the shipped specifications, and an SDK clone under `docs/`. The search below
+covers a session started in either tree and one started in the folder
+above an `nxs/` clone:
 
 ```
-find docs -name nxs-click-personalities.md    # prints the file to read, wherever the docs tree keeps it
+find docs nxs/docs -name nxs-click-personalities.md 2>/dev/null   # prints the file to read
 ```
+
+When it prints nothing, look for the same file under the installed `nxs`
+package (`python -c "import nxs, os; print(os.path.dirname(nxs.__file__))"`)
+and read that copy if the wheel ships one. Otherwise stop and name the
+missing file, `nxs-click-personalities.md`.
 
 That guide is the single source of truth for what a personality can do
 and how `RegisterClickPersonality` / `StreamClickPersonality` behave. The templates and
@@ -75,7 +82,9 @@ loop.
 From the user's input ($ARGUMENTS), identify:
 - The sensor IC (part number from the datasheet or Click silkscreen)
 - Communication protocol: **I2C, SPI, or UART**
-- If a mikroE Click board URL is given, fetch it to identify the IC
+- If a mikroE Click board URL is given, fetch it to identify the IC. On
+  an HTTP 403 from mikroe.com, identify the part from the page title or a
+  web search, then fetch its datasheet from the manufacturer.
 
 **3.3V only.** NXS provides 3.3V on the mikroBUS power rail.
 
@@ -118,8 +127,10 @@ Search for the Click board driver on GitHub:
 https://github.com/MikroElektronika/mikrosdk_click_v2/tree/master/clicks/<click-name>
 ```
 
-Read: `lib_<name>/include/<name>.h` (register map, pin defs) and
-`lib_<name>/src/<name>.c` (init sequence, read functions).
+Read: `lib_<click-name>/include/<click-name>.h` (register map, pin defs)
+and `lib_<click-name>/src/<click-name>.c` (init sequence, read functions).
+The path carries the Click's name, never the part number:
+`lib_<click-name>` such as `lib_c6dofimu9`, not `lib_<part number>`.
 
 The Click driver is normative for the **wire protocol** (framing, CRC
 parameters, register addresses, strap options), never for
@@ -153,6 +164,11 @@ Map mikroBUS pins to NXS GPIO aliases:
 | SCL | I2C2 | PC4 | I2C clock |
 
 ## Step 4: Read the Sensor Datasheet
+
+Read the datasheet's current revision. When it cannot be fetched and an
+older revision can, use the older one. Its document id and revision go in
+the docstring's `datasheet <document id, revision>` field, and the report
+card names the unreachable current revision (Step 7).
 
 Extract:
 - **Device ID register** (WHO_AM_I / CHIP_ID) and expected values
@@ -189,7 +205,7 @@ Extract:
 
 ## Step 5: Write the Click Personality
 
-A click personality is two files in a directory named after the sensor, written where the
+A click personality is two files in a directory named `<name>`, written where the
 user works — never into the installed package (a customer's site-packages
 is wiped by the next reinstall):
 
@@ -198,10 +214,11 @@ is wiped by the next reinstall):
 ./<name>/<name>.yaml   facts — the params table (Step 5b)
 ```
 
-`<name>` is the snake_case sensor name, also the YAML `meta.personality` value.
+`<name>` is the personality's snake_case name (see the naming rule below), also
+the YAML `meta.personality` value.
 `nxs upload ./<name>/<name>.py` compiles the personality from there; `nxs personality
-install ./<name>` copies it into the personality store so `personality: <name>` in
-suite.yaml resolves to it. Create the directory, then write `<name>.py`.
+install ./<name>` copies it into the personality store so a click node's
+`type: <name>` in suite.yaml resolves to it. Create the directory, then write `<name>.py`.
 
 The family bases live in the installed package (`nxs.click_personalities`); find its
 path from the package rather than hardcoding it:
@@ -254,6 +271,13 @@ module part number, which is its datasheet-bearing part). File: the
 part number in lower_snake (`xyz9000.py`); class: the same in
 PascalCase with digits kept (`class Xyz9000`), matching the sibling
 personalities already in the package.
+
+A name the prompt gives (`name it my_imu`) wins for the directory, the
+file and the class: `my_imu/my_imu.py`, `class MyImu`. The part number
+then goes in the docstring's title and part lines. A part-number name
+would shadow the shipped personality of the same part once installed,
+since an installed personality resolves before the shipped set. Without
+a given name, the part-number rule holds.
 
 ### I2C/SPI (Register-Based) Sensor Template
 
@@ -406,8 +430,8 @@ the mikroBUS analog or PWM pin:
   buffer, so a positional commit ships empty bytes. Pair it with a
   `uint16` field whose `scale` is `Vref/4096 · gain`.
 - **`self.drive_pwm(freq=…, duty=…)`** in `configure()` drives the **PWM**
-  pin via two `kind="live"` range params (`pwm_freq` Hz, `pwm_duty` %)
-  that the host retunes at runtime, no reload.
+  pin via two `kind="apply"` range params (`pwm_freq` Hz, `pwm_duty` %)
+  that the host retunes at runtime, no VM restart.
 
 ### Command-response I²C (opcodes instead of a register map)
 
@@ -820,7 +844,7 @@ def _read_word(addr):
     return word | ((bin(word).count("1") & 1) << 15)
 
 
-class ParityFramedEncoder(RegisterClickPersonality):
+class ParityEncoder(RegisterClickPersonality):
     BUSES = ('spi',)     # literal wire words are SPI-only
     PINS = {}            # no data-ready output: poll
     SPI_PROFILE = SpiProfile(max_hz=10_000_000, mode=1)   # DS SPI timing table
@@ -864,7 +888,7 @@ class ParityFramedEncoder(RegisterClickPersonality):
 
 
 # DS worked example: the <REGISTER> read command is 0xFFFF.
-assert ParityFramedEncoder.CMD_POSITION == 0xFFFF
+assert ParityEncoder.CMD_POSITION == 0xFFFF
 ```
 
 ### Critical rules for literal-word (`xfer`) personalities
@@ -1277,6 +1301,13 @@ declare `BUSES = ('i2c', 'spi')` and set `BUS` to the Click's pre-soldered
 default (product page / schematic). A silicon-single-bus part (SPI-only)
 lists one bus.
 
+An I²C-disable bit that the datasheet tells SPI users to set does not make
+the bring-up differ per bus. `configure()` is one program for every
+declared bus and offers no per-bus branch (see "`configure()` is traced
+once" in the FRAME rules). So declare every bus the silicon supports and
+leave the bit at its reset value, with a comment that says so. The part
+still answers on SPI with I²C enabled.
+
 **Register address width.** Register opcodes carry a uniform 16-bit
 operand, but device-side framing of addresses wider than 8 bits is not yet
 implemented — only 8-bit-addressed parts are supported today.
@@ -1320,7 +1351,8 @@ does the sensor even have one (Step 4 pin description)?
 
 Every settle after a power-mode transition (a reset, a wake from sleep, a
 mode change) is twice the datasheet's maximum start-up time for that
-transition, floor 10 ms, with the table cited in the comment.
+transition, floor 10 ms. When the table gives only a typical, it is twice
+the typical. The comment cites the table and says which of the two it gave.
 
 **1. Click routes RST to the part** → the platform hard-resets it at
 every bind. `configure()` issues NO reset of any kind; declare
@@ -1349,9 +1381,10 @@ def configure(self, config):
     # ... all configuration writes AFTER the delay ...
 ```
 
-- The delay is 2x the datasheet's boot/turn-on maximum with a 10 ms
-  floor, cited to the timing table. The maximum comes from the
-  datasheet's power-up/start-up table — never from a vendor driver's
+- The delay is 2x the datasheet's boot/turn-on maximum (or typical, per
+  the settle rule above) with a 10 ms floor, cited to the timing table.
+  The figure comes from the datasheet's power-up/start-up table — never
+  from a vendor driver's
   delay constant (a vendor delay proves sufficiency on one bench,
   not the silicon's bound). Under-sleeping loses the writes that
   follow — silently on SPI (no acks), producing stable wrong data
@@ -1379,9 +1412,11 @@ Declare ALL user-facing parameters — not just sensor modes but also
 `sample_rate`, filter bandwidth, and any other configurable setting
 that affects register values.
 
-Values are integers: the descriptor wire carries int32 and the compiler
-refuses a fraction. Encode a fractional physical value in a smaller
-integer unit and name that unit in `unit`.
+Values are whole numbers from 0 up: the descriptor wire carries them unsigned, and the compiler refuses a fraction or a negative value. A param whose values are a menu of register codes declares each value rounded to the nearest whole unit. The exact datasheet figure goes in a comment beside its code: `123: 0x02,   # 123.4 Hz`. Outside a menu, encode a fractional physical value in a smaller integer unit and name that unit in `unit`.
+
+**The parameter table has hard limits, and the compile names the one it breaks.** Declare 16 parameters at most, counting the ones the compiler adds: `bus` on a register personality, `reset_active`, the two of `drive_pwm` and `stream`. Never declare a parameter named `stream`: the compiler adds that GATE row, which starts and parks the sampling. Keep the class name, a parameter's name and an output field's name to 15 characters, and a parameter's unit and an output field's unit to 6. List 16 values at most in an enum, or 8 when a value passes 65535. The compiler writes each parameter into the image's PARAMS record as one row: name, unit, standard id, kind, values or range, and default. It writes how each row reads into the PRESENTATION record, each output field into the OUTPUTS record and the board's one output, `out`, into the PORTS record, and `nxs personality records ./<name>` prints them all.
+
+`declare_param()` takes the facts file's three display keys as keywords (Step 5b): `id=` the row's standard id by its registry number, `show=Show(unit, exponent)` and `labels=`. `public=` and `declare_row()` belong to a hub or a host program: every parameter of a click personality is a row, so leave `public` out and never call `declare_row()`.
 
 **Names are canonical across the fleet** — hosts script against them,
 so the same concept never gets a synonym. Rate is `sample_rate`;
@@ -1407,6 +1442,14 @@ must solely own its register byte (see "Two params on one register"
 under Traps). Default to the widest in-path bandwidth (the least
 filtering that keeps the divider's base rate), so the out-of-box
 response matches the part's headline behavior.
+
+**Rate and full-scale defaults come from the datasheet.** `sample_rate`
+defaults to the datasheet's power-on output data rate when that rate is a
+declared value. Otherwise it defaults to the lowest declared rate at or
+above 100 Hz, the rate the guides stream at, else the highest declared
+rate. Each full-scale param defaults
+to the datasheet's power-on range. With the bandwidth default above, the
+report card's `params` line follows from the datasheet alone.
 
 **A setting that cannot be a runtime param becomes a compile-time
 config key — never a silently fixed value.** Most documented settings
@@ -1571,8 +1614,9 @@ t_pass ≈ 8 × (N + 4) / f_spi      # the same pass over SPI
 `N` is the sample size in bytes. These are **wire terms only** — the
 executed pass adds platform overhead: budget ≈ 200 µs per bus
 *transaction* (VM dispatch plus bus-stack setup on the target MCU class)
-and every staging sleep at face value. A DRDY loop adds one such term for
-its burst, a poll loop two (the status read and the burst), and the wire
+and every staging sleep at face value. A pass adds one such term per
+transaction it issues. The register template reads the status register
+before the burst under either trigger, so its pass adds two. The wire
 arithmetic stands; a per-word framed protocol that
 reads W words as W transactions is *dominated* by the overhead term —
 `t_pass ≈ W × 200 µs + Σ staging sleeps + wire` — and the fastest honest
@@ -1602,10 +1646,11 @@ Poll-paced parts run the same check with the whole pass (conversion sleeps
 included) against the poll period; with no tear risk, no 3× headroom.
 
 Worked numbers — a 14-byte sample on the board's I²C, 330 kHz on the
-wire, DRDY-paced: t_pass ≈ 200 µs + 9 × 22 / 330 kHz ≈ 800 µs, and a poll
-loop adds the status read's 200 µs. On a part with a coherent
-output set that holds 1000 Hz. Without one the bound is 333 µs at 1000 Hz
-and 667 µs at 500 Hz, so the list stops at 250 Hz.
+wire, behind the status gate under DRDY or poll:
+t_pass ≈ 2 × 200 µs + 9 × 22 / 330 kHz ≈ 1000 µs. On a part with a
+coherent output set that holds 1000 Hz, exactly at the bound. Without one
+the bound is 333 µs at 1000 Hz and 667 µs at 500 Hz, so the list stops at
+250 Hz.
 
 **The on-chip FIFO is not a data path.** Leave it disabled. A `measure()`
 body is one fixed burst per wake: it cannot drain a backlog and it cannot
@@ -1752,9 +1797,12 @@ before the tagged write moves the sites and is rejected.
 …)` tag — the tag needs the declared value set — and the tagged value must be
 one of the declared values.
 
-**A live param nothing reads.** `kind="live"` takes effect only through the PWM
-pair (`pwm_freq`/`pwm_duty`) or an output field's `scale_param`. Any other live
-param is a no-op `set`; use `kind="reload"`.
+**An apply param nothing reads.** `kind="apply"` takes effect only through a
+runtime reader: the PWM pair (`pwm_freq`/`pwm_duty`), an output field's
+`scale_param`, the program through `param()` (a cam personality's verb), or
+the unit itself for a row of a standard id it reads, the `orientation` row of
+id `MOUNT_ORIENTATION` that the unit composes onto its calibration (Step 5b).
+Any other apply param is a no-op `set`; use `kind="run"`.
 
 **A `scale_param` holding register codes.** A `scale_param` value multiplies
 the field's scale, so its values are physical magnitudes (`2, 4, 8, 16` g),
@@ -1791,8 +1839,20 @@ params:
 `meta.personality` equals the directory and file name. `nxs personality check ./<name>`
 refuses a mismatch, a default outside its values, and a duplicate name.
 Entries take an optional `type: range` (values exactly `[min, max]`; a range
-is always live) and `kind: live` (applied without a VM restart); the defaults
-are enum and reload. A computed table (values derived at configure time) calls
+is always `apply`) and `kind: apply` (applied without a VM restart); the
+defaults are enum and run. Three more optional keys say how a host shows the
+row: `show: {unit, exponent}` names the unit a value shows in and the power of
+ten that scales it (a row served in mdB shows in dB with
+`{unit: dB, exponent: -3}`); `labels:` names each value, an enum's in the order
+of its values and a range's from its min, 31 printable ASCII characters each
+and no two alike; `id:` names the row's standard id by its `ParamId` name. A
+row without `show` reads in its own unit at exponent 0.
+
+A part whose outputs ride its frame (an accelerometer, a gyroscope, a
+magnetometer) closes its facts file on the `orientation` row: the mount
+rotation of the sensor's frame, a range of the 24 rotation codes, `apply`, id
+`MOUNT_ORIENTATION`, default 0, the codes' names as its labels. Copy the row
+verbatim from `references/inertial.md`. No other class declares it. A computed table (values derived at configure time) calls
 `self.declare_param()` explicitly; the YAML carries plain facts. A value that
 never passes through `declare_param()` is invisible to `nxs caps`, `status`
 and `tune`.
@@ -1815,10 +1875,11 @@ just the defaults. Then check the semantics the compiler can't see:
 
 - **Class**: subclasses `RegisterClickPersonality` (I²C/SPI) or `StreamClickPersonality`
   (UART). Never plain `ClickPersonality`.
-- **Naming**: file = the part number in lower_snake, class = the same
-  in PascalCase (`xyz9000.py` / `Xyz9000`), consistent with the
-  sibling personalities in the package; never the carrier board's marketing
-  name.
+- **Naming**: file = the name the prompt gives, else the part number, in
+  lower_snake. Class = the same in PascalCase (`xyz9000.py` / `Xyz9000`),
+  consistent with the sibling personalities in the package, never the
+  carrier board's marketing name. A given name leaves the part number in
+  the docstring.
 - **Class checks**: every `references/<class>.md` read in Step 2 has
   its Self-checks section applied — a combo part applies every
   matching file's checks.
@@ -1942,6 +2003,7 @@ nxs personality: <name>
   trigger   <trigger>[ · <rate> Hz]
   outputs   <field> (<unit>)[ · <field> (<unit>) …]
   params    <name>=<default>[ · <name>=<default> …]
+  datasheet <document id, revision> · current revision not reachable
 
   nxs upload ./<name>/<name>.py[ --config bus=<other>]
   nxs stream --hz <rate>
@@ -1953,35 +2015,14 @@ nxs personality: <name>
 Fill from the personality: the two paths are the files Step 5 wrote in the
 working directory; group axis fields (`accel_x/y/z`) under one unit;
 `<rate>` is the integer sample rate. A single-bus part shows only `bus
-<the bus>` and drops the `--config bus=` hint. Default transport is I²C; append `-t cyphal-serial -p
+<the bus>` and drops the `--config bus=` hint. The `datasheet` line
+appears only when an older revision stood in for an unreachable current
+one (Step 4). Default transport is I²C; append `-t cyphal-serial -p
 <port>` (or `-t cyphal-can -p <iface>`) to the commands only if the user asked
 for it. Add no lines beyond the card.
 
-**Multi-sensor (suite).** For a host that manages several NXS units
-declaratively, also show the suite.yaml form — the new personality becomes a
-`sensors:` entry under its unit, and `nxs switch` deploys it:
-
-```yaml
-units:
-  - name: <unit-role>
-    module: nxs
-    links: [{transport: i2c, bus: /dev/i2c-9, address: 0x30}]
-    sensors:
-      - personality: <sensor_name_lowercase>
-        config: {sample_rate: 100, <other_key>: <value>}
-```
-
-The switch converges every declared unit and is idempotent:
-
-```bash
-nxs switch
-```
-
-After live-tuning params on a declared unit (`nxs --unit <name> set ...`),
-`nxs tune --freeze --unit <name>` adopts the tuned values back into the
-manifest. The manifest schema, switch semantics, and the tune-then-freeze
-flow are in the Integration & Operation Manual §5
-(https://aliensense.github.io/nxs-docs/reference/nxs-integration-manual/).
+The card never carries the suite.yaml form, which the Custom click
+personality guide's declaration step covers.
 
 When the part is not expressible (the stop rule above), output exactly
 this card instead — one `missing` block per gap — write no personality file,

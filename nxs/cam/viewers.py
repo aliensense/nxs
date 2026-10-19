@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from nxs import host as host_layer
 
 from .contracts import LinkSpec, Topology
-from . import port_state
+from . import daemon_records, port_state
 
 def resolve_capture_hints(hints: Optional[Dict[str, Any]],
                           link: Optional[str] = None) -> Dict[str, Any]:
@@ -49,6 +49,11 @@ def resolve_capture_hints(hints: Optional[Dict[str, Any]],
     for key in ("ae_role", "ae_peer"):
         if hints.get(key):
             resolved[key] = str(hints[key])
+    if hints.get("triggered"):
+        resolved["triggered"] = True
+        for key in ("readout_delay_ns", "exposure_offset_ns"):
+            if hints.get(key) is not None:
+                resolved[key] = int(hints[key])
     return resolved
 
 
@@ -72,7 +77,7 @@ def source_props(hints: Dict[str, Any], host=None, exposure_ns: Optional[int] = 
     if role:
         gain_db = hints.get("gain_db")
         if role == "follower":
-            gain_db = port_state.follow_gain_db(port) if port else None
+            gain_db = daemon_records.follow_gain_db(port) if port else None
         return host.pair_props(role, hints.get("exposure_us"), gain_db)
     if hints.get("exposure_us") is not None:
         return host.exposure_props(hints["exposure_us"])

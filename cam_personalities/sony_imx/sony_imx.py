@@ -16,8 +16,8 @@ frame-rate control runs; the fastest is V_TR's, the slowest the longest
 frame the register holds or the capture stack's `capture.framerate.min_fps`.
 Exposure needs the shutter register, `integration_offset_us`,
 `min_integration_lines`, and a floor (`shs_floor`, or the `shs_floor_regs`
-waits); a fast-trigger frame's output delay needs a `fast` preset and the
-GMRWT and GMTWT waits; gain needs `gain_max`, gain in
+waits); a fast-trigger frame's output delay needs a `fast` preset, the
+`fast_trigger` chart and its waits; gain needs `gain_max`, gain in
 dB `gain_reg_per_db`; the black level per bit depth is `program.blklevel`.
 Programs need their sleep set under `program:`; a knob whose facts are
 absent is not offered."""
@@ -29,8 +29,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from nxs.cam.contracts import InfeasibleConfig, MipiContract
 from nxs.cam.descriptors import SEN, Descriptor, to_int, w
-from nxs.cam.chips.sony_imx_knobs import (
-    FREERUN, _KnobMixin, _require_positive)
+from nxs.cam.laws import ApplyLaw, RegSpec, camera_options
+
+from .sony_imx_knobs import FREERUN, _KnobMixin, _require_positive
 
 #: The shutter register by shutter kind: SHS on the global-shutter parts,
 #: SHR0 on the rolling-shutter ones.
@@ -44,11 +45,6 @@ VINT_BITS = 0x03
 VINT_MODE_SHIFT = 2
 #: The kernel's trigger control slots, in order.
 TRIGGER_SLOTS = (FREERUN, "fast", "sequential")
-#: The fast trigger's data output delay (datasheet 20.7.3):
-#: t_TGDLY = 0.42 us + 4H + GMRWT + GMTWT, the waits in lines.
-OUTPUT_DELAY_US = 0.42
-OUTPUT_DELAY_LINES = 4
-OUTPUT_DELAY_WAITS = ("GMRWT", "GMTWT")
 
 
 class SonyImx(_KnobMixin):
@@ -101,10 +97,48 @@ class SonyImx(_KnobMixin):
         limits = self._d.limits
         return "captured_waits" in limits and "frame_length_delta_const" in limits
 
+    def _fast_trigger(self) -> Optional[Dict[str, Any]]:
+        """The fast-trigger timing chart (`limits.fast_trigger`), or None."""
+        chart = self._d.limits.get("fast_trigger")
+        return chart if isinstance(chart, dict) else None
+
+    def _mode_waits(self, mode: str) -> Dict[str, int]:
+        """The wait registers a mode's output delay counts: the mode's own
+        (`timing.waits`), else the captured set when the mode's frame follows
+        from it.
+
+        Raises:
+            InfeasibleConfig: For a mode with neither (one declared whole
+                runs waits the captured set does not state).
+        """
+        timing = self._timing(mode)
+        own = timing.get("waits")
+        if isinstance(own, dict):
+            return {str(k): to_int(v) for k, v in own.items()}
+        if timing.get("delta_kind") is None:
+            raise InfeasibleConfig(
+                f"{self._d.compatible} {mode}: its frame does not follow from the "
+                f"captured waits and it declares none, so the laws carry no "
+                f"output delay for it")
+        return {str(k): to_int(v)
+                for k, v in self._d.limits["captured_waits"].items()}
+
+    def _chart_waits(self, mode: str, regs: List[str]) -> int:
+        """The sum, in lines, of the chart's named waits at a mode."""
+        waits = self._mode_waits(mode)
+        missing = [reg for reg in regs if reg not in waits]
+        if missing:
+            raise InfeasibleConfig(
+                f"{self._d.compatible} {mode}: its waits state no {missing}, "
+                f"which the fast-trigger chart counts")
+        return sum(waits[reg] for reg in regs)
+
     def _output_delay_facts(self) -> bool:
+        chart = self._fast_trigger()
         waits = self._d.limits.get("captured_waits") or {}
-        return ("fast" in self._trigger_presets()
-                and all(reg in waits for reg in OUTPUT_DELAY_WAITS))
+        return (chart is not None and "fast" in self._trigger_presets()
+                and all(reg in waits for reg in chart["output_delay_regs"])
+                and all(reg in waits for reg in chart.get("exposure_regs", ())))
 
     def _gain_db_law(self) -> Optional[Tuple[int, int]]:
         """Register steps per dB as (numerator, denominator)."""
@@ -300,22 +334,50 @@ class SonyImx(_KnobMixin):
 
     def data_output_delay_lines(self, mode: str, hmax: int) -> int:
         """How many lines late a fast-trigger frame's valid pixels arrive,
-        rounded up to whole lines: t_TGDLY = 0.42 us + 4H + GMRWT + GMTWT
-        (datasheet 20.7.3) at the line `hmax`, the waits the captured ones.
-        A capture window of the mode's rows ends in that many lines of
-        filler.
+        rounded up to whole lines: t_TGDLY of the chart (`limits.fast_trigger`,
+        datasheet 20.7.3: a fixed time, whole lines and the output-delay
+        waits) at the line `hmax`, the waits the mode's. A capture window
+        of the mode's rows ends in that many lines of filler.
 
         Raises:
-            InfeasibleConfig: For a mode whose frame does not follow from
-                the captured waits (one declared whole runs its own).
+            InfeasibleConfig: For a mode whose waits the laws do not know.
         """
-        if self._timing(mode).get("delta_kind") is None:
-            raise InfeasibleConfig(
-                f"{self._d.compatible} {mode}: its frame does not follow from the "
-                f"captured waits, so the laws carry no output delay for it")
-        waits = self._d.limits["captured_waits"]
-        lines = OUTPUT_DELAY_LINES + sum(int(waits[reg]) for reg in OUTPUT_DELAY_WAITS)
-        return lines + math.ceil(OUTPUT_DELAY_US / self.line_time_us(hmax))
+        chart = self._fast_trigger()
+        lines = (int(chart["output_delay_lines"])
+                 + self._chart_waits(mode, list(chart["output_delay_regs"])))
+        return lines + math.ceil(float(chart["output_delay_us"]) / self.line_time_us(hmax))
+
+    def trigger_output_delay_us(self, mode: str, hmax: int) -> float:
+        """t_TGDLY at the line `hmax`: the chart's fixed time plus its whole
+        lines and the mode's output-delay waits, counted from the pulse's
+        end edge (datasheet 20.7.3)."""
+        chart = self._fast_trigger()
+        lines = (int(chart["output_delay_lines"])
+                 + self._chart_waits(mode, list(chart["output_delay_regs"])))
+        return float(chart["output_delay_us"]) + lines * self.line_time_us(hmax)
+
+    def trigger_exposure_offset_us(self, mode: str, hmax: int) -> float:
+        """What the sensor adds to the pulse's low time under fast trigger:
+        the chart's exposure waits at the line `hmax` plus the integration
+        offset (datasheet 20.7.3)."""
+        chart = self._fast_trigger()
+        lines = self._chart_waits(mode, list(chart.get("exposure_regs") or []))
+        return lines * self.line_time_us(hmax) + float(self._d.limits["integration_offset_us"])
+
+    def trigger_exposure_us(self, pulse_low_us: float, hmax: int, mode: str) -> float:
+        """The exposure a fast-trigger pulse low for `pulse_low_us` gives at
+        the line `hmax`: the pulse plus the sensor's offset."""
+        _require_positive("pulse_low_us", pulse_low_us)
+        return float(pulse_low_us) + self.trigger_exposure_offset_us(mode, hmax)
+
+    def readout_delay_ns(self, mode: str, hmax: int) -> int:
+        """From the exposure's end to the first valid line out, in
+        nanoseconds: t_TGDLY less the exposure's tail, both counted from the
+        pulse's end edge (datasheet 20.7.3). A frame consumer takes it off
+        the sensor's start-of-frame stamp."""
+        delay = (self.trigger_output_delay_us(mode, hmax)
+                 - self.trigger_exposure_offset_us(mode, hmax))
+        return round(delay * 1000)
 
     def validate_vmax(self, vmax: int, mode: str, color: Optional[bool] = None) -> None:
         """The frame-length law: no shorter than the mode's recommended
@@ -356,6 +418,42 @@ class SonyImx(_KnobMixin):
         lines = max(min_lines, min(lines, vmax - min_lines))
         return max(self.shs_floor(), vmax - lines)
 
+    def _apply_facts(self) -> bool:
+        cap_gain = (self._d.raw("capture") or {}).get("gain") or {}
+        return (self._has("REGHOLD", "VMAX", "GAIN") and self._exposure_facts()
+                and self._gain_db_law() is not None and "gain_max" in self._d.limits
+                and "max" in cap_gain)
+
+    def apply_law(self) -> ApplyLaw:
+        """The constants of the personality's `apply` action: VMAX, the
+        shutter and GAIN under REGHOLD. The frame is bounded by the running
+        mode's recommended frame and the register's capacity, the exposure
+        by the integration minimum and the shutter floor, and the gain by
+        the dB law over the capture stack's factor, in the capture stack's
+        unit."""
+        limits = self._d.limits
+        cap_gain = self._d.raw("capture")["gain"]
+        num, den = self._gain_db_law()
+        factor = int(cap_gain.get("factor", 1))
+        regs = self._d.registers
+        modes = self._d.program_modes()
+        floors = tuple(self.recommended_frame_length(m) for m in modes)
+        # Each mode's line at its HMAX, the period `run_timing` starts it at.
+        line_times = tuple(round(self.line_time_us(int(self._timing(m)["hmax"])) * 1000)
+                           for m in modes)
+        floor = self.shs_floor()
+        min_lines = int(limits["min_integration_lines"])
+        return ApplyLaw(
+            hold=RegSpec.of(regs, "REGHOLD"), frame_length=RegSpec.of(regs, "VMAX"),
+            shutter=RegSpec.of(regs, self._shutter_reg()), gain=RegSpec.of(regs, "GAIN"),
+            frame_length_min=min(floors), frame_length_max=self.vmax_capacity(),
+            frame_length_floors=floors, line_times_ns=line_times,
+            exposure_min=min_lines, exposure_margin=max(min_lines, floor),
+            shs_floor=floor, shutter_inverted=True,
+            gain_num=num, gain_den=den * factor, gain_reg_max=self._gain_max(),
+            gain_min=max(0, int(cap_gain.get("min", 0))), gain_max=int(cap_gain["max"]),
+            gain_step=max(1, int(cap_gain.get("step", 1))), gain_factor=factor,
+            stream_gate=self._has("STANDBY"))
 
     # --- readings ---------------------------------------------------------
     def derive_status(self, readings: Dict[str, int]) -> List[str]:
@@ -393,6 +491,13 @@ class SonyImx(_KnobMixin):
         sync = self._d.raw("sync") or {}
         return bool(sync.get("takes_trigger")), str(sync.get("text", ""))
 
+    def options(self, view) -> Dict[str, Any]:
+        """What the family narrows on its camera's rows: the rate row spans
+        the declared mode's free-run rates, from the driver's floor to the
+        datasheet frame V_TR (`camera_options`)."""
+        return camera_options(view, self._d,
+                            lambda mode: (self.fps_floor(mode), self.fps_ceiling(mode)))
+
     # --- the offered surface ---------------------------------------------
     def surface(self) -> Dict[str, Callable[..., Any]]:
         """Name -> bound callable for every law, program, and knob whose
@@ -403,7 +508,7 @@ class SonyImx(_KnobMixin):
                  "fps_ceiling", "fps_floor", "vmax_for_fps", "vmax_capacity",
                  "validate_vmax", "recommended_frame_length",
                  "trigger_frame_length", "line_time_us",
-                 "derive_status", "knob_readback"]
+                 "derive_status", "knob_readback", "options"]
         if self._adbit_facts():
             names.append("adbit_monosel")
         if self._program("init_inck_hz") is not None:
@@ -429,7 +534,10 @@ class SonyImx(_KnobMixin):
         if self._delta_formula_facts():
             names.append("frame_length_delta_formula")
         if self._output_delay_facts():
-            names.append("data_output_delay_lines")
+            names += ["data_output_delay_lines", "trigger_output_delay_us"]
+            if "integration_offset_us" in self._d.limits:
+                names += ["trigger_exposure_offset_us", "trigger_exposure_us",
+                          "readout_delay_ns"]
         if self._has("REGHOLD"):
             if self._has("VMAX"):
                 names.append("knob_fps")
@@ -443,6 +551,8 @@ class SonyImx(_KnobMixin):
             names.append("knob_test_pattern")
         if "takes_trigger" in (self._d.raw("sync") or {}):
             names.append("sync_capability")
+        if self._apply_facts():
+            names.append("apply_law")
         return {name: getattr(self, name) for name in names}
 
     # --- the kernel control table ----------------------------------------
@@ -501,3 +611,8 @@ class SonyImx(_KnobMixin):
         if self._has("BLKLEVEL"):
             rows.append(("black-level", "BLKLEVEL", 0, ()))
         return rows
+
+
+def bind(descriptor: Descriptor) -> SonyImx:
+    """The family bound to a descriptor's facts."""
+    return SonyImx(descriptor)

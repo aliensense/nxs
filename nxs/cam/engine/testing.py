@@ -38,6 +38,10 @@ class SpyRunner:
         """Record a device write step."""
         self.record("device_write", device, width, reg, offset, value, comment=comment)
 
+    def raw_write(self, device: int, data: list[int], comment: Optional[str] = None) -> None:
+        """Record a raw write step."""
+        self.record("raw_write", device, list(data), comment=comment)
+
     def read(self, device: int, reg: int, offset: int, length: int,
              store: Optional[str] = None, comment: Optional[str] = None) -> None:
         """Record a device read step."""

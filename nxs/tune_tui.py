@@ -87,12 +87,14 @@ class Panel:
                 view.move(self.state, 1)
             elif key in (curses.KEY_LEFT, curses.KEY_RIGHT):
                 self.step(-1 if key == curses.KEY_LEFT else 1)
+            elif key in (curses.KEY_PPAGE, curses.KEY_NPAGE):
+                self.step(-10 if key == curses.KEY_PPAGE else 10)
             elif key in (ord("s"), ord("S")):
                 self.act(scr, attrs, "saving…", self.save)
             elif key in (ord("f"), ord("F")):
                 self.act(scr, attrs, "freezing…", self.freeze)
             elif key in (ord("i"), ord("I")):
-                self.identify()
+                self.act(scr, attrs, "identifying…", self.identify)
             elif key in (ord("r"), ord("R")):
                 self.act(scr, attrs, "refreshing…", self.refresh)
 
@@ -116,12 +118,16 @@ class Panel:
         try:
             action()
         except SystemExit as e:
-            fact, alternatives = parse_refusal(str(e))
-            self.say(f"refused · {fact.splitlines()[0]}", "err",
-                     view.lines_rows(f"  - {a}" for a in alternatives))
+            self.refuse(str(e))
         except OSError as e:
             self.say(f"refused · {e.strerror or e}", "err")
         scr.clearok(True)
+
+    def refuse(self, text):
+        """The refusal's fact on the status row, its alternatives in the block."""
+        fact, alternatives = parse_refusal(text)
+        self.say(f"refused · {fact.splitlines()[0]}", "err",
+                 view.lines_rows(f"  - {a}" for a in alternatives))
 
     def say(self, text, role, block=()):
         """The status row and the block; the focused node's hint yields to the result."""
@@ -192,12 +198,12 @@ class Panel:
             # The port's own knobs and its links' are what the freeze adopted.
             keep = lambda ch, sec, _f: not (
                 (ch.name == node.port or getattr(ch, "port_name", None) == node.port)
-                and sec.kind in ("declare", "camera", "sync", "gain"))
+                and sec.kind in ("declare", "rows"))
         else:
             keep = lambda _ch, sec, _f: sec.unit_name != node.unit
         refused = self.reload(keep if rc == 0 else None)
         what = node.port if ports else node.unit
-        lines = out.getvalue().splitlines() + ([refused] if refused else [])
+        lines = out.getvalue().splitlines() + (refused.splitlines() if refused else [])
         self.say(f"froze {what} · next: nxs switch" if rc == 0 else "freeze failed",
                  "ok" if rc == 0 else "err", view.lines_rows(lines))
 
@@ -215,7 +221,7 @@ class Panel:
     def refresh(self):
         refused = self.reload()
         if refused:
-            self.say(f"refused · {refused}", "err")
+            self.refuse(refused)
             return
         ports, units = graph.counts(self.state.tree)
         self.say(f"refreshed · {view.plural(ports, 'port')} · {view.plural(units, 'unit')}", "ok")

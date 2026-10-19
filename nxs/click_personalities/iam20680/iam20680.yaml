@@ -5,8 +5,20 @@
 meta:
   personality: iam20680
 params:
-  - {name: sample_rate, values: [10, 25, 50, 100, 200, 250], default: 100, unit: Hz}
+  - {name: sample_rate, values: [10, 25, 50, 100, 200, 250, 500], default: 100, unit: Hz}
   - {name: accel_fs, values: [2, 4, 8, 16], default: 8, unit: g}
   - {name: gyro_fs, values: [250, 500, 1000, 2000], default: 2000, unit: dps}
   - {name: accel_bw, values: [5, 10, 21, 45, 99, 218, 420], default: 420, unit: Hz}
   - {name: gyro_bw, values: [5, 10, 20, 41, 92, 176], default: 176, unit: Hz}
+  # The mount rotation of the sensor's frame, a Rotation code.
+  - name: orientation
+    type: range
+    values: [0, 23]
+    default: 0
+    kind: apply
+    id: MOUNT_ORIENTATION
+    labels: [NONE, YAW_90, YAW_180, YAW_270, PITCH_90, PITCH_180, PITCH_270, ROLL_90, ROLL_180,
+             ROLL_270, PITCH_90_YAW_90, PITCH_90_YAW_180, PITCH_90_YAW_270, PITCH_180_YAW_90,
+             PITCH_180_YAW_270, PITCH_270_YAW_90, PITCH_270_YAW_180, PITCH_270_YAW_270,
+             ROLL_90_YAW_90, ROLL_90_YAW_180, ROLL_90_YAW_270, ROLL_90_PITCH_180,
+             ROLL_270_YAW_90, ROLL_270_YAW_270]

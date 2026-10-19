@@ -26,7 +26,7 @@ def print_hub_hint():
 
 def completion_text() -> Optional[str]:
     """argcomplete's registration for bash (zsh sources the same file after
-    `bashcompinit`); None when argcomplete is not installed."""
+    `compinit`); None when argcomplete is not installed."""
     try:
         from argcomplete.shell_integration import shellcode
     except ImportError:

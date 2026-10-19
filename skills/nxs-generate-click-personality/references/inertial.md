@@ -29,6 +29,26 @@ scale_param value; the resulting scale is within the part's
 sensitivity tolerance; state the approximation in the table's comment.
 Consume every table row or state which rows were dropped and why.
 
+The facts file closes on the `orientation` row, the mount rotation of
+the sensor's frame: a range of the 24 rotation codes, `apply`, id
+`MOUNT_ORIENTATION`, default 0, labelled with the codes' names in code
+order. Copy it verbatim; it is the same row in every frame-bearing
+personality:
+
+```yaml
+  - name: orientation
+    type: range
+    values: [0, 23]
+    default: 0
+    kind: apply
+    id: MOUNT_ORIENTATION
+    labels: [NONE, YAW_90, YAW_180, YAW_270, PITCH_90, PITCH_180, PITCH_270, ROLL_90, ROLL_180,
+             ROLL_270, PITCH_90_YAW_90, PITCH_90_YAW_180, PITCH_90_YAW_270, PITCH_180_YAW_90,
+             PITCH_180_YAW_270, PITCH_270_YAW_90, PITCH_270_YAW_180, PITCH_270_YAW_270,
+             ROLL_90_YAW_90, ROLL_90_YAW_180, ROLL_90_YAW_270, ROLL_90_PITCH_180,
+             ROLL_270_YAW_90, ROLL_270_YAW_270]
+```
+
 ## Output vector
 
 - `accel_x/y/z` in m/s² — sensitivity from the datasheet's

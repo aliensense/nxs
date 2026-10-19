@@ -38,6 +38,13 @@ KIND_IMAGE = "image"
 KIND_CLICK = "click"
 KIND_CAM = "cam"
 
+#: Who runs an image of a kind a unit's store never takes: the store takes
+#: click and cam personalities alone.
+RUNS_ELSEWHERE = {ImageKind.HUB: "the host runs it (nxs switch)",
+                  ImageKind.GRAPH: "the owner of the hub's bus runs it",
+                  ImageKind.MODULE: "a smart module runs it",
+                  ImageKind.HOST: "the host describes itself with it"}
+
 
 def store_dir() -> str:
     from nxs.suite import PERSONALITY_DIR
@@ -219,12 +226,11 @@ def _class_source(cls: type, path: Optional[str], name: str, origin: str) -> Sou
         return Source(KIND_CLICK, origin, name, path=path, driver_cls=cls)
     yaml_path = f"{os.path.splitext(path)[0]}.yaml" if path else None
     if not yaml_path or not os.path.isfile(yaml_path):
-        # A behaviour class alone compiles (a development image); without its
-        # datasheet the image carries no descriptor trailer, so no host
-        # learns the sensor from it.
+        # A behaviour class alone compiles (a development image); without its datasheet the trailer
+        # holds its ports alone, so no host learns the sensor from it.
         print(f"note: no datasheet beside {path or cls.__name__} "
               f"({os.path.basename(yaml_path) if yaml_path else 'no source file'}): "
-              f"the image carries no descriptor trailer", file=sys.stderr)
+              f"the image carries no record of the sensor", file=sys.stderr)
         return Source(KIND_CAM, origin, name, path=path, driver_cls=cls)
     return Source(KIND_CAM, origin, name, path=path, driver_cls=cls,
                   descriptor=_descriptor_at(yaml_path))
@@ -336,29 +342,47 @@ def parse_config(pairs) -> Dict[str, Any]:
     return config
 
 
+def config_keys(cls, compiled) -> set:
+    """The configuration keys a compile takes: the personality's parameters
+    but the gate row, the sampling's on and off, and `sample_rate`, `bus`
+    and, for a loop triggered from its configuration, `trigger`."""
+    allowed = {p.name for p in compiled.params if p.kind != "gate"}
+    allowed.update(("sample_rate", "bus"))
+    for attr_name in dir(cls):
+        fn = getattr(cls, attr_name)
+        if (callable(fn) and getattr(fn, "_measure_loop", False)
+                and getattr(fn, "_trigger", "") == "from_config"):
+            allowed.add("trigger")
+            break
+    return allowed
+
+
 def compile_source(source: Source, config: Dict[str, Any]):
     """`(compiled, image bytes)` for a click or cam personality source; a cam
     personality's trailer is the datasheet's records with the compiled
-    param indices. CompileFailed carries the user-facing line."""
+    param indices, then the records the compiler writes, its ports.
+    CompileFailed carries the user-facing line."""
     cls = source.driver_cls
     user_supplied = set(config)
     try:
         compiled = cls().compile(dict(config))
     except (CompileError, FileNotFoundError, ValueError) as e:
         raise CompileFailed(f"Error: {e}") from None
-    from nxs.check import sensor_allowed_keys
-    allowed = sensor_allowed_keys(cls, compiled)
+    allowed = config_keys(cls, compiled)
     unknown = user_supplied - allowed
     if unknown:
         raise CompileFailed(f"Unknown config keys: {', '.join(sorted(unknown))}\n"
                             f"Valid: {', '.join(sorted(allowed))}", stderr=False)
     if (source.kind == KIND_CAM and source.descriptor is not None
-            and compiled.kind != ImageKind.HUB):
+            and compiled.kind == ImageKind.CAMERA):
+        from nxs.cam.contracts import InfeasibleConfig
         from nxs.personality import records
         try:
             compiled.trailer = records.encode_trailer(source.descriptor, compiled.params,
-                                                      hub=source.hub)
-        except records.RecordError as e:
+                                                      hub=source.hub) + compiled.trailer
+        except (records.RecordError, InfeasibleConfig) as e:
+            # A law family refuses facts it cannot encode by name: a native
+            # mode that states no rate is a refusal, never a traceback.
             raise CompileFailed(f"Error: {e}") from None
     try:
         img = serialize(compiled)
@@ -406,9 +430,9 @@ def cmd_upload(t, args) -> int:
             print(f"error: {source.path} is already compiled; -o compiles a "
                   f"personality from its .py", file=sys.stderr)
             return 1
-        if source.image_kind == ImageKind.HUB:
-            print(f"error: {source.path} is a hub image; the host runs it "
-                  f"(nxs switch), a unit never does", file=sys.stderr)
+        if source.image_kind in RUNS_ELSEWHERE:
+            print(f"error: {source.path} is a {IMAGE_KIND_NAMES[source.image_kind]} image; "
+                  f"{RUNS_ELSEWHERE[source.image_kind]}, a unit never does", file=sys.stderr)
             return 1
         print(f"Uploading {source.path}: {len(source.image)}B "
               f"{IMAGE_KIND_NAMES[source.image_kind]} image")
@@ -432,15 +456,27 @@ def cmd_upload(t, args) -> int:
 def _land(t, args, source: Source, img: bytes, kind: int, name: str, compiled) -> int:
     """Upload the image: a click personality runs, a cam personality lands in a
     store slot (refused on a transport that cannot save one), and the
-    link's cache learns the descriptor."""
+    link's cache learns the descriptor. A native head's personality is
+    refused: the head serves its camera map in its own logic."""
+    from nxs.cam import laws
     from nxs.cli import _upload_and_run
+    from nxs.personality import records
 
-    if kind == ImageKind.HUB:
-        print(f"error: {name} is a hub personality; the host runs it (nxs switch), "
-              f"a unit never does", file=sys.stderr)
+    if kind in RUNS_ELSEWHERE:
+        print(f"error: {name} is a {IMAGE_KIND_NAMES[kind]} personality; "
+              f"{RUNS_ELSEWHERE[kind]}, a unit never does", file=sys.stderr)
         return 1
     if kind != ImageKind.CAMERA:
         return _upload_and_run(t, img)
+    try:
+        trailer = compiled.trailer if compiled is not None else deserialize(img).trailer
+    except ValueError:
+        trailer = []                # an image this tool cannot read: the unit judges it
+    if records.law_family(trailer) == laws.NATIVE:
+        print(f"error: {name} is a native head's personality; the head programs its own "
+              f"sensor and serves its camera map in its own logic, so a unit never runs it",
+              file=sys.stderr)
+        return 1
     if not _can_save(t):
         print("error: a cam personality runs from a flash slot, and this transport "
               "cannot save one", file=sys.stderr)
@@ -497,8 +533,7 @@ def _pick_slot(t, name: str, wanted: Optional[int]) -> Optional[int]:
                   "the session", file=sys.stderr)
             return None
         names[slot] = str(info.name) if info is not None else None
-        kind = getattr(info, "kind", None)
-        if IMAGE_KIND_NAMES.get(kind, kind) == IMAGE_KIND_NAMES[ImageKind.CAMERA]:
+        if getattr(info, "kind", None) == IMAGE_KIND_NAMES[ImageKind.CAMERA]:
             cameras.append(slot)
     empty = next((slot for slot, held_name in names.items() if held_name is None), None)
     if wanted is not None:
@@ -561,9 +596,11 @@ def port_link_for(args):
 def write_manifest(directory: str, version: str, build: Optional[str] = None) -> Dict[str, Any]:
     """`manifest.yaml` beside the `.nxs` files of a personalities directory:
     per image its name, the sensor it drives, the image format, and the
-    file's CRC-32. Returns the manifest written."""
+    file's CRC-32, then each module of the law families beside the images
+    with its CRC-32. Returns the manifest written."""
     import yaml
 
+    from nxs.cam.laws import is_family
     from nxs.personality import records
 
     entries = []
@@ -589,10 +626,17 @@ def write_manifest(directory: str, version: str, build: Optional[str] = None) ->
                 record["sensor"] = descriptor.compatible
                 record["modes"] = len(records.mode_values(descriptor))
         entries.append(record)
+    laws = []
+    for family in sorted(p for p in Path(directory).iterdir() if is_family(p)):
+        for module in sorted(family.glob("*.py")):
+            laws.append({"family": family.name, "file": f"{family.name}/{module.name}",
+                         "crc32": f"0x{zlib.crc32(module.read_bytes()) & 0xFFFFFFFF:08x}"})
     manifest: Dict[str, Any] = {"version": str(version)}
     if build:
         manifest["build"] = str(build)
     manifest["personalities"] = entries
+    if laws:
+        manifest["laws"] = laws
     with open(os.path.join(directory, "manifest.yaml"), "w", encoding="utf-8") as fh:
         fh.write(yaml.safe_dump(manifest, sort_keys=False))
     return manifest

@@ -312,29 +312,73 @@ def _load_facts_file(path: str) -> dict:
 def _param_laws(entry: dict) -> list:
     """The value laws the compiler applies to a parameter, judged on the
     descriptor alone: an enum default is one of its values, a range is
-    `[min, max]` with the default inside it."""
+    `[min, max]` with the default inside it, a label names each value and
+    an id is a ParamId's name."""
     values = entry.get("values")
     default = entry.get("default")
     if not isinstance(values, list) or isinstance(default, bool) or not isinstance(default, int):
         return []                          # shape problems: the schema's
+    problems = _label_laws(entry)
     if entry.get("type", "enum") == "range":
         if len(values) != 2 or not all(isinstance(v, int) for v in values):
-            return []
+            return problems
         lo, hi = values
         if lo > hi:
-            return [f"range [{lo}, {hi}] is reversed (min must not exceed max)"]
+            return problems + [f"range [{lo}, {hi}] is reversed (min must not exceed max)"]
         if not lo <= default <= hi:
-            return [f"default {default} is outside its range [{lo}, {hi}]"]
-        return []
+            return problems + [f"default {default} is outside its range [{lo}, {hi}]"]
+        return problems
     if default not in values:
-        return [f"default {default} is not one of its values {values}"]
-    return []
+        return problems + [f"default {default} is not one of its values {values}"]
+    return problems
+
+
+def _label_laws(entry: dict) -> list:
+    """An entry's labels count its values, an enum's or a range's `max -
+    min + 1`, no two alike, and its id names a standard id."""
+    from nxs._generated_constants import NxsMap
+
+    problems = []
+    pid = entry.get("id")
+    if isinstance(pid, str) and pid not in NxsMap.ParamId._NAMES.values():
+        problems.append(f"id {pid!r} is no ParamId")
+    labels, values = entry.get("labels"), entry.get("values")
+    if not isinstance(labels, list) or not all(isinstance(v, int) for v in values):
+        return problems
+    count = (values[1] - values[0] + 1 if entry.get("type", "enum") == "range"
+             and len(values) == 2 else len(values))
+    if len(labels) != count:
+        problems.append(f"{len(labels)} labels for {count} values; a label names each value")
+    twice = sorted({str(label) for label in labels if labels.count(label) > 1})
+    if twice:
+        problems.append(f"{', '.join(twice)} labels two values")
+    return problems
 
 
 def click_params(cls) -> list:
     """The params table for a click personality's class: the facts file beside
     the class's own source, else the one of that name among the installed
     and shipped click personalities (a shipped class copied elsewhere)."""
+    path, candidates = _facts_path(cls)
+    if path is None:
+        raise FileNotFoundError(
+            f"no parameter descriptor for {cls.__name__} (looked beside "
+            f"{', '.join(dict.fromkeys(candidates)) or 'nothing resolvable'})")
+    return _load_facts_file(path).get("params") or []
+
+
+def personality_name(cls) -> str:
+    """A click personality's name: its facts file's `meta.personality`, the
+    class name for a class with no facts file."""
+    path, _candidates = _facts_path(cls)
+    if path is None:
+        return cls.__name__
+    return str(_load_facts_file(path)["meta"]["personality"])
+
+
+def _facts_path(cls):
+    """`(path, candidates)`: the facts file of a click personality's class,
+    None when no candidate exists, and every path looked at."""
     import os
     import sys
 
@@ -357,9 +401,5 @@ def click_params(cls) -> list:
         by_name = personality_file(klass.__name__.lower(), "yaml")
         if by_name:
             candidates.append(by_name)
-    for path in candidates:
-        if os.path.exists(path):
-            return _load_facts_file(path).get("params") or []
-    raise FileNotFoundError(
-        f"no parameter descriptor for {cls.__name__} (looked beside "
-        f"{', '.join(dict.fromkeys(candidates)) or 'nothing resolvable'})")
+    path = next((c for c in candidates if os.path.exists(c)), None)
+    return path, candidates

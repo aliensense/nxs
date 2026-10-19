@@ -14,7 +14,7 @@ from nxs import term
 
 from .descriptors import to_int
 
-from . import hubs
+from . import hubs, laws
 from .contracts import Topology
 from .descriptors import Descriptor
 
@@ -142,9 +142,11 @@ def unwalked(lock: Optional[bool]) -> Optional[str]:
 
 def derive_lines(hub, compatible: str,
                  results: List[ProbeResult]) -> List[str]:
-    """Ask the chip module for derived status lines, if it offers any."""
+    """Ask the chip's laws for derived status lines, if they offer any: one
+    of the hub's own chips' physics module, else the cam personality's
+    laws."""
     try:
-        module = hub.chip_module(compatible)
+        module = hub.chip_module(compatible) or laws.laws(hub.descriptor(compatible))
     except Exception:
         module = None
     hook = getattr(module, "derive_status", None) if module else None
@@ -157,13 +159,44 @@ def derive_lines(hub, compatible: str,
         return []
 
 
+def map_results(topology: Topology, addr: int) -> List[ProbeResult]:
+    """A camera door's header as probe rows: its identity and layout
+    version, the state and the mode in effect, the stream, the errno of the
+    last commit that faulted and the faulted commits."""
+    from nxs._generated_constants import NxsMap as Map
+    from nxs._libnxs_map import open_door
+
+    try:
+        with open_door(topology.i2c_bus, addr) as door:
+            boot = door.header()
+    except OSError:
+        return [ProbeResult("identity", None, "no ACK", False, "camera door identity")]
+    state, mode = boot["state"], boot["current_mode"]
+    return [
+        ProbeResult("identity", boot["id"], f"0x{boot['id']:02X}",
+                    boot["id"] == Map.MAP_ID_CAMERA, "camera door identity"),
+        ProbeResult("version", boot["version"], str(boot["version"]),
+                    boot["version"] == Map.MAP_VERSION_VALUE, "layout version"),
+        ProbeResult("state", state, Map.MapState._NAMES.get(state, str(state)),
+                    state in (Map.MapState.READY, Map.MapState.BUSY), "INERT until a run configures the head"),
+        ProbeResult("mode", mode, "none" if mode == 0xFF else str(mode), mode != 0xFF,
+                    "the mode table's value in effect"),
+        ProbeResult("stream", boot["stream"], "streaming" if boot["stream"] else "standby", None, ""),
+        ProbeResult("error", boot["error"], str(boot["error"]), boot["error"] == 0,
+                    "errno of the last commit that faulted"),
+        ProbeResult("fault_count", boot["fault_count"], str(boot["fault_count"]), None,
+                    "commits that ended FAULT"),
+    ]
+
+
 def probe_topology(
     i2c: Any, topology: Topology, hub, links=None,
 ) -> List[Tuple[str, List, List[str]]]:
     """Walk the carrier, des first, then each link through its window; ``links``
     narrows the walk. A direct port has no des and no serializer: its sensor
-    is read on the bus itself. Returns sections as (title, probe results,
-    derived lines)."""
+    is read on the bus itself. A pod's head behind a hub is read on its
+    camera map, never at the sensor (R-10.2). Returns sections as (title,
+    probe results, derived lines)."""
     sections: List[Tuple[str, List, List[str]]] = []
     flows = hub.flows()
 
@@ -211,6 +244,11 @@ def probe_topology(
                 derive_lines(hub, link.ser_compatible, ser_results),
             ))
             if not link.has_camera:
+                continue
+            if link.nxs_units:
+                mapped = int(hubs.map_address(hub, link))
+                sections.append((f"link {link.name} camera door @{mapped:#04x}",
+                                 map_results(topology, mapped), []))
                 continue
             from nxs.cam.identity import answering_address
 

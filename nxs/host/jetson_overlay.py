@@ -207,15 +207,34 @@ def _control_node(pools: Sequence[PoolSensor], indent: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def passive_mode_cells(rows: bytes) -> str:
+    """The driver's `aliensense,modes` cells from the camera door's mode
+    rows: per mode the width, the height, the bit depth, the pixel phase
+    (0xff for none), the lane rate in Mbps and the lanes."""
+    from nxs.personality.records_fields import mode_entries
+
+    return " ".join(f"{m['width']} {m['height']} {m['bit_depth']} {m['phase']} {m['rate_mbps']} "
+                    f"{m['lanes']}" for m in mode_entries(rows))
+
+
 def _sensor_node(port: Dict[str, Any], label: str, node: str, addr: int,
                  table: Sequence[CaptureMode], lanes: int, vc: int,
                  csi_in_label: str, out_label: str, indent: str,
                  reg_bits: int = REG_BITS_DEFAULT, val_bits: int = VAL_BITS_DEFAULT,
-                 pools: Sequence[PoolSensor] = (), direct: bool = False) -> str:
+                 pools: Sequence[PoolSensor] = (), direct: bool = False,
+                 camera_map: bool = False, passive: Optional[bytes] = None) -> str:
     """The port's sensor node: driver identity, register widths, clocks,
     the mode table, the control table, and the endpoint into the NVCSI
     channel. Behind a hub the clock is the pods' INCK; a direct port's is
-    the lead sensor's own."""
+    the lead sensor's own. A channel whose link carries a pod gets the
+    unit's camera map instead, `aliensense,nxs-csi2` at the camera map's
+    address: the same modes, no register widths and no control table,
+    since the unit holds the sensor's laws. On a host another node owns the
+    hub's bus for, the channel's node is passive: `aliensense,passive` and
+    the compiled mode table the camera door would serve (`passive`) as the
+    driver's `aliensense,modes` cells, so the driver takes its formats with
+    no I²C transfer."""
+    camera_map = camera_map or passive is not None
     i = indent
     w, h = port["physical"]
     clock_hz = int(table[0].mclk_khz) * 1000 if direct else POD_INCK_HZ
@@ -225,12 +244,16 @@ def _sensor_node(port: Dict[str, Any], label: str, node: str, addr: int,
 {i}\tassigned-clock-parents = <&bpmp {CLK_PLLP_OUT0}>;
 {i}\tassigned-clock-rates = <{clock_hz}>;
 ''' if direct else "")
-    head = f'''{i}{label}: universal_{node}@{addr:x} {{
-{i}\tcompatible = "aliensense,universal";
-{i}\treg = <0x{addr:x}>;
-{i}\taliensense,reg-bits = <{reg_bits}>;
+    widths = ("" if camera_map else f'''{i}\taliensense,reg-bits = <{reg_bits}>;
 {i}\taliensense,val-bits = <{val_bits}>;
-{i}\tclocks = <&bpmp {CLK_EXTPERIPH1}>, <&bpmp {CLK_EXTPERIPH1}>;
+''')
+    if passive is not None:
+        widths = (f"{i}\taliensense,passive;\n"
+                  f"{i}\taliensense,modes = <{passive_mode_cells(passive)}>;\n")
+    head = f'''{i}{label}: {node_name(node, camera_map)}@{addr:x} {{
+{i}\tcompatible = "{COMPATIBLE_CAMERA_MAP if camera_map else COMPATIBLE_UNIVERSAL}";
+{i}\treg = <0x{addr:x}>;
+''' + widths + f'''{i}\tclocks = <&bpmp {CLK_EXTPERIPH1}>, <&bpmp {CLK_EXTPERIPH1}>;
 {i}\tclock-names = "extperiph1", "pllp_grtba";
 {i}\tmclk = "extperiph1";
 {i}\tclock-frequency = <{clock_hz}>;
@@ -238,7 +261,7 @@ def _sensor_node(port: Dict[str, Any], label: str, node: str, addr: int,
 {i}\tdevnode = "{port['devnode']}";
 {i}\tphysical_w = "{w}";
 {i}\tphysical_h = "{h}";
-{i}\tsensor_model = "universal";
+{i}\tsensor_model = "{DRIVER_CAMERA_MAP if camera_map else DRIVER_UNIVERSAL}";
 {i}\tpost_crop_frame_drop = "0";
 {i}\tuse_decibel_gain = "true";
 {i}\tdelayed_gain = "false";
@@ -246,7 +269,8 @@ def _sensor_node(port: Dict[str, Any], label: str, node: str, addr: int,
 '''
     modes = "".join(_mode_block(n, mode_properties(m, port, lanes, vc, direct), i + "\t")
                     for n, m in enumerate(table))
-    modes += _control_node(pools, i + "\t")
+    if not camera_map:
+        modes += _control_node(pools, i + "\t")
     tail = f'''{i}\tports {{
 {i}\t\t#address-cells = <1>;
 {i}\t\t#size-cells = <0>;
@@ -330,23 +354,50 @@ def node_identity(port: Dict[str, Any], pools: Sequence[PoolSensor],
 
 
 def node_aliases(port_name: str) -> Dict[int, int]:
-    """The host alias each channel's node carries on a hub port, {vc: addr}."""
+    """The host alias each channel's node carries on a hub port for a head
+    without a pod, {vc: addr}; a pod's channel carries the camera map's instead."""
     port = PORTS[port_name]
     return {0: int(port["sensor_addr"]), 1: int(port["vc1"]["sensor_addr"])}
 
 
+#: The kernel drivers a channel's node binds: the universal driver for a head the host programs,
+#: the unit driver for a pod's camera map. NVIDIA's module node devname is `<driver> <bus>-<addr>`.
+DRIVER_UNIVERSAL = "universal"
+DRIVER_CAMERA_MAP = "nxs-csi2"
+COMPATIBLE_UNIVERSAL = "aliensense,universal"
+COMPATIBLE_CAMERA_MAP = "aliensense,nxs-csi2"
+
+
+def node_name(node: str, camera_map: bool) -> str:
+    """The node's name before its address: `universal_<n>` or `nxs_csi2_<n>`."""
+    return f"{'nxs_csi2' if camera_map else 'universal'}_{node}"
+
+
 def _vc0_fragments(port: Dict[str, Any], lanes: int,
                    table: Sequence[CaptureMode], identity: NodeIdentity,
-                   pools: Sequence[PoolSensor], direct: bool = False) -> str:
+                   pools: Sequence[PoolSensor], direct: bool = False,
+                   camera_maps: Optional[Dict[int, int]] = None,
+                   passive: Optional[Dict[int, bytes]] = None) -> str:
     """Fragments 0-8: the carrier's own module (declared by the mux
     overlay; it takes the VC1 node, link A's, so link A gets the lower
     capture id), VI port and NVCSI channel switched on, and the VC0
-    sensor node. A direct port has the one node, so its module takes it."""
+    sensor node. A direct port has the one node, so its module takes it.
+    `camera_maps` names the channels whose link carries a pod, {vc: the camera map's
+    address}; those channels get the unit's node. `passive` names the
+    channels of a host that does not own the hub's bus, {vc: the compiled
+    mode table}; their node takes no I²C."""
+    camera_maps = camera_maps or {}
+    passive = passive or {}
     n = port["node"]
     vi, ch = port["vi_port"], port["csi_ch"]
-    addr = identity.addr
+    map0 = 0 in camera_maps
+    addr = camera_maps[0] if map0 else identity.addr
     v = port["vc1"]
-    module_node, module_addr = (n, addr) if direct else (v["node"], v["sensor_addr"])
+    map1 = 1 in camera_maps
+    vc1_addr = camera_maps[1] if map1 else v["sensor_addr"]
+    module_node, module_addr, module_map = ((n, addr, map0) if direct
+                                             else (v["node"], vc1_addr, map1))
+    driver = DRIVER_CAMERA_MAP if module_map else DRIVER_UNIVERSAL
     body = f'''\tfragment@0 {{
 \t\ttarget = <&sensor_module{port['module']}>;
 \t\t__overlay__ {{
@@ -354,8 +405,8 @@ def _vc0_fragments(port: Dict[str, Any], lanes: int,
 \t\t\tbadge = "{port['badge']}";
 \t\t\tdrivernode0 {{
 \t\t\t\tstatus = "okay";
-\t\t\t\tdevname = "universal {port['i2c_bus']}-00{module_addr:02x}";
-\t\t\t\tsysfs-device-tree = "/sys/firmware/devicetree/base/bus@0/cam_i2cmux/{port['mux_path']}/universal_{module_node}@{module_addr:x}";
+\t\t\t\tdevname = "{driver} {port['i2c_bus']}-00{module_addr:02x}";
+\t\t\t\tsysfs-device-tree = "/sys/firmware/devicetree/base/bus@0/cam_i2cmux/{port['mux_path']}/{node_name(module_node, module_map)}@{module_addr:x}";
 \t\t\t}};
 \t\t}};
 \t}};
@@ -421,9 +472,29 @@ def _vc0_fragments(port: Dict[str, Any], lanes: int,
 '''
     body += _sensor_node(port, f"sensor_{n}", n, addr, table, lanes, 0,
                          f"sensor_csi_ch{ch}_in", f"sensor_out_{n}", "\t\t\t",
-                         identity.reg_bits, identity.val_bits, pools, direct)
+                         identity.reg_bits, identity.val_bits, pools, direct, map0,
+                         passive.get(0))
     body += "\t\t};\n\t};\n"
     return body
+
+
+#: The camera I²C controller every camera bus of the carrier hangs off, behind the mux.
+CAM_I2C_CONTROLLER_PATH = "/bus@0/i2c@3180000"
+
+
+def _controller_fragment() -> str:
+    """Fragment 12: the camera I²C controller in multi-master mode. A unit
+    masters its own bus behind the serializer, so the host's controller
+    must lose an arbitration quietly, with EAGAIN, instead of clearing the
+    bus: the clocks of a bus clear reach every device behind the
+    serializers."""
+    return f'''\tfragment@12 {{
+\t\ttarget-path = "{CAM_I2C_CONTROLLER_PATH}";
+\t\t__overlay__ {{
+\t\t\tmulti-master;
+\t\t}};
+\t}};
+'''
 
 
 def _enable_fragment(port_name: str, port: Dict[str, Any]) -> str:
@@ -455,15 +526,24 @@ def _enable_fragment(port_name: str, port: Dict[str, Any]) -> str:
 
 def _vc1_fragments(port: Dict[str, Any], lanes: int,
                    table: Sequence[CaptureMode], identity: NodeIdentity,
-                   pools: Sequence[PoolSensor]) -> str:
+                   pools: Sequence[PoolSensor],
+                   camera_maps: Optional[Dict[int, int]] = None,
+                   passive: Optional[Dict[int, bytes]] = None) -> str:
     """Fragments 9-11: a second module (created here; it takes the VC0
     node, link B's), VI port and NVCSI channel, and the VC1 sensor node at
-    the port's alias address."""
+    the port's alias address, or at the camera map's when the channel's link
+    carries a pod; passive where `passive` names the channel."""
+    camera_maps = camera_maps or {}
+    passive = passive or {}
     v = port["vc1"]
     n = v["node"]
     vi, ch = v["vi_port"], v["csi_ch"]
     e_in, e_out = v["endpoints"]
-    addr = v["sensor_addr"]
+    map1 = 1 in camera_maps
+    addr = camera_maps[1] if map1 else v["sensor_addr"]
+    map0 = 0 in camera_maps
+    vc0_addr = camera_maps[0] if map0 else identity.addr
+    driver0 = DRIVER_CAMERA_MAP if map0 else DRIVER_UNIVERSAL
     pi = port["port_index"]
     body = f'''\tfragment@9 {{
 \t\ttarget-path = "/";
@@ -479,8 +559,8 @@ def _vc1_fragments(port: Dict[str, Any], lanes: int,
 \t\t\t\t\t\tdrivernode0 {{
 \t\t\t\t\t\t\tstatus = "okay";
 \t\t\t\t\t\t\tpcl_id = "v4l2_sensor";
-\t\t\t\t\t\t\tdevname = "universal {port['i2c_bus']}-00{identity.addr:02x}";
-\t\t\t\t\t\t\tsysfs-device-tree = "/sys/firmware/devicetree/base/bus@0/cam_i2cmux/{port['mux_path']}/universal_{port['node']}@{identity.addr:x}";
+\t\t\t\t\t\t\tdevname = "{driver0} {port['i2c_bus']}-00{vc0_addr:02x}";
+\t\t\t\t\t\t\tsysfs-device-tree = "/sys/firmware/devicetree/base/bus@0/cam_i2cmux/{port['mux_path']}/{node_name(port['node'], map0)}@{vc0_addr:x}";
 \t\t\t\t\t\t}};
 \t\t\t\t\t}};
 \t\t\t\t}};
@@ -554,17 +634,29 @@ def _vc1_fragments(port: Dict[str, Any], lanes: int,
 '''
     body += _sensor_node(port, f"sensor_{n}", n, addr, table, lanes, 1,
                          f"sensor_csi_ch{ch}_in", f"sensor_out_{n}", "\t\t\t",
-                         identity.reg_bits, identity.val_bits, pools)
+                         identity.reg_bits, identity.val_bits, pools, False, map1,
+                         passive.get(1))
     body += "\t\t};\n\t};\n"
     return body
 
 
 def overlay_dts(port_name: str, lanes: int, table: Sequence[CaptureMode],
                 pools: Sequence[PoolSensor] = (), direct: bool = False,
-                node_addr: Optional[int] = None) -> str:
+                node_addr: Optional[int] = None,
+                camera_maps: Optional[Dict[int, int]] = None,
+                passive: Optional[Dict[int, bytes]] = None) -> str:
     """The overlay source for a port, lane count, capture table, and sensor
     pool, both virtual channels included; a direct port's carries virtual
-    channel 0 alone. Compiles with ``dtc -@`` alone."""
+    channel 0 alone. `camera_maps` names the channels whose link carries a pod,
+    {vc: the camera map's host address}: those channels get the unit's
+    node. `passive` names the channels of a host another node owns the
+    hub's bus for, {vc: the compiled mode table}: those nodes are passive.
+    Compiles with ``dtc -@`` alone."""
+    passive = passive or {}
+    camera_maps = dict(camera_maps or {})
+    for vc in passive:
+        if vc not in camera_maps:
+            raise ValueError(f"virtual channel {vc}'s passive node names no address")
     if port_name not in PORTS:
         raise ValueError(f"no such camera port {port_name!r}; have {sorted(PORTS)}")
     if int(lanes) not in (2, 4):
@@ -574,7 +666,11 @@ def overlay_dts(port_name: str, lanes: int, table: Sequence[CaptureMode],
     port = PORTS[port_name]
     identity = node_identity(port, pools, direct, node_addr)
     head = (_header(port_name, int(lanes), direct)
-            + _vc0_fragments(port, int(lanes), table, identity, pools, direct))
+            + _vc0_fragments(port, int(lanes), table, identity, pools, direct, camera_maps,
+                             passive)
+            + "\n" + _controller_fragment())
     if direct:
         return head + "\n" + _enable_fragment(port_name, port) + "};\n"
-    return head + "\n" + _vc1_fragments(port, int(lanes), table, identity, pools) + "};\n"
+    return (head + "\n" + _vc1_fragments(port, int(lanes), table, identity, pools, camera_maps,
+                                          passive)
+            + "};\n")

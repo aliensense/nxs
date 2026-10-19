@@ -10,17 +10,19 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 from nxs.cam.descriptors import to_int
+from nxs._libnxs_map import UNIT_PROBES
 from nxs.cam.contracts import ContractError, LinkSpec, Topology
 from nxs.cam.diag import unwalked
 from nxs import host as host_layer
 from nxs.finding import Finding, parse_refusal
-from nxs.cam import port_state
+from nxs.cam import daemon_records, port_state
+from nxs.cam.hubs import is_smart_camera, map_address
 from nxs.cam import unit_source
 from nxs.cam import run as cam_run
 from nxs.cam import identity as cam_identity
 from nxs.cam.follow import HEARTBEAT_STALE_S
 from nxs.cam.identity import (_identity_read, answering_address, detect_sensor,
-                              sensor_identity_line)
+                              sensor_identity_line, unit_acks)
 from nxs.cam.select import _hub_for, _port_name, select_port_links
 from nxs.cam.verbs.sync import PULSE_EXPOSURE, sync_text
 from nxs.cam.verbs.verify import _age, verified_line
@@ -150,9 +152,11 @@ def presence_payload(topology: Topology,
         locks: Dict[str, Optional[bool]] = {}
         if not direct:
             from nxs.cam.diag import link_locks, lock_probes
+            from nxs.cam.graph import walked_locks
 
             desd = hub.descriptor(topology.des_compatible)
-            locks = link_locks(desd, lock_probes(i2c, topology.des_addr, desd))
+            locks = (walked_locks(hub, topology)
+                     or link_locks(desd, lock_probes(i2c, topology.des_addr, desd)))
         found_sensors: Dict[str, str] = {}
         walked: List[Tuple[LinkSpec, Dict[str, Any]]] = []
         for link in selected or topology.links:
@@ -165,10 +169,27 @@ def presence_payload(topology: Topology,
             flows.open_window(hub, i2c, topology, link)
             entry: Dict[str, Any] = {"name": link.name, "units": []}
             walked.append((link, entry))
-            sen_addr, mapped = answering_address(hub, i2c, link)
-            entry["sen_addr"] = sen_addr
-            entry["mapped"] = mapped
-            chain = [("sen", sen_addr)]
+            if is_smart_camera(hub, link):
+                entry.update(_smart_camera_presence(hub, topology, link))
+                if entry["sen"] != "present" or not entry["sensor"]["ok"]:
+                    payload["ok"] = False
+                payload["links"].append(entry)
+                continue
+            # A pod's head behind a hub is its unit's: its camera map says what it runs. The host
+            # reads no sensor register (R-10.2), which the serializer forwards from both links.
+            pod_head = bool(link.nxs_units) and link.has_camera and not direct
+            chain = []
+            if pod_head:
+                entry.update(cam_identity.map_head(hub, topology, link))
+                if entry["sen"] != "present" or not entry["sensor"]["ok"]:
+                    payload["ok"] = False
+                if entry["sensor"]["detected"]:
+                    found_sensors[link.name] = entry["sensor"]["detected"]
+            else:
+                sen_addr, mapped = answering_address(hub, i2c, link)
+                entry["sen_addr"] = sen_addr
+                entry["mapped"] = mapped
+                chain = [("sen", sen_addr)]
             if not direct:
                 chain.insert(0, ("ser", link.ser_addr))
             for key, addr in chain:
@@ -181,7 +202,7 @@ def presence_payload(topology: Topology,
                     # A pod alone declares no head: silence there is the fact.
                     if key != "sen" or link.has_camera:
                         payload["ok"] = False
-            if link.has_camera:
+            if link.has_camera and not pod_head:
                 detected, detail = detect_sensor(hub, i2c, link)
                 ok, text = sensor_identity_line(
                     link, hub.descriptor(link.sensor_compatible), detected, detail)
@@ -194,22 +215,16 @@ def presence_payload(topology: Topology,
                     payload["ok"] = False
             for unit in link.nxs_units:
                 node: Dict[str, Any] = {"addr": int(unit.alias_addr), "state": "present"}
-                try:
-                    i2c.read_reg(0x0000, reg_width=16, data_width=8,
-                                 addr=hex(unit.alias_addr))
-                except Exception:
+                # One look judges the pod: it is asked as the unit door's probe asks.
+                if not unit_acks(i2c, unit.alias_addr, UNIT_PROBES):
                     node["state"] = "no ACK"
                     payload["ok"] = False
                     # A pod silent at its alias is sought where it straps: a
                     # hub that lost its aliases (a power cycle) leaves it there.
                     if int(unit.target_addr) != int(unit.alias_addr):
                         node["strap"] = int(unit.target_addr)
-                        try:
-                            i2c.read_reg(0x0000, reg_width=16, data_width=8,
-                                         addr=hex(unit.target_addr))
+                        if unit_acks(i2c, unit.target_addr, UNIT_PROBES):
                             node["answers_at"] = int(unit.target_addr)
-                        except Exception:
-                            pass
                 entry["units"].append(node)
             payload["links"].append(entry)
         flows.close_windows(hub, i2c, topology)
@@ -236,6 +251,40 @@ def presence_payload(topology: Topology,
             except Exception as exc:
                 unit["error"] = f"personalities unreadable ({exc})"
     return payload
+
+
+def _smart_camera_presence(hub, topology: Topology, link: LinkSpec) -> Dict[str, Any]:
+    """A smart camera's presence: its camera map's identity, and whether it
+    serves the rows and the mode table of the declared personality, or
+    which installed personality's it serves instead."""
+    from nxs._libnxs_map import open_door
+    from nxs.cam import pods, smart_camera
+
+    entry: Dict[str, Any] = {"sen_addr": smart_camera.ADDRESS, "mapped": False}
+    silent = {**entry, "sen": "no ACK",
+              "sensor": {"declared": link.sensor_compatible, "detected": None,
+                         "detail": f"no ACK at {smart_camera.ADDRESS:#04x}", "ok": False,
+                         "text": f"{link.sensor_compatible}: no camera door answers at "
+                                 f"{smart_camera.ADDRESS:#04x}"}}
+    try:
+        with open_door(topology.i2c_bus, smart_camera.ADDRESS) as cmap:
+            if not smart_camera.answers(cmap):
+                foreign = smart_camera.foreign_layout(cmap)
+                if foreign is None:
+                    return silent
+                return {**entry, "sen": "present",
+                        "sensor": {"declared": link.sensor_compatible, "detected": None,
+                                   "detail": foreign, "ok": False, "text": foreign}}
+            line = smart_camera.map_line(cmap)
+            ok = smart_camera.serves(cmap, pods.declared_records(hub, link))
+            detected = link.sensor_compatible if ok else smart_camera.identify(cmap)
+    except OSError:
+        return silent
+    text = line if ok else (f"{line}; its rows are {detected}'s, not {link.sensor_compatible}'s"
+                            if detected else f"{line}; no installed personality serves its rows")
+    return {**entry, "sen": "present",
+            "sensor": {"declared": link.sensor_compatible, "detected": detected, "detail": line,
+                       "ok": ok, "text": text}}
 
 
 def presence_rows(payload: Dict[str, Any]) -> List[str]:
@@ -336,7 +385,7 @@ def pair_gain(topology: Topology) -> Optional[Dict[str, Any]]:
     if ae.get("mode") != "follow":
         return gain
     gain["gain_db"] = None
-    beat = port_state.read_follow(_port_name(topology)) or {}
+    beat = daemon_records.read_follow(_port_name(topology)) or {}
     try:
         age = max(0.0, time.time() - float(beat["at"]))
     except (KeyError, ValueError):
@@ -375,6 +424,33 @@ def follow_gap(topology: Topology, gain: Optional[Dict[str, Any]]) -> Optional[F
     return Finding(f"{port}/{gain['follower']}",
                    f"does not follow {gain['leader']} (nxsd copies no gain for {port}{why})",
                    [FOLLOW_NEXT])
+
+
+#: What a stopped camera node names next: the node runs in nxsd.
+CAMERA_NODE_NEXT = "journalctl -u nxsd"
+
+
+def camera_node_gap(topology: Topology) -> List[Finding]:
+    """The links whose camera node nxsd runs no more, one finding each: a
+    record `stopped` or `failed` with the node's last line, written by the
+    daemon that runs in this boot. A link without a record has no node of
+    the daemon's, and a record of a daemon that no longer runs says
+    nothing: neither raises a finding."""
+    from nxs.daemon.verdict import running
+
+    port = _port_name(topology)
+    out: List[Finding] = []
+    for link in topology.links:
+        record = daemon_records.read_camera_node(port, link.name) or {}
+        writer = str(record.get("nxsd", ""))
+        if not running({"pid": int(writer) if writer.isdigit() else None,
+                        "boot": record.get("boot") or None, "started": record.get("nxsd_started", "")}):
+            continue
+        if record.get("state") in ("stopped", "failed"):
+            line = record.get("line") or "no line"
+            out.append(Finding(f"{port}/{link.name}", f"the camera node stopped: {line}",
+                               [CAMERA_NODE_NEXT]))
+    return out
 
 
 def pair_gain_lines(topology: Topology, gain: Optional[Dict[str, Any]],
@@ -534,6 +610,17 @@ def _pod_names(topology: Topology) -> Dict[str, str]:
     return {l.name: l.unit.name for l in port.links if l.unit is not None}
 
 
+def _declared_row(hub, link, token: str) -> str:
+    """The row a link's declared mode token names, a geometry such as
+    `1920x1080` resolved to its row; the token itself where it names none."""
+    from nxs.cam.descriptors import resolve_mode
+
+    try:
+        return resolve_mode(hub.descriptor(link.sensor_compatible), token)
+    except Exception:        # noqa: BLE001 (a token the hub no longer resolves)
+        return token
+
+
 def verdict_lines(topology: Topology, hub, presence: Dict[str, Any],
                   selected) -> Tuple[List[str], bool]:
     """Declared against actual, one line for the port and one per declared
@@ -553,7 +640,8 @@ def verdict_lines(topology: Topology, hub, presence: Dict[str, Any],
     # fact and the next command come first. A port of pods alone streams
     # no video: no package, no capture stack.
     cameras = bool(topology.camera_links)
-    missing = host_layer.current().kernel_package_missing() if cameras else None
+    camera_maps = any(map_address(hub, link) is not None for link in topology.links)
+    missing = host_layer.current().kernel_package_missing(camera_maps=camera_maps) if cameras else None
     if missing:
         lines += [missing, f"  - {host_layer.current().kernel_package_next()}"]
         ok = False
@@ -595,6 +683,11 @@ def verdict_lines(topology: Topology, hub, presence: Dict[str, Any],
                 parts.append(mode_label(hub.descriptor(link.sensor_compatible), mode))
             except Exception:        # noqa: BLE001 (a mode the hub no longer names)
                 parts.append(str(mode))
+            declared = link.mode
+            if declared and _declared_row(hub, link, str(declared)) != mode:
+                # The row the link runs is not the declared one: `set mode` or a
+                # driver's switch moved it, and `switch` moves it back.
+                parts.append(f"(declared {declared})")
         rate = port_state.running_rate(record, link.name)
         if rate is not None and link.has_camera:
             parts.append(f"{float(rate):.1f} fps")
@@ -629,40 +722,69 @@ def verdict_lines(topology: Topology, hub, presence: Dict[str, Any],
                 lines.append(f"{port}/{link.name}: no pod answers at {where} ({who})")
             ok = False
             continue
+        # A pod's head behind a hub is read on its camera map.
+        mapped = bool(link.nxs_units) and not topology.is_direct
         if entry.get("sen") == "no ACK" and link.has_camera:
             addr = entry.get("sen_addr")
             where = f" at {int(addr):#04x}" if addr is not None else ""
-            lines.append(f"{port}/{link.name}: no head answers{where}")
+            lines.append(f"{port}/{link.name}: no {'camera door' if mapped else 'head'} answers{where}")
             ok = False
             continue
         if link.nxs_units and link.has_camera:
             who = names.get(link.name) or f"@{link.nxs_units[0].alias_addr:#04x}"
             held = (unit_source.cached_record(topology, link) or {}).get("personality") or {}
             personality = held.get("name") or "no personality read"
-            head_ok = "head ok" if entry.get("sen") == "present" else "head silent"
-            text += f", pod {who} ({personality}, {head_ok})"
+            if mapped:
+                # The camera map runs a mode of the declared personality's rows, else the SEN row says
+                # what it reads; a head silent to its pod is the link's finding, as a silent bare head.
+                sensor = entry.get("sensor") or {}
+                if sensor.get("head") == "silent":
+                    lines += [f"{port}/{link.name}: no head answers at {int(sensor['head_addr']):#04x} "
+                              f"on pod {who} ({personality})",
+                              f"  - check the cable and power on link {link.name}"]
+                    ok = False
+                    continue
+                head = "head ok" if sensor.get("ok") else "head not ready"
+                ok = ok and head == "head ok"
+            else:
+                head = "head ok" if entry.get("sen") == "present" else "head silent"
+            text += f", pod {who} ({personality}, {head})"
         lines.append(text)
         ok = ok and state == port_state.STATE_UP
     refused = daemon_refusal(port, topology, selected)
     if refused is not None:
         lines += str(refused).splitlines()
+        ok = False
+    # A camera node nxsd runs no more is the link's gap, as the daemon's
+    # refusal is the port's.
+    for gap in camera_node_gap(topology):
+        lines += str(gap).splitlines()
+        ok = False
     return lines, ok
 
 
 def daemon_refusal(port: str, topology: Topology, links=None) -> Optional[Finding]:
-    """The refusal nxsd's last `on` of the port ended on since this boot, as
-    it recorded it, while a link (of `links`, else the port's) still reads
-    unknown from it: a finding at the port, the fact with the time since,
-    then its next commands, `nxs switch` where it named this verb alone
-    (the daemon runs the `on` again on the reload). None when that `on`
-    ended otherwise, or a step since brought the links up or parked them."""
-    from nxs.daemon import port_verdict
+    """What nxsd's `on` of the port says at the port since this boot. While
+    it runs, from its `bringing up` to its end, the port is nobody else's,
+    whatever the links read: the finding names the run and the time since
+    it started. After it, the refusal it ended on, as it recorded it, while
+    a link (of `links`, else the port's) still reads unknown from it: the
+    fact with the time since, then its next commands, `nxs switch` where it
+    named this verb alone (the daemon runs the `on` again on the reload).
+    None when that `on` ended otherwise, or a step since brought the links
+    up or parked them."""
+    from nxs.daemon import BRINGING_UP, port_verdict
 
+    seen = port_verdict(port)
+    if (seen is not None and seen["verdict"] == BRINGING_UP
+            and seen["boot"] == port_state.boot_id()):
+        age = _age(max(0.0, time.time() - seen["at"]))
+        return Finding(port, f"nxsd is bringing the port up, started {age} ago",
+                       [f"nxs {port} status"])
     if not any(port_state.link_state(topology, link) == port_state.STATE_UNKNOWN
                for link in links or topology.links):
         return None
-    seen = port_verdict(port)
-    if (seen is None or seen["boot"] != port_state._boot_id()
+    if (seen is None or seen["boot"] != port_state.boot_id()
             or not seen["verdict"].startswith("refused") or not seen["lines"]):
         return None
     fact, nexts = parse_refusal("\n".join(seen["lines"]))

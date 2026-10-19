@@ -20,10 +20,13 @@ from nxs import term
 INSTRUCTIONS = """\
 nxs drives Aliensense NXS sensor units and camera ports on this machine.
 Three doors edit one declared config (suite.yaml): hand-written YAML,
-`nxs tune`, and these tools, all validated by the same laws. Read
-before you write: generate lists what answers on the rig, caps lists what
-a port's sensor offers, status tells you whether the declaration is
-lawful and what deviates from it, suite_get shows every option.
+`nxs tune`, and these tools, all validated by the same laws. The
+declaration is a graph of blocks: each node a type with the rows its
+description offers, and the connections between their ports. Read before
+you write: generate lists what answers on the rig, caps lists what a
+port's sensor offers, status tells you whether the declaration is lawful
+and what deviates from it, suite_get shows every option, suite_schema
+each node's rows and the values each takes on this rig.
 Hardware effects are real: on writes registers and trains links, off
 parks sensors, reload reconverges the running daemon. A refusal is a fact
 and its lawful alternatives; under a JSON tool it is the document
@@ -114,8 +117,9 @@ def generate(dry_run: bool = True) -> dict:
     wiring names and nothing answers for is `unanswered`. With `dry_run`
     (the default) nothing is written; without it hardware.yaml, the report
     of what answered, is written from the walk, suite.yaml is seeded when
-    there is none, and a unit on a bare bus running nothing is named by
-    trying every personality on it."""
+    there is none, a declaration of an earlier language (api 2, the 1.0
+    form) is written again in api 3, and a unit on a bare bus running
+    nothing is named by trying every personality on it."""
     argv = ["generate", "--json"]
     if dry_run:
         argv.append("--dry-run")
@@ -184,8 +188,8 @@ def on(port: str, link: Optional[str] = None, mode: Optional[str] = None,
 
 
 def off(port: str) -> str:
-    """Park the whole port: stop its viewers, put every sensor in standby,
-    close the CSI gate, then have each pod park its head. There is no
+    """Park the whole port: stop its viewers, put every bare head in standby,
+    close the CSI gate, then have each pod park its head through its unit. There is no
     one-link park (the gate and the park program are port-wide); a single
     viewer closes from its own window."""
     # The park program, then up to a unit run's 30 s for each pod's park.
@@ -213,16 +217,20 @@ def set_knob(port: str, link: Optional[str], knob: str, value: str,
              dry_run: bool = False, fps: Optional[float] = None,
              exposure_us: Optional[float] = None) -> str:
     """Change a knob under the hub's laws; an infeasible value is refused
-    naming the lawful alternatives. `sync` is the port's frame sync (`link`
-    omitted): `fsync` starts the hub's generator at `fps`, one pulse per
+    naming the lawful alternatives. On a pod's or a smart camera's camera
+    map a value past the row's range commits at its bound, and the output
+    names the value in effect and the one asked. `sync` is the port's frame
+    sync (`link` omitted): `fsync` starts the hub's generator at `fps`, one pulse per
     frame, with the synced sensors on their trigger, `free_run` returns to
     free run. Under frame sync the exposure is the trigger pulse's low time
     at the rate, so `exposure_us` is refused with that fact: a shorter
     exposure needs a higher rate. A new sync or `fps` is counted for two
     seconds on the links it changes; one they do not deliver is refused
     naming the rates delivered, and the previous sync or rate comes back.
-    dry_run prints the write stream. A camera knob is refused on a live
-    sibling link; a knob the camera does not have goes to the link's unit."""
+    dry_run prints the write stream. A bare head's camera knob is refused
+    on a live sibling link, since its window drops the sibling's video; a
+    pod's or a smart camera's is a commit on its map, which selects
+    no window. A knob the camera does not have goes to the link's unit."""
     argv = _node(port, link, "set", knob, str(value))
     if fps is not None:
         argv += ["--fps", str(float(fps))]
@@ -239,19 +247,24 @@ def set_knob(port: str, link: Optional[str], knob: str, value: str,
 
 def suite_get() -> dict:
     """The declared config as options: every channel, its sections, each field's
-    value and the values it may take. A channel with declared: false is a
-    platform port or an answering unit whose DECLARE knobs write its entry."""
+    value and the values it may take. A channel's DECLARE knobs choose what the
+    rig holds (a port's hub, a link's camera and pod, a unit's clicks); each
+    block it then names has a rows section, a field per row its description
+    offers there, valued as the declaration writes it. A channel with
+    declared: false is a platform port or an answering unit whose DECLARE
+    knobs write its entry."""
     return _call_json(["tune", "--list", "--json"])
 
 
 def suite_schema() -> dict:
-    """The rig's rules as JSON Schema (2020-12): the declaration schema narrowed
-    by the nodes on this rig. Each port lists the keys its nodes bring, each
-    link the sensors its port's hub serves, each sensor its modes and each
-    mode the rates the laws give it on the port; a unit's personality lists
-    its config keys.
-    Validate a declaration against it before writing it. It is necessary,
-    not sufficient: `status` judges the arithmetic across nodes."""
+    """The rig's rules as JSON Schema (2020-12): the declaration schema with
+    each node's type pinned and its parameters narrowed to the rows its
+    block offers on this rig, each with the values it takes there: a hub's
+    rows under its frame sync, a camera's modes by name and the rates its
+    mode runs free at on its port, a click's rows, a host's rows for its
+    connectors. Validate a declaration against it before
+    writing it. It is necessary, not sufficient: the connections' laws are
+    the loader's, and `status` judges the rig."""
     return _call_json(["tune", "--schema", "--json"])
 
 
@@ -259,12 +272,14 @@ def suite_set(channel: Optional[str] = None, field: Optional[str] = None,
               value: Optional[str] = None, section: Optional[str] = None,
               sets: Optional[List[str]] = None) -> dict:
     """Set declared values from their offered options (see suite_get) and save
-    the declaration once, with a timestamped backup; the result carries the
-    check findings. One value as `channel`, `field` and `value` (`section`
-    when the field repeats in the channel), or a batch as `sets`, each
-    `CHANNEL[:SECTION]:FIELD=VALUE`, applied in order before the save: a hub
-    with its links' sensors, a mode with the rate it moves. Nothing converges
-    until `switch` (units) or `reload` (ports)."""
+    the declaration once, its nodes and connections, with a timestamped
+    backup; the result carries the check findings. One value as `channel`,
+    `field` and `value` (`section` when the field repeats in the channel), or
+    a batch as `sets`, each `CHANNEL[:SECTION]:FIELD=VALUE`, applied in order
+    before the save: a hub with its links' sensors, the hub's sync_source
+    with the camera rate it hides. A row's value is its display form, a
+    name or a number in the row's unit, any its options admit. Nothing
+    converges until `switch` (units) or `reload` (ports)."""
     specs = list(sets or [])
     if channel is not None or field is not None or value is not None:
         if not (channel and field) or value is None:
@@ -386,8 +401,9 @@ TOOLS: List[ToolSpec] = [
              "dry_run?",
              "walks every camera port and bus. With dry_run false it writes "
              "hardware.yaml, the report of what answered, and seeds suite.yaml when "
-             "there is none. A unit on a bare bus running nothing is named by "
-             "trying every personality on it",
+             "there is none. It writes a declaration of api 2 or the 1.0 form again "
+             "in api 3, the earlier file kept beside it. A unit on a bare bus running "
+             "nothing is named by trying every personality on it",
              "no hub and no camera port, or the wiring file is not writable"),
     ToolSpec("status", status, "the declaration against the rig, or a port's "
                                "presence and health",
@@ -411,28 +427,30 @@ TOOLS: List[ToolSpec] = [
              "the laws refuse the mode or rate, the hub does not answer, video "
              "did not lock, or the links do not deliver the rate"),
     ToolSpec("off", off, "park the whole port", "port",
-             "sensors to standby, CSI gate closed, viewers stopped, each pod's head parked",
+             "bare heads to standby, CSI gate closed, viewers stopped, each pod's head parked by its unit",
              "kernel-owned hub"),
     ToolSpec("capture", capture, "headless delivery proof", "port, link, frames?, timeout_s?",
              "opens a capture session on the up link, the tool's viewer on it stopped first",
              "the link is not up, or the frames were not delivered"),
     ToolSpec("get", get, "read a knob: the port's sync, the sensor's, the unit's",
              "port, link, knob",
-             "none (reads sensor registers)", "unknown knob lists the knobs",
+             "none (reads a row of the map, a bare head's registers or the unit's parameter)",
+             "unknown knob lists the knobs",
              read_only=True),
     ToolSpec("set", set_knob, "change a knob under the laws, sync being the port's "
                               "frame sync",
              "port, link?, knob, value, dry_run?, fps?, exposure_us?",
-             "writes sensor registers, or the link's unit for a knob that is its "
-             "personality's parameter. Sync starts or stops the hub's generator, and "
+             "a row's commit on a pod's or smart camera's map, a bare head's "
+             "registers, or the link's unit for its personality's parameter. Sync starts "
+             "or stops the hub's generator, and "
              "a sync or fps change counts two seconds of frames",
              "an unlawful value, with the lawful alternatives. A sync or rate the "
-             "links do not deliver, the previous one restored. A live sibling link, for a camera knob. "
-             "The port is not up"),
+             "links do not deliver, the previous one restored. A live sibling link, "
+             "for a bare head's camera knob. The port is not up"),
     ToolSpec("suite_get", suite_get, "the declaration as options", "—",
              "none", "no camera port on the host and no declaration",
              read_only=True, idempotent=True),
-    ToolSpec("suite_schema", suite_schema, "the rig's rules as JSON Schema", "—",
+    ToolSpec("suite_schema", suite_schema, "each node's rows on this rig as JSON Schema", "—",
              "none", "the declaration does not parse",
              read_only=True, idempotent=True),
     ToolSpec("suite_set", suite_set, "set declared values from their options, one or a batch",

@@ -15,7 +15,6 @@ from nxs import term
 from nxs.cam import capture, hubs, port_state, timing, viewers
 from nxs.cam import run as cam_run
 from nxs.cam.contracts import InfeasibleConfig, LinkSpec, Topology
-from nxs.cam.plan import RawConfig
 from nxs.cam.select import _link_descriptor, _port_name, _refuse
 from nxs.cam.verbs.sync import _fsync_plan, _record_sync
 from nxs.finding import parse_refusal
@@ -26,6 +25,9 @@ COUNT_S = 2.0
 MIN_FRAMES = 3
 #: How far a delivered rate may sit from the rate the link runs.
 RATE_TOLERANCE = 0.01
+#: A near miss (this close under the rate, or any count over it, every frame delivered, no error)
+#: counts again, twice as long, before the refusal: a restarted capture daemon's first count is off.
+NEAR_TOLERANCE = 0.025
 #: Each step of the pair-line search lengthens the line to this percentage of it.
 LINE_STEP_PERCENT = 105
 #: The search runs no line past this multiple of the datasheet's.
@@ -34,19 +36,26 @@ LINE_BOUND = 2
 
 def csi_gate(hub, flows, topology: Topology):
     """The CSI output-gate toggle every choreographed capture shares, each
-    write under the bus lock: a capture holds the bus while it switches the
-    gate and leaves it free while its consumers start and run. A gate
-    program that fails is a control-bus fault, raised as such."""
+    gate a walk of the port's graph image under the bus lock: a capture
+    holds the bus while it switches the gate and leaves it free while its
+    consumers start and run. Behind a hub the walk gates the hub's output
+    and touches no head; a port with no hub gates its head's own stream,
+    by its start and its park or its camera door's stream row. A gate that
+    fails is a control-bus fault, raised as such."""
+    del flows
+    composed = []
+
     def gate(enable: bool) -> None:
-        cfg = RawConfig("csi-gate")
-        if topology.is_direct:
-            # The lanes are the sensor's own: its stream gate is the gate.
-            cfg.set_address("ADR_SENSOR", hubs.sensor_address(hub, topology.links[0]))
-        cfg.add("gate", flows.csi_gate_steps(hub, topology, enable))
-        with port_state.BusLock():
-            ok = cam_run._execute(cfg.to_dict(), topology.i2c_bus, "csi-gate",
-                                  guard=(hub, topology))
-        if not ok:
+        from nxs.cam import graph
+
+        if not composed:
+            image = graph.compose_port(hub, topology, heads=False)
+            if not image.steps(graph.Walk.GATE_ON):
+                # No hub's output stands before the head: the head gates itself.
+                image = graph.compose_port(hub, topology)
+            composed.append(image)
+        walk = graph.Walk.GATE_ON if enable else graph.Walk.GATE_OFF
+        if not graph.run(hub, topology, walk, composed[0]).ok:
             raise _refuse("csi-gate program failed (a control-bus fault)",
                           f"nxs {_port_name(topology)} status")
     return gate
@@ -77,12 +86,12 @@ def _no_capture_id(topology: Topology, link: LinkSpec) -> str:
             f"  - nxs {_port_name(topology)} {link.name} on")
 
 
-def frames_for(rate: Optional[float]) -> int:
-    """The frames the check counts on a link running `rate`: COUNT_S of
+def frames_for(rate: Optional[float], seconds: float = COUNT_S) -> int:
+    """The frames the check counts on a link running `rate`: `seconds` of
     them, never fewer than MIN_FRAMES."""
     if not rate:
         return MIN_FRAMES
-    return max(MIN_FRAMES, math.ceil(COUNT_S * float(rate)))
+    return max(MIN_FRAMES, math.ceil(seconds * float(rate)))
 
 
 def asked_rate(topology: Topology, link: LinkSpec) -> Optional[float]:
@@ -174,6 +183,7 @@ def judge(hub, topology: Topology, links: List[LinkSpec], outputs: Dict[str, str
     delivered: Dict[str, Optional[float]] = {}
     words: List[str] = []
     missed = errored = False
+    near = True
     for link in links:
         output = outputs.get(link.name, "")
         broken = capture.consumer_error(output)
@@ -187,6 +197,8 @@ def judge(hub, topology: Topology, links: List[LinkSpec], outputs: Dict[str, str
         off = fps is None or (rate is not None and abs(fps - rate) > RATE_TOLERANCE * rate)
         missed = missed or off or got < wanted or errors > 0
         errored = errored or errors > 0
+        near = near and got >= wanted and not errors and fps is not None and rate is not None \
+            and fps >= rate * (1 - NEAR_TOLERANCE)
         if fps is None:
             value = f"{got} of {wanted} frames" if got else "none"
         else:
@@ -218,7 +230,9 @@ def judge(hub, topology: Topology, links: List[LinkSpec], outputs: Dict[str, str
         elif lawful:
             fact += f", under the {lawful[0]} fps floor"
             alternatives = [retry.format(fps=lawful[0])]
-    raise InfeasibleConfig(fact, alternatives=alternatives)
+    refusal = InfeasibleConfig(fact, alternatives=alternatives)
+    refusal.near_miss = near
+    raise refusal
 
 
 def check(hub, topology: Topology, links: List[LinkSpec],
@@ -236,9 +250,23 @@ def check(hub, topology: Topology, links: List[LinkSpec],
     if not links:
         return {}
     stop_viewers_for_count(topology, links)
-    delivered = judge(hub, topology, links, _counted(hub, topology, links), retry=retry)
+    try:
+        delivered = judge(hub, topology, links, _counted(hub, topology, links), retry=retry)
+    except InfeasibleConfig as first:
+        if not getattr(first, "near_miss", False):
+            raise
+        delivered = _recount(hub, topology, links, first, retry)
     _passed(hub, topology, links, delivered)
     return delivered
+
+
+def _recount(hub, topology: Topology, links: List[LinkSpec], first: InfeasibleConfig,
+             retry: Optional[str]) -> Dict[str, float]:
+    """One more count after a near miss, twice as long, and `judge`'s
+    verdict on it: that count decides either way."""
+    term.info(f"{first.reason}, counted again for {2 * COUNT_S:g} s")
+    return judge(hub, topology, links, _counted(hub, topology, links, seconds=2 * COUNT_S),
+                 retry=retry)
 
 
 def stop_viewers_for_count(topology: Topology, links: List[LinkSpec],
@@ -251,11 +279,12 @@ def stop_viewers_for_count(topology: Topology, links: List[LinkSpec],
         term.info(f"viewer for link {stopped} stopped: {counts} counts its frames")
 
 
-def _counted(hub, topology: Topology, links: List[LinkSpec]) -> Dict[str, str]:
-    """`count` at each link's rate; a count that does not run (a link
-    without a capture id or caps, a bus another run holds, a gate that
-    fails) is the check's refusal."""
-    frames = {link.name: frames_for(asked_rate(topology, link)) for link in links}
+def _counted(hub, topology: Topology, links: List[LinkSpec],
+             seconds: float = COUNT_S) -> Dict[str, str]:
+    """`count` at each link's rate for `seconds`; a count that does not run
+    (a link without a capture id or caps, a bus another run holds, a gate
+    that fails) is the check's refusal."""
+    frames = {link.name: frames_for(asked_rate(topology, link), seconds) for link in links}
     try:
         return count(topology, links, hub, frames)
     except SystemExit as exc:
@@ -289,7 +318,7 @@ def _read_latched(hub, topology: Topology, links: List[LinkSpec]) -> None:
     the rows itself."""
     from nxs.cam.diag import run_probes
 
-    if topology.is_direct:
+    if not any(link.ser_compatible for link in links):
         return
     flows = hub.flows()
     i2c = cam_run.CamI2c(addr=hex(topology.des_addr), bus=topology.i2c_bus)
@@ -352,16 +381,26 @@ def _overflowed(hub, topology: Topology) -> bool:
 
 def _wider(topology: Topology) -> List[str]:
     """What carries a longer line: the hub's four CSI lanes where the port
-    runs fewer."""
-    if int(topology.csi_lanes) < 4:
-        return ["csi_lanes: 4"]
-    return [f"nxs {_port_name(topology)} caps"]
+    runs fewer and its connector wires four."""
+    port = _port_name(topology)
+    if int(topology.csi_lanes) < 4 and 4 in _connector_lanes(port):
+        return [f"the host's {port}_lanes: 4"]
+    return [f"nxs {port} caps"]
+
+
+def _connector_lanes(port: str) -> tuple:
+    """The lane counts the host's row for the connector offers; none for a
+    connector the host does not describe."""
+    try:
+        return tuple(host_layer.current().description().row(f"{port}_lanes").values)
+    except Exception:        # noqa: BLE001 (a host whose block does not build offers none)
+        return ()
 
 
 def search(hub, topology: Topology, links: List[LinkSpec], retry: str,
            record: Callable[[Dict[str, int]], Topology]) -> Dict[str, float]:
     """The delivery check of a pair behind the hub, finding the line the
-    pair needs on this rig (requirements nxs-cam §8, R-FACT-2). The pair
+    pair needs on this rig (requirements nxs-cam §8, R-8.2). The pair
     starts at the deserializer datasheet's line. A step reads the hub's
     line-memory overflow probe to clear it, counts every link and reads
     the probe again. An overflow lengthens the line to LINE_STEP_PERCENT
@@ -411,7 +450,12 @@ def search(hub, topology: Topology, links: List[LinkSpec], retry: str,
             missed = exc
         if not overflow:
             if missed is not None:
-                raise missed
+                if not getattr(missed, "near_miss", False):
+                    raise missed
+                try:
+                    delivered = _recount(hub, at_lines(lines), links, missed, retry)
+                except (OSError, RuntimeError) as exc:
+                    raise _did_not_run(topology, exc) from exc
             found = _remember(hub, topology, modes, fps, record, lines)
             _passed(hub, found, links, delivered, _line_note(hub, found))
             return delivered
@@ -424,9 +468,10 @@ def search(hub, topology: Topology, links: List[LinkSpec], retry: str,
                                    alternatives=_wider(topology))
         at = at_lines(step)
         try:
-            programs = [flows.build_timing(hub, at, links, modes, rates)]
+            # The laws judge the rates at the new line before the bus.
+            flows.build_timing(hub, at, links, modes, rates)
             if fps is not None:
-                programs.append(flows.build_fsync(hub, at, fps=fps, method="manual", modes=modes))
+                flows.build_fsync(hub, at, fps=fps, method="manual", modes=modes)
         except InfeasibleConfig as exc:
             rate = [retry.format(fps=m.group(1)) for alt in exc.alternatives
                     if (m := re.fullmatch(r"fps (\d+)", alt))]
@@ -435,14 +480,25 @@ def search(hub, topology: Topology, links: List[LinkSpec], retry: str,
                                    alternatives=rate[:1] + _wider(topology)) from exc
         term.info(f"{port}: the line memory overflowed at {_lines_text(lines)} clocks, "
                   f"the pair runs {_lines_text(step)} now")
-        with port_state.BusLock():
-            ok = all(cam_run._execute_split(program, topology, name, guard=(hub, topology))
-                     for program, name in zip(programs, ("pair-line", "fsync")))
-        if not ok:
+        # At the new line: each head's timing walk stages the line it moves to,
+        # then the sync walk converts the pair again under frame sync.
+        if not _retimed(hub, at, links, modes, rates, fps):
             raise InfeasibleConfig(f"{port}: the pair's timing at {_lines_text(step)} clocks did not run",
                                    alternatives=[f"nxs {port} status"])
         _remember(hub, topology, modes, fps, record, step)
         lines = step
+
+
+def _retimed(hub, at: Topology, links: List[LinkSpec], modes: Dict[str, str],
+             rates: Dict[str, float], fps: Optional[float]) -> bool:
+    """The pair retimed at the line `at` carries: the timing walk of the
+    port's graph image composed there, then its sync walk under frame sync."""
+    from nxs.cam import compose, graph
+
+    composition = compose.compose(hub, at, links, modes, rates, fsync=fps)
+    walks = [graph.Walk.TIMING] + ([graph.Walk.SYNC] if fps is not None else [])
+    with port_state.BusLock():
+        return all(graph.walk(at, composition, walk).ok for walk in walks)
 
 
 def _remember(hub, topology: Topology, modes: Dict[str, str], fps: Optional[float],

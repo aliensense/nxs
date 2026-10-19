@@ -13,6 +13,9 @@ parts.
 - `mag_res` — resolution rows (bits) for parts with a switchable
   measurement width.
 - `mag_fs` — full-scale rows when the range is selectable.
+- `orientation` — the mount rotation of the sensor's frame, the facts
+  file's last entry, verbatim as `inertial.md` gives it. A combo
+  package declares it once.
 
 ## Output vector and frame
 

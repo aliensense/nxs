@@ -2,17 +2,103 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from nxs._generated_constants import FieldSemantics
+from nxs._generated_constants import Calibration, FieldSemantics, NxsMap
 from nxs.opcodes import Op
 from nxs.profiles import I2cProfile
 from nxs.dsl.compile import _CompilePhase
-from nxs.dsl.compiled import ImageKind
+from nxs.dsl.compiled import HOST_KINDS, ImageKind
 from nxs.dsl.emit import WideRef, _Emitter, _RegAlloc, _TraceReadValue, _WorkAlloc, _load_spec_byte
 from nxs.dsl.errors import CompileError
-from nxs.dsl.fields import PWM_FREQ_MAX_HZ, PWM_FREQ_MIN_HZ, ParamDescriptor, PatchEntry, REG_ADDR_MAX_16, REG_ADDR_MAX_8, infer_semantic, resolve_field_offsets, validate_field_layout
+from nxs.dsl.fields import PWM_FREQ_MAX_HZ, PWM_FREQ_MIN_HZ, ParamDescriptor, PatchEntry, Port, PortDirection, PortType, REG_ADDR_MAX_16, REG_ADDR_MAX_8, Show, infer_semantic, resolve_field_offsets, validate_field_layout
 from nxs.dsl.loop import _ASTCompiler
+
+
+ParamId = NxsMap.ParamId
+#: A standard id by its name, the spelling a facts file takes.
+_PARAM_IDS = {name: number for number, name in ParamId._NAMES.items()}
+#: The values a row of a standard id takes, for the ids whose values the
+#: generated registry names: the mount rotation codes, the trigger
+#: conversions and the flip bits.
+_ID_VALUES = {ParamId.MOUNT_ORIENTATION: frozenset(Calibration.Rotation._NAMES),
+              ParamId.TRIGGER: frozenset(NxsMap.TriggerCode._NAMES),
+              ParamId.FLIPS: frozenset(range((NxsMap.FLIP_X | NxsMap.FLIP_Y) + 1))}
+
+
+def _param_id_named(param: str, name: Optional[str]) -> int:
+    """The standard id a facts file names, `CUSTOM` where it names none."""
+    if name is None:
+        return ParamId.CUSTOM
+    if name not in _PARAM_IDS:
+        raise CompileError(f"params[{param}]: id {name!r} is no ParamId; the ids are "
+                           f"{', '.join(_PARAM_IDS)}")
+    return _PARAM_IDS[name]
+
+
+def _standard_id(verb: str, name: str, pid: Any, values: list, param_type: str) -> int:
+    """A declared row's standard id: one the registry names, never the
+    stream row's, which the compiler adds, over values the registry gives
+    the id where it names them (`_ID_VALUES`)."""
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid not in ParamId._NAMES:
+        raise CompileError(f"{verb}({name!r}): id {pid!r} is no ParamId")
+    if pid == ParamId.STREAM:
+        raise CompileError(f"{verb}({name!r}): STREAM is the id of the row the compiler adds")
+    allowed = _ID_VALUES.get(int(pid))
+    declared = range(values[0], values[1] + 1) if param_type == "range" else values
+    if allowed is not None and (len(declared) > len(allowed)
+                                or any(value not in allowed for value in declared)):
+        raise CompileError(f"{verb}({name!r}): a {ParamId._NAMES[pid]} row takes "
+                           f"{min(allowed)}..{max(allowed)}, not {values!r}")
+    return int(pid)
+
+
+def _show(name: str, show: Optional[Show]) -> Optional[Show]:
+    """A declared display: a unit of `ROW_UNIT_LEN` printable ASCII
+    characters at most and an exponent of a signed byte."""
+    if show is None:
+        return None
+    if not isinstance(show, Show):
+        raise CompileError(f"declare_param({name!r}): show takes a Show(unit, exponent), "
+                           f"not {show!r}")
+    if not _printable(show.unit, NxsMap.ROW_UNIT_LEN, allow_empty=True):
+        raise CompileError(f"declare_param({name!r}): show unit {show.unit!r} is not 0 to "
+                           f"{NxsMap.ROW_UNIT_LEN} printable ASCII characters")
+    if isinstance(show.exponent, bool) or not isinstance(show.exponent, int) \
+            or not -128 <= show.exponent <= 127:
+        raise CompileError(f"declare_param({name!r}): show exponent {show.exponent!r} is no "
+                           f"whole number from -128 to 127")
+    return show
+
+
+def _value_names(name: str, values: list, param_type: str,
+                 labels: Optional[Sequence[str]]) -> Optional[Tuple[str, ...]]:
+    """A declared name per value: as many as an enum's values, or a range's
+    `max - min + 1`, each 1 to `LABEL_CHARS_MAX` printable ASCII characters
+    and no two alike."""
+    if labels is None:
+        return None
+    if isinstance(labels, str) or not all(isinstance(label, str) for label in labels):
+        raise CompileError(f"declare_param({name!r}): labels take a list of names")
+    names = tuple(labels)
+    count = len(values) if param_type == "enum" else values[1] - values[0] + 1
+    if len(names) != count:
+        raise CompileError(
+            f"declare_param({name!r}): {len(names)} labels for {count} values; a label names "
+            f"each value, an enum's in its order and a range's from its min")
+    for label in names:
+        if not _printable(label, NxsMap.LABEL_CHARS_MAX):
+            raise CompileError(f"declare_param({name!r}): label {label!r} is not 1 to "
+                               f"{NxsMap.LABEL_CHARS_MAX} printable ASCII characters")
+    twice = sorted({label for label in names if names.count(label) > 1})
+    if twice:
+        raise CompileError(f"declare_param({name!r}): {', '.join(twice)} labels two values")
+    return names
+
+
+def _printable(text: str, limit: int, allow_empty: bool = False) -> bool:
+    return (isinstance(text, str) and (allow_empty or bool(text)) and len(text) <= limit
+            and all(0x20 <= ord(c) <= 0x7E for c in text))
 
 
 class ClickPersonality(_CompilePhase):
@@ -28,6 +114,10 @@ class ClickPersonality(_CompilePhase):
     # the shared reset at bind for every personality kind.
     RESET_ACTIVE = 'low'
 
+    # The ports the personality's device offers, the image's PORTS record: a
+    # click board's one output, the mikroBUS edge a unit's socket takes.
+    PORTS: Tuple[Port, ...] = (Port("out", PortType.CLICK, PortDirection.OUTPUT),)
+
     def __init__(self):
         self._emitter = self._new_emitter()
         self._regs = _RegAlloc()
@@ -39,6 +129,8 @@ class ClickPersonality(_CompilePhase):
         self._output_fields: List[dict] = []
         self._config: dict = {}
         self._params: Dict[str, ParamDescriptor] = {}
+        # The rows a hub or host program declares apart from its run parameters.
+        self._rows: Dict[str, ParamDescriptor] = {}
         self._patch_entries: List[PatchEntry] = []
         self._patch_accum: Dict[str, Dict] = {}  # param_name → {config_val → byte_val}
         # Params the program reads or stores at run time (`param()`,
@@ -108,7 +200,7 @@ class ClickPersonality(_CompilePhase):
         tail = total - configure_end
         if tail:
             lines.append(("halt" if getattr(type(self), 'IMAGE_KIND', None)
-                          in (ImageKind.CAMERA, ImageKind.HUB) else "measure loop", tail))
+                          in (ImageKind.CAMERA, *HOST_KINDS) else "measure loop", tail))
         return lines
 
     def _check_param_value(self, name, value, values, param_type, unit):
@@ -141,42 +233,35 @@ class ClickPersonality(_CompilePhase):
 
         for entry in click_params(type(self)):
             param_type = entry.get("type", "enum")
-            # A range has no bytecode patch site, so it is always live: an
-            # entry that names no kind gets the only kind that loads.
+            show = entry.get("show")
+            # A range has no bytecode patch site, so it always applies in
+            # place: an entry that names no kind gets the only kind that loads.
             self.declare_param(
                 entry["name"],
                 values=list(entry["values"]),
                 default=entry["default"],
                 param_type=param_type,
                 unit=entry.get("unit", ""),
-                kind=entry.get("kind", "live" if param_type == "range" else "reload"),
+                kind=entry.get("kind", "apply" if param_type == "range" else "run"),
+                id=_param_id_named(entry["name"], entry.get("id")),
+                show=None if show is None else Show(str(show.get("unit", "")),
+                                                    show.get("exponent", 0)),
+                labels=entry.get("labels"),
             )
 
     def declare_param(self, name: str, values: list, default: Any,
                       param_type: str = "enum", unit: str = "",
-                      kind: str = "reload"):
+                      kind: str = "run", id: int = ParamId.CUSTOM,
+                      show: Optional[Show] = None,
+                      labels: Optional[Sequence[str]] = None, public: bool = True):
         """Declare a configurable parameter with valid values. Call in
         configure() before using the parameter. The declared default and any
-        config override are validated here, at declaration time."""
-        if param_type not in ("enum", "range"):
-            raise CompileError(
-                f"declare_param({name!r}): param_type must be 'enum' or "
-                f"'range', got {param_type!r}")
-        if param_type == "range" and (len(values) != 2 or values[0] > values[1]):
-            raise CompileError(
-                f"declare_param({name!r}): a range param must declare exactly "
-                f"[min, max] with min <= max, got {values!r}")
-        # The descriptor wire carries values as int32; a fractional value would
-        # truncate silently and ship a corrupt allowed set.
-        for v in values:
-            if not isinstance(v, int) or isinstance(v, bool):
-                raise CompileError(
-                    f"declare_param({name!r}): value {v!r} is not an "
-                    f"integer — the descriptor wire carries int32. Encode "
-                    f"fractional physical values in a smaller integer unit "
-                    f"(mHz, mV), or drop the fractional rows with a stated "
-                    f"exclusion, or make the setting a compile-time config "
-                    f"key.")
+        config override are validated here, at declaration time. `id` is the
+        row's standard id, `show` how a host shows its values and `labels` a
+        name per value, an enum's in its order and a range's from its min.
+        `public` puts a hub or host program's parameter in its image's PARAMS
+        record."""
+        self._check_values("declare_param", name, values, param_type)
         # Both the default and a config override reach the image: default as the
         # fallback, current as the value applied at load.
         self._check_param_value(name, default, values, param_type, unit)
@@ -185,25 +270,72 @@ class ClickPersonality(_CompilePhase):
             self._check_param_value(name, current, values, param_type, unit)
         else:
             current = default
-        if kind not in ("reload", "live"):
+        if kind not in ("run", "apply"):
             raise CompileError(
-                f"declare_param({name!r}): kind must be 'reload' or 'live', "
+                f"declare_param({name!r}): kind must be 'run' or 'apply', "
                 f"got {kind!r}")
         # A range param has no bytecode patch site, so the firmware accepts it
-        # only as live.
-        if param_type == "range" and kind != "live":
+        # only as kind APPLY.
+        if param_type == "range" and kind != "apply":
             raise CompileError(
-                f"declare_param({name!r}): a range param must be kind='live' "
-                f"(the firmware rejects a non-live range).")
+                f"declare_param({name!r}): a range param must be kind='apply' "
+                f"(the firmware rejects a range of another kind).")
         self._params[name] = ParamDescriptor(
             name=name, param_type=param_type, values=values,
             default=default, current=current, unit=unit, kind=kind,
+            id=_standard_id("declare_param", name, id, values, param_type),
+            show=_show(name, show),
+            labels=_value_names(name, values, param_type, labels), public=bool(public),
         )
         self._patch_accum[name] = {}
 
+    def declare_row(self, name: str, values: list, default: Any,
+                    param_type: str = "enum", unit: str = "", kind: str = "run",
+                    id: int = ParamId.CUSTOM, show: Optional[Show] = None,
+                    labels: Optional[Sequence[str]] = None):
+        """A row of a hub or host program's PARAMS record that no phase
+        reads: what a declaration sets on the block, which the graph's walk
+        stages into the run parameters. Its values, kind, id, display and
+        names are a parameter's; it takes no config override."""
+        self._check_values("declare_row", name, values, param_type)
+        self._check_param_value(name, default, values, param_type, unit)
+        if kind not in ("run", "apply"):
+            raise CompileError(f"declare_row({name!r}): kind must be 'run' or 'apply', got {kind!r}")
+        if name in self._params or name in self._rows:
+            raise CompileError(f"declare_row({name!r}): the name is declared already")
+        self._rows[name] = ParamDescriptor(
+            name=name, param_type=param_type, values=values, default=default, current=default,
+            unit=unit, kind=kind, id=_standard_id("declare_row", name, id, values, param_type),
+            show=_show(name, show),
+            labels=_value_names(name, values, param_type, labels), public=True)
+
+    @staticmethod
+    def _check_values(verb: str, name: str, values: list, param_type: str) -> None:
+        """A declaration's values: an enum's or a range's `[min, max]`, each
+        a whole number the descriptor wire carries."""
+        if param_type not in ("enum", "range"):
+            raise CompileError(
+                f"{verb}({name!r}): param_type must be 'enum' or "
+                f"'range', got {param_type!r}")
+        if param_type == "range" and (len(values) != 2 or values[0] > values[1]):
+            raise CompileError(
+                f"{verb}({name!r}): a range param must declare exactly "
+                f"[min, max] with min <= max, got {values!r}")
+        # The descriptor wire carries values as unsigned 32-bit cells; a
+        # fractional or negative value would ship a corrupt allowed set.
+        for v in values:
+            if not isinstance(v, int) or isinstance(v, bool) or not 0 <= v <= 0xFFFFFFFF:
+                raise CompileError(
+                    f"{verb}({name!r}): value {v!r} is not a whole "
+                    f"number from 0 to 4294967295 — the descriptor wire carries "
+                    f"unsigned 32-bit values. Encode fractional physical values in a "
+                    f"smaller integer unit (mHz, mV), offset a signed range "
+                    f"to start at 0, drop the rows with a stated exclusion, or "
+                    f"make the setting a compile-time config key.")
+
     def drive_pwm(self, freq: int = 1000, duty: int = 50):
-        """Drive the mikroBUS PWM pin via the live params ``pwm_freq`` (Hz) and
-        ``pwm_duty`` (%), retunable at runtime with no reload. ``freq`` and
+        """Drive the mikroBUS PWM pin via the apply params ``pwm_freq`` (Hz) and
+        ``pwm_duty`` (%), retunable at runtime with no restart. ``freq`` and
         ``duty`` are the initial drive applied at load. Call in configure()."""
         if not (PWM_FREQ_MIN_HZ <= freq <= PWM_FREQ_MAX_HZ):
             raise CompileError(
@@ -213,9 +345,9 @@ class ClickPersonality(_CompilePhase):
             raise CompileError(f"drive_pwm(duty={duty}): must be 0-100 %")
         self.declare_param("pwm_freq", values=[PWM_FREQ_MIN_HZ, PWM_FREQ_MAX_HZ],
                            default=freq, param_type="range", unit="Hz",
-                           kind="live")
+                           kind="apply")
         self.declare_param("pwm_duty", values=[0, 100], default=duty,
-                           param_type="range", unit="%", kind="live")
+                           param_type="range", unit="%", kind="apply")
 
     def persistent(self, name: str, init: int = 0):
         """Declare a loop-carried integer: initialized once in configure(),

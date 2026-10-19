@@ -30,7 +30,7 @@ def port_verdict(port: str) -> Optional[Dict[str, Any]]:
     is absent: nobody ends that run, and a reader that waited on it would
     wait on nothing."""
     record = _read(port)
-    if record is not None and record["verdict"] == BRINGING_UP and not _running(record):
+    if record is not None and record["verdict"] == BRINGING_UP and not running(record):
         return None
     return record
 
@@ -61,7 +61,7 @@ def _read(port: str) -> Optional[Dict[str, Any]]:
     return record if "verdict" in record else None
 
 
-def _instance() -> Tuple[int, str]:
+def instance() -> Tuple[int, str]:
     """This process as a verdict names its writer: the pid, and the start
     time `/proc/<pid>/stat` holds (clock ticks since boot, "" without
     /proc), which together outlive the pid's reuse."""
@@ -75,7 +75,7 @@ def _start_ticks(pid: int) -> str:
         return ""
 
 
-def _running(record: Dict[str, Any]) -> bool:
+def running(record: Dict[str, Any]) -> bool:
     """Whether the daemon instance that wrote a verdict still runs: the
     record's pid, alive in this boot, started when the record says. A
     record without a pid is an older build's, whose daemon the install
@@ -83,7 +83,7 @@ def _running(record: Dict[str, Any]) -> bool:
     from nxs.cam import port_state
 
     pid = record.get("pid")
-    if pid is None or record["boot"] != port_state._boot_id():
+    if pid is None or record["boot"] != port_state.boot_id():
         return False
     started = _start_ticks(pid)
     if started:
@@ -105,9 +105,9 @@ def record_verdict(port: str, verdict: str, lines: List[str]) -> None:
 
     path = port_state.state_dir() / VERDICT_FILE.format(port=port)
     staged = path.with_name(path.name + ".tmp")
-    pid, started = _instance()
+    pid, started = instance()
     text = "".join(f"{key}={value}\n" for key, value in [
-        ("at", repr(time.time())), ("boot", port_state._boot_id() or ""), ("pid", pid),
+        ("at", repr(time.time())), ("boot", port_state.boot_id() or ""), ("pid", pid),
         ("started", started), ("verdict", verdict), *(("line", line) for line in lines)])
     try:
         # A fresh file, never one through a link left at its name: the
@@ -140,7 +140,7 @@ def settle_stale() -> List[str]:
             continue
         port = name[len(prefix):]
         seen = _read(port)
-        if seen is not None and seen["verdict"] == BRINGING_UP and not _running(seen):
+        if seen is not None and seen["verdict"] == BRINGING_UP and not running(seen):
             record_verdict(port, *verdict_of(1, [f"{port}: the daemon restarted", "  - nxs switch"]))
             settled.append(port)
     return settled
@@ -162,3 +162,10 @@ def verdict_of(rc: int, lines: List[str]) -> Tuple[str, List[str]]:
         start -= 1
     refusal = lines[max(start - 1, 0):] or [f"on exited {rc}"]
     return f"refused: {refusal[0]}", refusal
+
+
+def bringing_up(port: str, since: float) -> bool:
+    """Whether the daemon records a bring-up of `port` it started after `since`."""
+    verdict = port_verdict(port)
+
+    return verdict is not None and verdict["verdict"] == BRINGING_UP and verdict["at"] >= since

@@ -10,14 +10,14 @@ import subprocess
 import sys
 
 from nxs.finding import as_data
-from nxs.tune_fields import NONE, Channel, Field, Section, refresh
-from nxs.tune_model import load_model
+from nxs.tune_fields import NONE, Channel, Field, Section, refresh, token
+from nxs.tune_model import admit, load_model
 from nxs.tune_write import save_model, write_model
 
 #: The names `nxs.tune` has always answered to, wherever they now live.
 __all__ = [
     "NONE", "Channel", "Field", "Section", "apply_sets",
-    "check_saved", "cmd_tune", "describe", "freeze", "identify", "identify_route",
+    "check_saved", "cmd_tune", "describe", "freeze", "identify_route",
     "identify_unit", "load_model",
     "nothing_tunable", "parse_set", "play", "refresh", "resolve_field",
     "run_batch", "save_model", "write_model",
@@ -26,19 +26,19 @@ __all__ = [
 
 def nothing_tunable(cfg) -> str:
     """Why the model is empty, with the step that fills it: a unit
-    without a `sensors:` entry offers no knobs, and a manifest with no
-    ports or units offers nothing at all."""
+    without a click node on its socket offers no knobs, and a declaration
+    with no ports or units offers nothing at all."""
     bare = [u.name for u in cfg.units if not u.sensors]
     if bare:
         return (f"nothing tunable declared — {', '.join(bare)} "
-                f"{'carries' if len(bare) == 1 else 'carry'} no sensors: "
-                f"entry; nxs generate writes one from the loaded "
-                f"personality, or add sensors: [{{personality: <name>}}] by hand")
+                f"{'carries' if len(bare) == 1 else 'carry'} no click node; "
+                f"nxs generate writes one from the loaded personality, or wire "
+                f"a click node into the unit's click socket by hand")
     if cfg.units:
-        # Every unit declares sensors, yet none became a strip: their
+        # Every unit declares its clicks, yet none became a strip: their
         # personalities did not load or expose no parameters.
         names = ", ".join(u.name for u in cfg.units)
-        return (f"nothing tunable declared — {names} declare sensors whose "
+        return (f"nothing tunable declared — {names} declare clicks whose "
                 f"personalities did not load or expose no parameters; nxs status "
                 f"names the personality errors")
     if cfg.ports:
@@ -66,25 +66,28 @@ def play():
     return False
 
 
-def identify(section):
-    """Strobe the focused section's unit LED so hands match strips."""
-    if section is None or section.kind != "sensor":
-        return False
-    identify_unit(section.unit_name)
-    return True
+#: Seconds an identify command may take: it opens the unit's route, sends one command and returns.
+IDENTIFY_S = 10.0
 
 
 def identify_unit(name):
-    """Strobe one unit's LED in the background."""
-    subprocess.Popen([sys.executable, "-m", "nxs.cli", "--unit", name, "identify"],
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    """Strobe one unit's LED; the command's refusal is raised as the panel's."""
+    _identify(["--unit", name])
 
 
 def identify_route(link):
     """Strobe the LED of the unit on an I2C route the manifest does not name."""
-    subprocess.Popen([sys.executable, "-m", "nxs.cli", "-t", "i2c", "-b", link.bus,
-                      "-a", f"{link.address:#x}", "identify"],
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    _identify(["-t", "i2c", "-b", link.bus, "-a", f"{link.address:#x}"])
+
+
+def _identify(route):
+    try:
+        done = subprocess.run([sys.executable, "-m", "nxs.cli", *route, "identify"],
+                              capture_output=True, text=True, timeout=IDENTIFY_S)
+    except subprocess.TimeoutExpired:
+        raise SystemExit(f"identify: no answer in {IDENTIFY_S:g} s") from None
+    if done.returncode:
+        raise SystemExit((done.stderr or done.stdout).strip() or f"identify: rc {done.returncode}")
 
 
 def freeze():
@@ -98,11 +101,6 @@ def freeze():
 # Non-interactive model access (scripts, `nxs mcp`)
 # ---------------------------
 
-def _token(option):
-    """The addressable value of an option (a PRESET carries a label)."""
-    return option[0] if isinstance(option, tuple) else option
-
-
 def describe(path, channels):
     """The `tune` surface: every channel, section, field, and option."""
     from nxs.schemas import CONTRACT
@@ -113,8 +111,8 @@ def describe(path, channels):
         for sec in ch.sections:
             fields = []
             for f in sec.fields:
-                entry = {"name": f.name, "value": _token(f.value),
-                         "options": [_token(o) for o in f.options]}
+                entry = {"name": f.name, "value": token(f.value),
+                         "options": [token(o) for o in f.options]}
                 if any(isinstance(o, tuple) for o in f.options):
                     entry["labels"] = [f.render(o) for o in f.options]
                 if f.unit:
@@ -132,7 +130,8 @@ def describe(path, channels):
 
 def parse_set(spec):
     """``CHANNEL[:SECTION]:FIELD=VALUE`` to (channel, section, field, value);
-    SECTION is ``CAMERA`` or a unit name, optional when the field is unique."""
+    SECTION is a section's label (``DECLARE``, ``hub``, ``host``,
+    ``camera``, a unit's or a click's), optional when the field is unique."""
     if "=" not in spec:
         raise SystemExit(f"nxs tune --set {spec!r}: expected "
                          f"CHANNEL[:SECTION]:FIELD=VALUE")
@@ -153,8 +152,7 @@ def _section_matches(sec, selector):
     if selector is None:
         return True
     s = selector.lower()
-    return (sec.label.lower() == s or (sec.kind == "camera" and s == "camera")
-            or (sec.unit_name or "").lower() == s
+    return (sec.label.lower() == s or (sec.unit_name or "").lower() == s
             or sec.label.split(" · ", 1)[-1].lower() == s
             or sec.label.split(" · ", 1)[-1].split("/", 1)[0].lower() == s)
 
@@ -184,6 +182,17 @@ def resolve_field(channels, channel, section, field):
                      f"{names})")
 
 
+def _offered(field) -> str:
+    """What a knob offers, as a refusal names it: a row's values or its span
+    in display form, else the knob's options."""
+    from nxs.description import offered
+
+    row = getattr(field, "row", None)
+    if row is not None:
+        return offered(row, field.option.values, field.option.span)
+    return ", ".join(str(token(o)) for o in field.options)
+
+
 def _family_knobs(family):
     """(channel, knob) -> value for every knob of a port's family of channels."""
     out = {}
@@ -203,28 +212,13 @@ def apply_sets(channels, specs):
     for spec in specs:
         channel, section, field, value = parse_set(spec)
         ch, sec, f = resolve_field(channels, channel, section, field)
-        wanted = value.lower()
-        index = next((i for i, o in enumerate(f.options)
-                      if str(_token(o)).lower() == wanted), None)
-        if index is None and f.bounds is not None:
-            # A range parameter takes any integer inside its bounds.
-            try:
-                number = int(value)
-            except ValueError:
-                number = None
-            if number is not None and f.bounds[0] <= number <= f.bounds[1]:
-                numbers = sorted({o for o in f.options if o != NONE} | {number})
-                f.options = ([NONE] if NONE in f.options else []) + numbers
-                index = f.options.index(number)
+        index = admit(f, value)
         if index is None:
-            offered = (f"{f.bounds[0]}..{f.bounds[1]}" if f.bounds is not None
-                       else ", ".join(str(_token(o)) for o in f.options))
-            raise SystemExit(f"nxs tune: {ch.name}:{f.name} offers "
-                             f"{offered} — not {value!r}")
+            raise SystemExit(f"nxs tune: {ch.name}:{f.name} offers {_offered(f)} — not {value!r}")
         f.index = index
         f.default = None        # a set knob is spelled out at save
         applied.append({"channel": ch.name, "section": sec.label,
-                        "field": f.name, "value": _token(f.value)})
+                        "field": f.name, "value": token(f.value)})
         if sec not in touched:
             touched.append(sec)
         # The batch names the knob a rebuild moved: that note is answered.
@@ -273,14 +267,13 @@ def run_batch(args):
                           ports=getattr(args, "ports", False),
                           only_port=getattr(args, "only_port", None))
     if getattr(args, "schema", False):
-        from nxs.suite import default_config_path
-        from nxs.suite.rig_schema import rig_schema
+        from nxs.suite import default_config_path, views
         from nxs.suite.schema import load_suite_config
         try:
             cfg = load_suite_config(default_config_path())
         except ManifestError as e:
             raise SystemExit(f"nxs tune: {e}")
-        print(json.dumps(rig_schema(cfg), indent=2))
+        print(json.dumps(views.schema(cfg), indent=2))
         return 0
     try:
         path, _cfg, channels = load_model()
